@@ -102,14 +102,15 @@ void Sender::sendVideo(const VideoFormat& fmt, std::span<const uint8_t> bgra, bo
   const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - d_->start).count();
   const bool key = d_->policy.next(nowMs, static_cast<uint64_t>(omt.FramesDropped), requested);
 
-  d_->stamps.push_back(timestamp);
   std::vector<Packet> packets = d_->encoder->encode(d_->picture, key);
+  d_->stamps.push_back(timestamp);  // after encode, so a throw leaves the deque unchanged
   const double encodeMs = msSince(t0);
 
   f.Codec = static_cast<OMTCodec>(kCodecHevc);
   f.Flags = static_cast<OMTVideoFlags>(fmt.alpha ? (OMTVideoFlags_Alpha | OMTVideoFlags_PreMultiplied) : 0);
   uint64_t keyframes = 0;
   for (Packet& p : packets) {
+    if (d_->stamps.empty()) break;
     f.Timestamp = d_->stamps.front();
     d_->stamps.pop_front();
     f.Data = p.data.data();
