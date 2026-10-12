@@ -1,6 +1,7 @@
 # OMT-HX: design
 
-**Status:** draft for owner review, 2026-10-12. Nothing is built yet.
+**Status:** approved by the owner 2026-10-12, with the MIT licence. Section 5 was
+proven by a throwaway build on 2026-10-13; nothing else is built yet.
 
 **Parent decisions:** broadcast roadmap R11 and R12
 (`../../../../docs/superpowers/specs/2026-10-12-broadcast-roadmap-design.md`).
@@ -35,10 +36,10 @@ shared library in its own repository, used by both apps.
 | H2 | Carriage | HEVC frames travel as normal OMT video frames with the codec tag `HEVC`. This needs a small patch to the OMT library (section 5), because stock libomt refuses any tag but its own. |
 | H3 | Codec | HEVC Main, 8-bit 4:2:0, full-range BT.709, progressive. No B-frames. |
 | H4 | Encoder | The GPU's hardware encoder through FFmpeg. The first of `hevc_nvenc`, `hevc_amf`, `hevc_qsv`, `hevc_mf` that opens is used. This is the pattern BreadCamera's preview encoder already uses. No software encoder. |
-| H5 | Decoder | FFmpeg's HEVC decoder, with D3D11 hardware decoding when the GPU offers it and software decoding otherwise. |
+| H5 | Decoder | FFmpeg's HEVC decoder, with D3D11 hardware decoding when the GPU offers it. Software decoding is the fallback; it uses several threads and so adds about three frames of delay. |
 | H6 | Alpha | Fill and alpha are packed into one picture: fill on top, alpha below as a grey image (section 7). Fill is premultiplied on the wire. |
 | H7 | Bitrate | Constant bitrate from bits per pixel, by quality level: Low 0.12, Medium 0.24, High 0.40. At 1080p60 that is 15, 30 and 50 Mbps. Alpha adds 25%. These are starting values, tuned by measurement in milestone H2. |
-| H8 | Keyframes | A keyframe is sent at start, when a receiver joins, when the library reports a dropped frame, and every 2 seconds (section 8). |
+| H8 | Keyframes | A keyframe is sent at start, when a receiver asks for one, when the library reports a dropped frame, and every 2 seconds (section 8). |
 | H9 | One library for both modes | `omthx` wraps libomt. Its sender sends plain OMT or OMT-HX; its receiver reads both and returns the same frame type. Apps use `omthx` and never call libomt directly. |
 | H10 | Repository | `F:\Coding\BreadMedia\OMT-HX`, its own git repository, beside the apps. BreadCamera and BreadStudio both build against it (section 10). |
 | H11 | Platform | Windows x64 only, like BreadCamera and BreadStudio S0. |
@@ -95,11 +96,11 @@ v1.0.0.19) was read for this design:
 - **Receiving.** `OMTReceive.ReceiveVideo` handles only `VMX1`. Any other tag
   is logged and the frame is discarded.
 - **The C wrapper** passes the frame struct straight to the .NET library, so
-  it needs no change beyond the header.
+  it needs no change. `omthx` defines the `HEVC` tag value itself.
 
-The patch, about 40 lines of C#:
+The patch, 31 added lines of C# in three files:
 
-1. Add `HEVC = 0x43564548` to `OMTCodec` and to `libomt.h`.
+1. Add `HEVC = 0x43564548` to `OMTCodec`.
 2. In `SendVideo`, treat `HEVC` exactly like the existing `VMX1` pass-through,
    keeping the `HEVC` tag on the outgoing frame.
 3. In `ReceiveVideo`, when the tag is `HEVC`, skip decoding and hand the bytes
@@ -115,6 +116,14 @@ commit. A script clones the two upstream repositories, applies it, and builds
 on this PC). `libvmx.dll` comes from the pinned upstream release, checked by
 SHA-256. No fork repository is needed.
 
+**Proven on this PC, 2026-10-13.** A clean clone, patched and built by the
+script, passed a throwaway test: 1000 bytes sent with the `HEVC` tag arrived
+byte for byte with size and flags intact; a UYVY frame still went through VMX
+and came back as UYVY; tally set on the receiver was read on the sender; a
+metadata message from the receiver reached the sender; audio arrived unchanged.
+The .NET 8 build does not find Visual Studio 2026 by itself, so the script
+runs inside the Visual Studio developer shell.
+
 ## 6. The `omthx` library
 
 C++20, CMake, vcpkg, doctest: the same toolchain as BreadCamera.
@@ -128,7 +137,7 @@ C++20, CMake, vcpkg, doctest: the same toolchain as BreadCamera.
 | `Decoder` | Decodes one access unit to an NV12 picture. Hardware when available. | FFmpeg |
 | `Sender` | One OMT source. Mode Full or HX. Takes BGRA, audio and a timestamp; applies the keyframe rules; reports tally and statistics. | libomt, `Encoder`, `pack`, `bitrate` |
 | `Receiver` | Connects to one OMT source by name. Returns BGRA frames whichever mode the source uses; waits for a keyframe after connecting; sets tally; reports statistics. | libomt, `Decoder`, `pack`, `nal` |
-| `omthx-send` | Test tool. Sends a moving test pattern or a video file as an OMT or OMT-HX source. | `Sender` |
+| `omthx-send` | Test tool. Sends a moving test pattern with grain as an OMT or OMT-HX source. | `Sender` |
 | `omthx-recv` | Test tool. Connects to a source and prints frame rate, Mbps, encode and decode time, drops and delay once a second. Can save a frame as an image. | `Receiver` |
 
 Apps see `Sender` and `Receiver` only. That keeps roadmap R12's rule: one
@@ -160,7 +169,8 @@ misses a frame needs a keyframe.
 The sender forces one when:
 
 1. it sends its first frame;
-2. the number of connections reported by libomt rises;
+2. a receiver asks for one, with the OMT metadata message
+   `<OMTHX Keyframe="true" />`;
 3. libomt's send statistics report a newly dropped frame, which happens when a
    receiver's connection is too slow to take a frame;
 4. the app says it skipped a frame (BreadCamera drops the oldest frame when an
@@ -170,9 +180,14 @@ The sender forces one when:
 Forced keyframes are limited to one per 500 ms. Without the limit a saturated
 link would drop a frame, get a larger keyframe, and drop again.
 
-The receiver discards frames until the first keyframe after connecting or
-after a decoder error. OMT runs over TCP, so frames are never lost in transit;
-they are only dropped at the sender, and the sender knows when.
+The receiver discards frames until the first keyframe after connecting, after
+a decoder error, and after a jump in timestamps of more than one and a half
+frames, which is how a dropped frame looks from its side. While it is
+discarding it asks for a keyframe, at most once per 500 ms. OMT runs over TCP,
+so frames are never lost in transit; they are only dropped at the sender.
+
+Because of the timestamp rule, a sender must stamp frames one frame duration
+apart. BreadCamera's tick clock already does.
 
 ## 9. Encoder settings
 
@@ -252,8 +267,7 @@ called working.
 
 ## 15. Open decisions for the owner
 
-1. **Licence of this repository.** Recommended: MIT, matching OMT, so the
-   library can ship inside a GPL BreadStudio and whatever BreadCamera chooses.
+1. **Licence of this repository.** Decided 2026-10-12: MIT.
 2. **Carriage (H2).** Recommended: the patched libomt. The alternative is a
    second TCP connection beside an unpatched libomt; it avoids the patch but
    adds a connection, a port, address discovery and reconnect logic of our own.
