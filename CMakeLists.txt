@@ -27,7 +27,13 @@ function(omthx_copy_runtime target)
 endfunction()
 
 # ---- library ----
-# (added in Task 2)
+add_library(omthx STATIC
+  src/pure.cpp
+)
+target_include_directories(omthx PUBLIC include PRIVATE src ${FFMPEG_INCLUDE_DIRS} "${OMTHX_LIBOMT_DIR}")
+target_link_directories(omthx PUBLIC ${FFMPEG_LIBRARY_DIRS} "${OMTHX_LIBOMT_DIR}")
+target_link_libraries(omthx PUBLIC ${FFMPEG_LIBRARIES} libomt)
+omthx_warnings(omthx)
 
 if(OMTHX_BUILD_TESTS)
   find_package(doctest CONFIG REQUIRED)
@@ -36,10 +42,10 @@ if(OMTHX_BUILD_TESTS)
   add_executable(omthx_tests
     tests/main.cpp
     tests/libomt_test.cpp
+    tests/pure_test.cpp
   )
-  target_include_directories(omthx_tests PRIVATE "${OMTHX_LIBOMT_DIR}")
-  target_link_directories(omthx_tests PRIVATE "${OMTHX_LIBOMT_DIR}")
-  target_link_libraries(omthx_tests PRIVATE doctest::doctest libomt)
+  target_include_directories(omthx_tests PRIVATE src tools "${OMTHX_LIBOMT_DIR}")
+  target_link_libraries(omthx_tests PRIVATE omthx doctest::doctest)
   omthx_warnings(omthx_tests)
   omthx_copy_runtime(omthx_tests)
 
