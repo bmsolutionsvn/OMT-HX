@@ -21,8 +21,8 @@ namespace {
   std::exit(2);
 }
 
-// 32-bit BMP, top row first. Enough to look at one frame.
-void writeBmp(const std::string& path, const VideoFrame& v) {
+// 32-bit BMP, top row first. Enough to look at one frame. False if the file could not be written.
+bool writeBmp(const std::string& path, const VideoFrame& v) {
   const uint32_t size = static_cast<uint32_t>(v.bgra.size());
   unsigned char h[54] = {'B', 'M'};
   auto put = [&](int at, uint32_t x) { std::memcpy(h + at, &x, 4); };
@@ -37,6 +37,7 @@ void writeBmp(const std::string& path, const VideoFrame& v) {
   std::ofstream out(path, std::ios::binary);
   out.write(reinterpret_cast<const char*>(h), sizeof(h));
   out.write(reinterpret_cast<const char*>(v.bgra.data()), size);
+  return out.good();
 }
 }  // namespace
 
@@ -86,8 +87,11 @@ int main(int argc, char** argv) {
         delayMax = std::max(delayMax, delay);
         ++delays;
         if (!dump.empty()) {
-          writeBmp(dump, frame);
-          std::printf("wrote %s\n", dump.c_str());
+          if (writeBmp(dump, frame)) {
+            std::printf("wrote %s\n", dump.c_str());
+          } else {
+            std::fprintf(stderr, "omthx-recv: cannot write %s\n", dump.c_str());
+          }
           dump.clear();
         }
       }
