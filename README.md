@@ -59,7 +59,7 @@ skipped, and it holds the last picture until the next keyframe.
 
 ## Limits of version 1
 
-8-bit 4:2:0 only. Colour conversion runs on the CPU. A program that speaks only OMT sees an
+8-bit 4:2:0 only. Colour conversion runs on the CPU. A program that speaks only stock OMT sees an
 OMT-HX source with audio and no picture. See section 13 of the design.
 
 ## Licence
