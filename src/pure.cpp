@@ -88,7 +88,7 @@ Packer::~Packer() {
 }
 
 void Packer::ensure(int w, int h) {
-  if (toNv12_ && w == width_ && h == height_) return;
+  if (toNv12_ && toBgra_ && w == width_ && h == height_) return;
   sws_freeContext(toNv12_);
   sws_freeContext(toBgra_);
   toNv12_ = toBgra_ = nullptr;
