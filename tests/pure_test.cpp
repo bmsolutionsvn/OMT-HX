@@ -152,3 +152,28 @@ TEST_CASE("pack trusts a premultiplied source and rejects sizes it cannot pack")
   std::vector<uint8_t> out;
   CHECK_THROWS_AS(packer.unpack(f, small, out), std::invalid_argument);
 }
+
+TEST_CASE("pack leaves opaque pixels as sent and turns fully transparent ones black") {
+  const VideoFormat f{32, 18, 60, 1, true};
+  Packer packer;
+  Nv12 straight, premultiplied;
+  const std::vector<uint8_t> opaque = flat(32, 18, 200, 100, 50, 255);
+  packer.pack(f, opaque, false, straight);
+  packer.pack(f, opaque, true, premultiplied);
+  CHECK(straight.y == premultiplied.y);
+  CHECK(straight.uv == premultiplied.uv);
+
+  packer.pack(f, flat(32, 18, 200, 100, 50, 0), false, straight);
+  CHECK(straight.y[0] <= 1);              // fill: black
+  CHECK(near(straight.uv[0], 128));
+  CHECK(straight.y[32 * 32] == 0);        // alphaTop(18) is 32: first row of the alpha picture
+
+  // Premultiplying runs in bands of rows: every row of a flat half-transparent picture must come out the same.
+  packer.pack(f, flat(32, 18, 200, 100, 50, 128), false, straight);
+  packer.pack(f, flat(32, 18, 100, 50, 25, 128), true, premultiplied);
+  for (int r = 0; r < 18; ++r) {
+    CAPTURE(r);
+    CHECK(straight.y[static_cast<size_t>(r) * 32] == straight.y[0]);
+    CHECK(near(straight.y[static_cast<size_t>(r) * 32 + 31], premultiplied.y[0]));
+  }
+}
