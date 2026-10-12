@@ -55,5 +55,11 @@ if(OMTHX_BUILD_TESTS)
   omthx_copy_runtime(omthx_tests)
 
   # ---- tools ----
-  # (added in Task 6)
+  foreach(tool send recv)
+    add_executable(omthx-${tool} tools/omthx_${tool}.cpp)
+    target_link_libraries(omthx-${tool} PRIVATE omthx)
+    omthx_warnings(omthx-${tool})
+    omthx_copy_runtime(omthx-${tool})
+  endforeach()
+  target_link_libraries(omthx-send PRIVATE winmm)
 endif()
