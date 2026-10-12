@@ -31,6 +31,7 @@ add_library(omthx STATIC
   src/pure.cpp
   src/encoder.cpp
   src/decoder.cpp
+  src/link.cpp
 )
 target_include_directories(omthx PUBLIC include PRIVATE src ${FFMPEG_INCLUDE_DIRS} "${OMTHX_LIBOMT_DIR}")
 target_link_directories(omthx PUBLIC ${FFMPEG_LIBRARY_DIRS} "${OMTHX_LIBOMT_DIR}")
@@ -46,6 +47,7 @@ if(OMTHX_BUILD_TESTS)
     tests/libomt_test.cpp
     tests/pure_test.cpp
     tests/codec_test.cpp
+    tests/link_test.cpp
   )
   target_include_directories(omthx_tests PRIVATE src tools "${OMTHX_LIBOMT_DIR}")
   target_link_libraries(omthx_tests PRIVATE omthx doctest::doctest)
