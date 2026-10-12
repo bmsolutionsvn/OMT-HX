@@ -1,0 +1,13 @@
+{
+  "name": "omthx",
+  "version-string": "0.1.0",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": ["avcodec", "avformat", "swresample", "swscale", "srt", "nvcodec", "amf"]
+    },
+    "doctest"
+  ],
+  "builtin-baseline": "2750401336fb7c95f6619657a46a7e798661341c"
+}
