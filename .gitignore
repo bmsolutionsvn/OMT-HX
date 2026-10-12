@@ -1,0 +1,6 @@
+/build/
+/out/
+/vcpkg_installed/
+/third_party/
+/.vs/
+/.superpowers/
