@@ -1,5 +1,5 @@
 #pragma once
-// OMT-HX: one sender and one receiver for plain OMT (VMX) and OMT-HX (HEVC inside OMT).
+// OMT-HX: one sender and one receiver for plain OMT (VMX) and OMT-HX (HEVC or H.264 inside OMT).
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -8,7 +8,7 @@
 
 namespace omthx {
 
-enum class Mode { Full, Hx };  // Full = plain OMT with VMX; Hx = HEVC inside OMT
+enum class Mode { Full, Hx };  // Full = plain OMT with VMX; Hx = HEVC or H.264 inside OMT
 enum class Quality { Low, Medium, High };
 enum class Codec { Hevc, H264 };  // the video codec of an Hx source
 
@@ -28,7 +28,7 @@ struct Tally {
 };
 
 struct SenderStats {
-  std::string encoder;         // "vmx", "hevc_amf", "hevc_nvenc", ...
+  std::string encoder;         // "vmx", "hevc_amf", "h264_nvenc", ...
   uint64_t framesSent = 0;
   uint64_t keyframes = 0;      // Hx only
   uint64_t bytesSent = 0;      // wire bytes, summed over all receivers
@@ -41,7 +41,8 @@ struct SenderStats {
 // requestKeyframe, tally and stats are safe from any thread.
 class Sender {
  public:
-  Sender(const std::string& name, Mode mode, Quality quality);
+  // codec picks the Hx video codec and is ignored in Mode::Full. The receiver needs no setting.
+  Sender(const std::string& name, Mode mode, Quality quality, Codec codec = Codec::Hevc);
   ~Sender();
   Sender(const Sender&) = delete;
   Sender& operator=(const Sender&) = delete;
@@ -78,7 +79,8 @@ struct AudioFrame {
 
 struct ReceiverStats {
   Mode mode = Mode::Full;        // what the source is sending
-  std::string decoder;           // "vmx", "hevc (d3d11va)", "hevc (software)"
+  Codec codec = Codec::Hevc;     // Hx only: which codec the source is sending
+  std::string decoder;           // "vmx", "hevc (d3d11va)", "h264 (software)", ...
   uint64_t framesReceived = 0;   // pictures handed to the caller
   uint64_t framesDiscarded = 0;  // Hx frames dropped while waiting for a keyframe
   uint64_t bytesReceived = 0;    // wire bytes

@@ -18,9 +18,10 @@ using namespace omthx;
 
 namespace {
 [[noreturn]] void usage() {
-  std::puts("omthx-send [--name TEXT] [--mode hx|full] [--quality low|medium|high]\n"
+  std::puts("omthx-send [--name TEXT] [--mode hx|full] [--codec hevc|h264] [--quality low|medium|high]\n"
             "           [--size WxH] [--fps N] [--alpha] [--seconds N]\n"
-            "Defaults: --name \"OMT-HX Test\" --mode hx --quality medium --size 1920x1080 --fps 60, runs until Ctrl+C.");
+            "Defaults: --name \"OMT-HX Test\" --mode hx --codec hevc --quality medium --size 1920x1080 --fps 60,\n"
+            "runs until Ctrl+C. --codec is ignored with --mode full.");
   std::exit(2);
 }
 }  // namespace
@@ -29,6 +30,7 @@ int main(int argc, char** argv) {
   std::string name = "OMT-HX Test";
   Mode mode = Mode::Hx;
   Quality quality = Quality::Medium;
+  Codec codec = Codec::Hevc;
   VideoFormat f{1920, 1080, 60, 1, false};
   int seconds = 0;
   for (int i = 1; i < argc; ++i) {
@@ -41,6 +43,8 @@ int main(int argc, char** argv) {
       name = value();
     } else if (a == "--mode") {
       mode = value() == "full" ? Mode::Full : Mode::Hx;
+    } else if (a == "--codec") {
+      codec = value() == "h264" ? Codec::H264 : Codec::Hevc;
     } else if (a == "--quality") {
       const std::string q = value();
       quality = q == "low" ? Quality::Low : q == "high" ? Quality::High : Quality::Medium;
@@ -63,7 +67,7 @@ int main(int argc, char** argv) {
     std::vector<std::vector<uint8_t>> loop(16);
     for (int i = 0; i < 16; ++i) drawPattern(loop[i], f.width, f.height, i * 4, f.alpha);
 
-    Sender sender(name, mode, quality);
+    Sender sender(name, mode, quality, codec);
     std::printf("source: %s\n", sender.address().c_str());
     timeBeginPeriod(1);  // 1 ms sleeps instead of 15 ms
     using Clock = std::chrono::steady_clock;

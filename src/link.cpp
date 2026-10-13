@@ -28,6 +28,7 @@ void checkBgra(const VideoFormat& f, std::span<const uint8_t> bgra) {
 struct Sender::Impl {
   Mode mode = Mode::Hx;
   Quality quality = Quality::Medium;
+  Codec codec = Codec::Hevc;
   omt_send_t* tx = nullptr;
   VideoFormat format;  // what the encoder was opened for
   std::unique_ptr<Encoder> encoder;
@@ -41,10 +42,11 @@ struct Sender::Impl {
   SenderStats stats;
 };
 
-Sender::Sender(const std::string& name, Mode mode, Quality quality) : d_(std::make_unique<Impl>()) {
+Sender::Sender(const std::string& name, Mode mode, Quality quality, Codec codec) : d_(std::make_unique<Impl>()) {
   static constexpr OMTQuality kOmtQuality[] = {OMTQuality_Low, OMTQuality_Medium, OMTQuality_High};
   d_->mode = mode;
   d_->quality = quality;
+  d_->codec = codec;
   d_->tx = omt_send_create(name.c_str(), kOmtQuality[static_cast<int>(quality)]);
   if (!d_->tx) throw std::runtime_error("cannot create the OMT source \"" + name + "\"");
   if (mode == Mode::Full) d_->stats.encoder = "vmx";
@@ -80,8 +82,8 @@ void Sender::sendVideo(const VideoFormat& fmt, std::span<const uint8_t> bgra, bo
   }
 
   if (!d_->encoder || !(fmt == d_->format)) {
-    d_->encoder = std::make_unique<Encoder>(Codec::Hevc, fmt.width, codedHeight(fmt), fmt.fpsN, fmt.fpsD,
-                                            targetBitrate(fmt, d_->quality, Codec::Hevc));
+    d_->encoder = std::make_unique<Encoder>(d_->codec, fmt.width, codedHeight(fmt), fmt.fpsN, fmt.fpsD,
+                                            targetBitrate(fmt, d_->quality, d_->codec));
     d_->format = fmt;
     d_->policy = KeyframePolicy();
     d_->stamps.clear();
@@ -106,7 +108,7 @@ void Sender::sendVideo(const VideoFormat& fmt, std::span<const uint8_t> bgra, bo
   d_->stamps.push_back(timestamp);  // after encode, so a throw leaves the deque unchanged
   const double encodeMs = msSince(t0);
 
-  f.Codec = static_cast<OMTCodec>(kCodecHevc);
+  f.Codec = static_cast<OMTCodec>(codecTag(d_->codec));
   f.Flags = static_cast<OMTVideoFlags>(fmt.alpha ? (OMTVideoFlags_Alpha | OMTVideoFlags_PreMultiplied) : 0);
   uint64_t keyframes = 0;
   for (Packet& p : packets) {
@@ -215,7 +217,8 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
   fmt.fpsD = f->FrameRateD;
   fmt.alpha = (f->Flags & OMTVideoFlags_Alpha) != 0;
 
-  if (static_cast<int>(f->Codec) != kCodecHevc) {
+  Codec codec = Codec::Hevc;
+  if (!codecFromTag(static_cast<int>(f->Codec), codec)) {
     // Plain OMT: libomt already decoded VMX to BGRA.
     if (f->Codec != OMTCodec_BGRA || !f->Data || fmt.width <= 0 || fmt.height <= 0) return false;
     const size_t rowBytes = static_cast<size_t>(fmt.width) * 4;
@@ -237,18 +240,22 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
     return true;
   }
 
-  // OMT-HX: the patched libomt hands the HEVC access unit over untouched.
+  // OMT-HX: the patched libomt hands the HEVC or H.264 access unit over untouched.
   if (!f->CompressedData || f->CompressedLength <= 0) return false;
   const std::span<const uint8_t> au(static_cast<const uint8_t*>(f->CompressedData),
                                     static_cast<size_t>(f->CompressedLength));
+  if (d_->decoder && d_->decoder->codec() != codec) {  // the source came back with the other codec
+    d_->decoder.reset();
+    d_->waiting = true;
+  }
   if (d_->haveLast && isGap(d_->lastTimestamp, f->Timestamp, fmt.fpsN, fmt.fpsD)) d_->waiting = true;
   d_->lastTimestamp = f->Timestamp;
   d_->haveLast = true;
-  if (d_->waiting && !isKeyframe(Codec::Hevc, au)) {
+  if (d_->waiting && !isKeyframe(codec, au)) {
     d_->discard();
     return false;
   }
-  if (!d_->decoder) d_->decoder = std::make_unique<Decoder>(Codec::Hevc);
+  if (!d_->decoder) d_->decoder = std::make_unique<Decoder>(codec);
 
   const auto t0 = Clock::now();
   int64_t timestamp = 0;
@@ -276,6 +283,7 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
   out.timestamp = timestamp;
   std::lock_guard lock(d_->statsMutex);
   d_->stats.mode = Mode::Hx;
+  d_->stats.codec = codec;
   d_->stats.decoder = d_->decoder->name();
   d_->stats.lastDecodeMs = msSince(t0);
   ++d_->stats.framesReceived;

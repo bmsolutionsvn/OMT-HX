@@ -2,7 +2,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -16,12 +18,12 @@ using Clock = std::chrono::steady_clock;
 namespace {
 constexpr int64_t kFrame = 166'667;  // one frame at 60 fps, in OMT units
 
-bool hardwareHevc() {
+bool hardware(Codec codec) {
   try {
-    Encoder probe(Codec::Hevc, 640, 360, 60, 1, 1'000'000);
+    Encoder probe(codec, 640, 360, 60, 1, 1'000'000);
     return true;
   } catch (const std::runtime_error& e) {
-    MESSAGE("SKIPPED, no hardware HEVC encoder on this PC: " << e.what());
+    MESSAGE("SKIPPED, no hardware " << codecName(codec) << " encoder on this PC: " << e.what());
     return false;
   }
 }
@@ -64,9 +66,12 @@ int receiveSome(Receiver& receiver, VideoFrame& frame, int wanted, int seconds) 
 }  // namespace
 
 TEST_CASE("an HX source delivers pictures with alpha, audio and tally") {
-  if (!hardwareHevc()) return;
+  Codec codec = Codec::Hevc;
+  SUBCASE("hevc") { codec = Codec::Hevc; }
+  SUBCASE("h264") { codec = Codec::H264; }
+  if (!hardware(codec)) return;
   const VideoFormat f{640, 360, 60, 1, true};
-  Sender sender("omthx-test-hx", Mode::Hx, Quality::Medium);
+  Sender sender(std::string("omthx-test-hx-") + codecName(codec), Mode::Hx, Quality::Medium, codec);
   Receiver receiver(sender.address());
   Pump pump(sender, f);
 
@@ -80,6 +85,9 @@ TEST_CASE("an HX source delivers pictures with alpha, audio and tally") {
   for (size_t i = 3; i < frame.bgra.size(); i += 4) opaque += frame.bgra[i] > 240;
   CHECK(opaque > 10'000);  // the disc itself
   CHECK(receiver.stats().mode == Mode::Hx);
+  CHECK(receiver.stats().codec == codec);
+  CHECK(receiver.stats().decoder.rfind(codecName(codec), 0) == 0);
+  CHECK(sender.stats().encoder.rfind(codecName(codec), 0) == 0);
   CHECK(receiver.stats().framesReceived >= 30);
   CHECK(sender.stats().keyframes >= 1);
   CHECK(sender.stats().connections >= 1);
@@ -107,7 +115,7 @@ TEST_CASE("an HX source delivers pictures with alpha, audio and tally") {
 
 TEST_CASE("a plain OMT source comes through the same Receiver") {
   const VideoFormat f{640, 360, 60, 1, true};
-  Sender sender("omthx-test-full", Mode::Full, Quality::Medium);
+  Sender sender("omthx-test-full", Mode::Full, Quality::Medium, Codec::H264);  // Full ignores the codec
   Receiver receiver(sender.address());
   Pump pump(sender, f);
 
@@ -122,9 +130,12 @@ TEST_CASE("a plain OMT source comes through the same Receiver") {
 }
 
 TEST_CASE("a receiver that joins a running HX source gets a picture") {
-  if (!hardwareHevc()) return;
+  Codec codec = Codec::Hevc;
+  SUBCASE("hevc") { codec = Codec::Hevc; }
+  SUBCASE("h264") { codec = Codec::H264; }
+  if (!hardware(codec)) return;
   const VideoFormat f{640, 360, 60, 1, false};
-  Sender sender("omthx-test-late", Mode::Hx, Quality::Medium);
+  Sender sender(std::string("omthx-test-late-") + codecName(codec), Mode::Hx, Quality::Medium, codec);
   Pump pump(sender, f);
   std::this_thread::sleep_for(std::chrono::seconds(1));
   const uint64_t before = sender.stats().keyframes;
@@ -142,7 +153,7 @@ TEST_CASE("a receiver that joins a running HX source gets a picture") {
 }
 
 TEST_CASE("a change of picture size reaches the receiver") {
-  if (!hardwareHevc()) return;
+  if (!hardware(Codec::Hevc)) return;
   const VideoFormat small{640, 360, 60, 1, false};
   const VideoFormat large{1280, 720, 60, 1, false};
   Sender sender("omthx-test-resize", Mode::Hx, Quality::Medium);
@@ -163,6 +174,33 @@ TEST_CASE("a change of picture size reaches the receiver") {
   CHECK(sawSmall);
   CHECK(sawLarge);
   CHECK(frame.bgra.size() == 1280u * 720 * 4);
+}
+
+TEST_CASE("a source that comes back with the other codec is picked up by the same Receiver") {
+  if (!hardware(Codec::Hevc) || !hardware(Codec::H264)) return;
+  const VideoFormat f{640, 360, 60, 1, false};
+  auto sender = std::make_unique<Sender>("omthx-test-switch", Mode::Hx, Quality::Medium, Codec::Hevc);
+  Receiver receiver(sender->address());
+  VideoFrame frame;
+  {
+    Pump pump(*sender, f);
+    REQUIRE(receiveSome(receiver, frame, 10, 10) == 10);
+    CHECK(receiver.stats().codec == Codec::Hevc);
+  }
+  sender.reset();  // the operator changes the camera's output codec
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  sender = std::make_unique<Sender>("omthx-test-switch", Mode::Hx, Quality::Medium, Codec::H264);
+  Pump pump(*sender, f);
+
+  // libomt reconnects by itself; on one PC that took about 3 seconds.
+  bool switched = false;
+  const auto deadline = Clock::now() + std::chrono::seconds(20);
+  while (!switched && Clock::now() < deadline) {
+    if (receiver.receiveVideo(frame, 100)) switched = receiver.stats().codec == Codec::H264;
+  }
+  CHECK(switched);
+  CHECK(receiver.stats().decoder.rfind("h264", 0) == 0);
+  CHECK(frame.format == f);
 }
 
 TEST_CASE("Sender rejects input it cannot use") {
