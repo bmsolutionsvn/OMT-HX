@@ -2,8 +2,8 @@
 
 A second video mode for [Open Media Transport](https://github.com/openmediatransport), in the way
 NDI|HX is a second mode of NDI: a hardware-encoded video codec inside ordinary OMT connections.
-Version 1 codes HEVC (H.265); H.264 is under research. Discovery, audio and tally are OMT's,
-unchanged.
+Version 1 codes HEVC (H.265) or H.264 (AVC) from the GPU's hardware encoder. Discovery, audio and
+tally are OMT's, unchanged.
 
 `omthx` is the library BreadCamera (sender) and BreadStudio (receiver) share. One `Sender` sends
 plain OMT or OMT-HX; one `Receiver` reads both.
@@ -31,6 +31,8 @@ cd build\release
 .\omthx-recv.exe --source "<PC> (OMT-HX Test)" --dump frame.bmp
 ```
 
+Add `--codec h264` to `omthx-send` to send H.264 instead of HEVC.
+
 ## Use it from an app
 
 The app's `vcpkg.json` needs FFmpeg with `avcodec`, `swscale`, `nvcodec` and `amf`.
@@ -55,6 +57,10 @@ if (receiver.receiveVideo(frame, 100)) { /* frame.bgra, premultiplied when it ha
 receiver.setTally({.preview = false, .program = true});
 ```
 
+A fourth `Sender` argument picks the HX codec: `omthx::Codec::Hevc` (the default) or
+`omthx::Codec::H264`. The receiver needs no setting; it reads whichever arrives, and follows a
+source that comes back with the other codec.
+
 Timestamps must be one frame duration apart. A larger step tells the receiver a frame was
 skipped, and it holds the last picture until the next keyframe.
 
@@ -67,7 +73,8 @@ modes spend bandwidth to save latency.
 | Mode | Codec | 1080p60 bandwidth | Latency | Alpha | Codec cost |
 |------|-------|-------------------|---------|-------|------------|
 | OMT (full) | VMX, intra, visually lossless | ~200 Mbps | ~9 ms | yes, in the BGRA frame | libomt owns it, no GPU codec |
-| OMT-HX | HEVC (H.265), GPU hardware | 15 / 30 / 50 Mbps | 29-42 ms | optional, stacked plane | ~5-11 ms to send, ~6-13 ms to receive, CPU colour conversion included |
+| OMT-HX, HEVC | HEVC (H.265), GPU hardware | 15 / 30 / 50 Mbps | 29-42 ms | optional, stacked plane | ~5-11 ms to send, ~6-13 ms to receive, CPU colour conversion included |
+| OMT-HX, H.264 | H.264, GPU hardware | 21 / 42 / 70 Mbps | 33-44 ms | optional, stacked plane | ~7-11 ms to send, ~8-13 ms to receive, CPU colour conversion included |
 | NDI (High Bandwidth) | SpeedHQ, intra | ~150 Mbps | ~16 ms | yes, RGBA 4:4:4:4 | CPU |
 | NDI\|HX | H.264 / HEVC | 1-50 Mbps | 80-200 ms | limited, 4:2:0 | CPU or GPU |
 
@@ -80,7 +87,7 @@ modes spend bandwidth to save latency.
 - The GPU codec is the smaller part of the cost. At 1080p60 the hardware encode call takes about
   3 ms and the decode about 4 ms; converting between BGRA and NV12 on one CPU core takes about 5 ms
   at each end. OMT full spends no GPU codec time but carries the whole picture.
-- Both compressed modes are lossy (OMT-HX is 8-bit 4:2:0 HEVC); OMT full and NDI are intra and
+- Both compressed modes are lossy (OMT-HX is 8-bit 4:2:0 HEVC or H.264); OMT full and NDI are intra and
   visually lossless. OMT-HX keeps OMT discovery, audio and tally; NDI|HX keeps NDI's.
 - Resolution and frame rate are bounded by the time each end needs per frame, most of it CPU colour
   conversion, and not by the transport or the GPU codec: on the test PC, HX holds 60 fps up to 1080p
@@ -90,15 +97,17 @@ modes spend bandwidth to save latency.
 
 ## Technical detail
 
-**Transport.** OMT-HX is not a new protocol. In version 1 it sends HEVC as ordinary OMT video
-frames tagged `HEVC` (a small patch lets stock libomt carry, rather than reject, a foreign tag).
+**Transport.** OMT-HX is not a new protocol. In version 1 it sends HEVC or H.264 as ordinary OMT
+video frames tagged `HEVC` or `H264` (a small patch lets stock libomt carry, rather than reject, a
+foreign tag).
 Discovery, connection, audio, tally and metadata stay OMT's, so an OMT-HX source is found and
 connected to exactly like a plain OMT one.
 
-**Codec.** Version 1 codes HEVC (H.265) Main, 8-bit, 4:2:0, progressive, no B-frames, full-range
-BT.709. H.264 (AVC) is under research and not implemented yet. Encoding runs on the GPU's hardware
-encoder through FFmpeg (`hevc_amf` on AMD, `hevc_nvenc` on NVIDIA); decoding uses D3D11 hardware
-(`hevc (d3d11va)`). Plain OMT instead uses libomt's VMX codec, which is intra and has no GPU codec
+**Codec.** Version 1 codes HEVC (H.265) or H.264 (AVC), 8-bit, 4:2:0, progressive, no B-frames,
+full-range BT.709. HEVC stays the default and is Main profile; the H.264 profile is the encoder's
+choice. Encoding runs on the GPU's hardware encoder through FFmpeg (`hevc_amf` and `h264_amf` on
+AMD, `hevc_nvenc` and `h264_nvenc` on NVIDIA); decoding uses D3D11 hardware (`hevc (d3d11va)` or
+`h264 (d3d11va)`). Plain OMT instead uses libomt's VMX codec, which is intra and has no GPU codec
 step.
 
 **Colour.** Buffers cross the API as BGRA and are converted to NV12 (BT.709, full range) on the CPU
@@ -107,7 +116,7 @@ the mode. Full OMT keeps the whole BGRA picture, so it is visually lossless.
 
 **Alpha (optional).** Alpha is off by default: it is a flag on the frame format
 (`VideoFormat::alpha`), and a run without it codes only the display picture at no extra cost. Turned
-on, the alpha plane is stacked under the colour in the same HEVC picture (a 1080p alpha source codes
+on, the alpha plane is stacked under the colour in the same coded picture (a 1080p alpha source codes
 as 1920x2176), so it rides in the one stream with no second connection. Alpha is lossy and doubles
 the coded size. With alpha on, each end needs about 13 ms per 1080p frame when it runs alone, inside
 the 16.7 ms of a 60 fps frame. With sender and receiver on one PC they share the CPU and GPU, and
@@ -124,7 +133,9 @@ sweeps.
 ## Limits of version 1
 
 8-bit 4:2:0 only. Colour conversion runs on the CPU. A program that speaks only stock OMT sees an
-OMT-HX source with audio and no picture. See section 13 of the design.
+OMT-HX source with audio and no picture. Both ends must run this build of libomt.dll: an older
+OMT-HX receiver, like a stock OMT program, sees an H.264 source with audio and no picture. See
+section 13 of the design.
 
 ## Licence
 

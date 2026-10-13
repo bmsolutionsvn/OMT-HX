@@ -116,3 +116,35 @@ Sender and receiver on one PC, as in the table at the top.
 - Two PCs over a real network. This matters most for 1080p60 with alpha, where one PC is the limit.
 - An idle PC. Repeat the table with nothing else running before quoting a figure to the millisecond.
 - Picture quality by eye on real camera footage.
+
+## H.264 beside HEVC
+
+Measured 2026-10-13 with `hevc_amf` and `h264_amf` in one session, on the same PC as above, by
+`scripts\measure.ps1 -Only "60"` (the H.264 rows use `--codec h264`). Each HEVC row sits directly
+above its H.264 partner.
+
+| Case | Sender fps | Recv fps | Mbps | Send ms | Receive ms | Delay avg ms | Delay max ms | Discarded |
+|------|-----------|----------|------|---------|------------|--------------|--------------|-----------|
+| hx 1080p60 | 60 | 60 | 29.8 | 11.2 | 14.3 | 43.4 | 47.7 | 28 |
+| h264 1080p60 | 60 | 60 | 41.8 | 10.5 | 13.3 | 41.4 | 233.9 | 59 |
+| hx 1080p60 low | 60 | 60 | 15.0 | 10.9 | 13.7 | 42.3 | 56.9 | 28 |
+| h264 1080p60 low | 60 | 60 | 20.8 | 10.6 | 13.0 | 41.2 | 51.6 | 27 |
+| hx 1080p60 high | 60 | 60 | 49.8 | 10.5 | 13.9 | 43.4 | 50.1 | 28 |
+| h264 1080p60 high | 60 | 60 | 69.4 | 11.3 | 15.5 | 44.1 | 57.7 | 27 |
+| hx 720p60 alpha | 60 | 60 | 14.2 | 7.0 | 7.9 | 32.6 | 37.0 | 29 |
+| h264 720p60 alpha | 60 | 60 | 19.8 | 7.0 | 7.9 | 33.2 | 50.2 | 28 |
+| hx 1080p60 alpha | 60 | 60 | 32.0 | 14.4 | 16.9 | 67.8 | 91.0 | 32 |
+| h264 1080p60 alpha | 60 | 60 | 44.7 | 15.2 | 17.1 | 59.1 | 93.8 | 26 |
+
+Notes:
+
+- `h264 1080p60 alpha` held 60 fps received in this run (58 or more). So did `hx 1080p60 alpha`;
+  this session was lighter than the ten-minute run above, where HEVC's 1080p60 alpha fell to a
+  median of 57 fps.
+- At 1080p60 medium the two codecs are close. H.264 encoded in 10.5 ms against HEVC's 11.2 ms, and
+  decoded in 13.3 ms against 14.3 ms: about 0.7 ms faster to send and 1.0 ms faster to receive.
+- The alpha stream decoded as `h264 (d3d11va)`. The taller 1920x2176 picture still takes D3D11
+  hardware.
+
+Not measured here: `h264_nvenc` (this PC has no NVIDIA GPU), and picture quality by eye, so the
+1.4 bitrate factor for H.264 is still a starting value.

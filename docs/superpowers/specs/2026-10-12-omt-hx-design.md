@@ -1,7 +1,8 @@
 # OMT-HX: design
 
 **Status:** approved by the owner 2026-10-12, with the MIT licence. Section 5 was
-proven by a throwaway build on 2026-10-13; nothing else is built yet.
+proven by a throwaway build on 2026-10-13; nothing else is built yet. Section 17, added 2026-10-13,
+makes H.264 a second HX codec; where sections 1 to 16 say HEVC, section 17 says what differs.
 
 **Parent decisions:** broadcast roadmap R11 and R12
 (`../../../../docs/superpowers/specs/2026-10-12-broadcast-roadmap-design.md`).
@@ -34,7 +35,7 @@ shared library in its own repository, used by both apps.
 |---|---|---|
 | H1 | Relation to OMT | HX is a codec inside OMT, not a new protocol. Discovery, connection, audio, tally and metadata are OMT's, unchanged. |
 | H2 | Carriage | HEVC frames travel as normal OMT video frames with the codec tag `HEVC`. This needs a small patch to the OMT library (section 5), because stock libomt refuses any tag but its own. |
-| H3 | Codec | HEVC Main, 8-bit 4:2:0, full-range BT.709, progressive. No B-frames. H.264 (AVC) is under research, not implemented in version 1. |
+| H3 | Codec | HEVC Main, 8-bit 4:2:0, full-range BT.709, progressive. No B-frames. H.264 (AVC) is a second codec, added in section 17. |
 | H4 | Encoder | The GPU's hardware encoder through FFmpeg. The first of `hevc_nvenc`, `hevc_amf`, `hevc_qsv`, `hevc_mf` that opens is used. This is the pattern BreadCamera's preview encoder already uses. No software encoder. |
 | H5 | Decoder | FFmpeg's HEVC decoder, with D3D11 hardware decoding when the GPU offers it. Software decoding is the fallback; it uses several threads and so adds about three frames of delay. |
 | H6 | Alpha | Alpha is off by default (the format's `Alpha` flag). When on, fill and alpha are packed into one picture: fill on top, alpha below as a grey image (section 7). Fill is premultiplied on the wire. |
@@ -286,3 +287,35 @@ called working.
 | Improving VMX (slices over UDP, block skipping, residual coding, NVENC motion vectors) | A transport and a codec of our own, no longer readable by any other OMT program, for at most one frame saved on this link. |
 | NVENC only, through NVIDIA's SDK | Cannot be developed or tested on this PC, and BreadCamera already runs on non-NVIDIA GPUs with its ONNX fallback. |
 | NDI\|HX | Sending HX needs NDI's Advanced SDK, and its closed runtime cannot ship inside a GPL BreadStudio. |
+
+## 17. H.264 as a second HX codec
+
+Added 2026-10-13. An HX source sends HEVC or H.264, chosen per source by the
+sender, the way NDI HX3 offers both. HEVC stays the default and is unchanged.
+
+| # | Topic | Decision |
+|---|---|---|
+| D1 | Who chooses | The sender, per source: `Codec::Hevc` (the default) or `Codec::H264`. The receiver has no setting; it reads the tag on each frame. |
+| D2 | Carriage | A second codec tag, `H264`, the 32-bit value `0x34363248`. The libomt patch passes it through exactly as it passes `HEVC`; the patch is now 32 added lines. |
+| D3 | H.264 on the wire | 8-bit 4:2:0, full-range BT.709, progressive, no B-frames, Annex B. Every keyframe is an IDR picture with SPS and PPS in the same access unit. The profile is the encoder's choice. |
+| D4 | Encoder | The first of `h264_nvenc`, `h264_amf`, `h264_qsv`, `h264_mf` that opens, with the same per-vendor low-delay settings as HEVC. No software encoder. |
+| D5 | No fallback between codecs | If the chosen codec has no hardware encoder, the sender fails with an error naming what it tried. |
+| D6 | Bitrate | 1.4 times the HEVC bitrate of the same quality level: 21, 42 and 70 Mbps at 1080p60. A starting value; picture quality has not been compared by eye. |
+| D7 | Codec change on a live source | When a source comes back with the other codec, the receiver rebuilds its decoder and waits for a keyframe. |
+
+Why: H.264 has a hardware encoder on every GPU, including ones too old for
+HEVC, and it is the simpler codec. Measured figures for both are in
+`docs/MEASUREMENTS.md`.
+
+What H.264 does not change:
+
+- It is covered by a patent pool, as HEVC is (section 14). It is not the
+  royalty-free option; AV1 still is.
+- Alpha packing, keyframe rules, discovery, audio and tally are the same for
+  both codecs.
+- A receiver built before this section, like a stock OMT program, sees an
+  H.264 source with audio and no picture.
+
+One difference in behaviour: left alone, AMD's H.264 encoder sends very few
+IDR pictures, so H.264 depends on the sender forcing a keyframe every
+2 seconds (section 8). It already does.
