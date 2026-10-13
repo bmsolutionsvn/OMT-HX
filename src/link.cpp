@@ -80,7 +80,7 @@ void Sender::sendVideo(const VideoFormat& fmt, std::span<const uint8_t> bgra, bo
   }
 
   if (!d_->encoder || !(fmt == d_->format)) {
-    d_->encoder = std::make_unique<Encoder>(fmt.width, codedHeight(fmt), fmt.fpsN, fmt.fpsD,
+    d_->encoder = std::make_unique<Encoder>(Codec::Hevc, fmt.width, codedHeight(fmt), fmt.fpsN, fmt.fpsD,
                                             targetBitrate(fmt, d_->quality, Codec::Hevc));
     d_->format = fmt;
     d_->policy = KeyframePolicy();
@@ -248,7 +248,7 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
     d_->discard();
     return false;
   }
-  if (!d_->decoder) d_->decoder = std::make_unique<Decoder>();
+  if (!d_->decoder) d_->decoder = std::make_unique<Decoder>(Codec::Hevc);
 
   const auto t0 = Clock::now();
   int64_t timestamp = 0;

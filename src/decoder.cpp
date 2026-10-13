@@ -7,6 +7,7 @@ extern "C" {
 
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 namespace omthx {
 namespace {
@@ -24,25 +25,26 @@ void copyPlane(uint8_t* dst, const uint8_t* src, int srcStride, int bytes, int r
 }
 }  // namespace
 
-Decoder::Decoder() {
-  const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
-  if (!codec) throw std::runtime_error("FFmpeg was built without an HEVC decoder");
-  ctx_ = avcodec_alloc_context3(codec);
+Decoder::Decoder(Codec codec) : codec_(codec) {
+  const std::string base = codecName(codec);
+  const AVCodec* av = avcodec_find_decoder(codec == Codec::H264 ? AV_CODEC_ID_H264 : AV_CODEC_ID_HEVC);
+  if (!av) throw std::runtime_error("FFmpeg was built without the " + base + " decoder");
+  ctx_ = avcodec_alloc_context3(av);
   ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
   if (av_hwdevice_ctx_create(&hw_, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0) >= 0) {
     ctx_->hw_device_ctx = av_buffer_ref(hw_);
     ctx_->get_format = pickFormat;
-    name_ = "hevc (d3d11va)";
+    name_ = base + " (d3d11va)";
   } else {
     // ponytail: four frame threads keep 1080p60 in real time but add three frames of delay.
     // Hardware decoding is the real path; this is the fallback for a PC without it.
     ctx_->thread_count = 4;
-    name_ = "hevc (software)";
+    name_ = base + " (software)";
   }
-  if (avcodec_open2(ctx_, codec, nullptr) < 0) {
+  if (avcodec_open2(ctx_, av, nullptr) < 0) {
     avcodec_free_context(&ctx_);
     av_buffer_unref(&hw_);
-    throw std::runtime_error("cannot open the HEVC decoder");
+    throw std::runtime_error("cannot open the " + base + " decoder");
   }
   frame_ = av_frame_alloc();
   sw_ = av_frame_alloc();
@@ -87,7 +89,7 @@ Decoded Decoder::decode(std::span<const uint8_t> au, int64_t timestamp, Nv12& ou
     }
     f = sw_;
   } else {
-    name_ = "hevc (software)";
+    name_ = std::string(codecName(codec_)) + " (software)";
   }
 
   const int w = f->width, h = f->height;

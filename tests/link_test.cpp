@@ -18,7 +18,7 @@ constexpr int64_t kFrame = 166'667;  // one frame at 60 fps, in OMT units
 
 bool hardwareHevc() {
   try {
-    Encoder probe(640, 360, 60, 1, 1'000'000);
+    Encoder probe(Codec::Hevc, 640, 360, 60, 1, 1'000'000);
     return true;
   } catch (const std::runtime_error& e) {
     MESSAGE("SKIPPED, no hardware HEVC encoder on this PC: " << e.what());
