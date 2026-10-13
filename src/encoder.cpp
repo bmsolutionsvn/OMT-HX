@@ -117,9 +117,9 @@ std::vector<Packet> Encoder::encode(const Nv12& pic, bool forceKeyframe) {
   while (avcodec_receive_packet(ctx_, packet_) >= 0) {
     Packet p;
     p.data.assign(packet_->data, packet_->data + packet_->size);
-    p.keyframe = isKeyframe(p.data);
+    p.keyframe = isKeyframe(Codec::Hevc, p.data);
     // Safety net for an encoder that keeps its parameter sets out of band.
-    if (p.keyframe && !hasNalType(p.data, 32) && ctx_->extradata_size > 4 && ctx_->extradata[0] == 0 &&
+    if (p.keyframe && !hasNalType(Codec::Hevc, p.data, 32) && ctx_->extradata_size > 4 && ctx_->extradata[0] == 0 &&
         ctx_->extradata[1] == 0) {
       p.data.insert(p.data.begin(), ctx_->extradata, ctx_->extradata + ctx_->extradata_size);
     }

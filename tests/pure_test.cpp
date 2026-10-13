@@ -1,34 +1,78 @@
 #include <doctest/doctest.h>
 
+#include <string>
 #include <vector>
 
 #include "codec.h"
 
 using namespace omthx;
 
-TEST_CASE("targetBitrate follows bits per pixel, quality and alpha") {
+TEST_CASE("targetBitrate follows bits per pixel, quality, alpha and codec") {
   VideoFormat f{1920, 1080, 60, 1, false};
-  CHECK(targetBitrate(f, Quality::Low) == 14'929'920);
-  CHECK(targetBitrate(f, Quality::Medium) == 29'859'840);
-  CHECK(targetBitrate(f, Quality::High) == 49'766'400);
+  CHECK(targetBitrate(f, Quality::Low, Codec::Hevc) == 14'929'920);
+  CHECK(targetBitrate(f, Quality::Medium, Codec::Hevc) == 29'859'840);
+  CHECK(targetBitrate(f, Quality::High, Codec::Hevc) == 49'766'400);
+  CHECK(targetBitrate(f, Quality::Low, Codec::H264) == 20'901'888);  // 1.4 times HEVC
+  CHECK(targetBitrate(f, Quality::Medium, Codec::H264) == 41'803'776);
+  CHECK(targetBitrate(f, Quality::High, Codec::H264) == 69'672'960);
   f.alpha = true;
-  CHECK(targetBitrate(f, Quality::Medium) == 37'324'800);
-  CHECK(targetBitrate(VideoFormat{1280, 720, 30000, 1001, false}, Quality::Medium) == 6'628'891);
+  CHECK(targetBitrate(f, Quality::Medium, Codec::Hevc) == 37'324'800);
+  CHECK(targetBitrate(f, Quality::Medium, Codec::H264) == 52'254'720);
+  CHECK(targetBitrate(VideoFormat{1280, 720, 30000, 1001, false}, Quality::Medium, Codec::Hevc) == 6'628'891);
 }
 
-TEST_CASE("isKeyframe and hasNalType read NAL unit types from Annex B data") {
+TEST_CASE("codec tags are the FourCCs HEVC and H264 and nothing else is a codec") {
+  CHECK(codecTag(Codec::Hevc) == 0x43564548);
+  CHECK(codecTag(Codec::H264) == 0x34363248);
+  Codec c = Codec::Hevc;
+  CHECK(codecFromTag(0x34363248, c));
+  CHECK(c == Codec::H264);
+  CHECK(codecFromTag(0x43564548, c));
+  CHECK(c == Codec::Hevc);
+  c = Codec::H264;
+  CHECK_FALSE(codecFromTag(0x31584D56, c));  // VMX1
+  CHECK_FALSE(codecFromTag(0, c));
+  CHECK(c == Codec::H264);  // untouched by a tag that is not a codec
+  CHECK(std::string(codecName(Codec::Hevc)) == "hevc");
+  CHECK(std::string(codecName(Codec::H264)) == "h264");
+}
+
+TEST_CASE("isKeyframe and hasNalType read HEVC NAL unit types from Annex B data") {
   const std::vector<uint8_t> idr{0, 0, 0, 1, 0x40, 1, 0xAA, 0, 0, 1, 0x26, 1, 0xBB};  // VPS (32), then IDR (19)
   const std::vector<uint8_t> trail{0, 0, 0, 1, 0x02, 1, 0xCC};                         // TRAIL_R (1)
   const std::vector<uint8_t> cra{0, 0, 1, 0x2A, 1};                                    // CRA (21)
   const std::vector<uint8_t> cut{0, 0, 1};                                             // start code, nothing after
-  CHECK(isKeyframe(idr));
-  CHECK(isKeyframe(cra));
-  CHECK_FALSE(isKeyframe(trail));
-  CHECK_FALSE(isKeyframe(cut));
-  CHECK_FALSE(isKeyframe(std::vector<uint8_t>{}));
-  CHECK(hasNalType(idr, 32));
-  CHECK(hasNalType(idr, 19));
-  CHECK_FALSE(hasNalType(trail, 32));
+  CHECK(isKeyframe(Codec::Hevc, idr));
+  CHECK(isKeyframe(Codec::Hevc, cra));
+  CHECK_FALSE(isKeyframe(Codec::Hevc, trail));
+  CHECK_FALSE(isKeyframe(Codec::Hevc, cut));
+  CHECK_FALSE(isKeyframe(Codec::Hevc, std::vector<uint8_t>{}));
+  CHECK(hasNalType(Codec::Hevc, idr, 32));
+  CHECK(hasNalType(Codec::Hevc, idr, 19));
+  CHECK_FALSE(hasNalType(Codec::Hevc, trail, 32));
+}
+
+TEST_CASE("isKeyframe and hasNalType read H.264 NAL unit types from Annex B data") {
+  // What an AMD keyframe looks like: AUD (9), SPS (7), PPS (8), then the IDR (5) last.
+  const std::vector<uint8_t> idr{0, 0, 0, 1, 0x09, 0x10, 0, 0, 0, 1, 0x67, 0xAA,
+                                 0, 0, 1,    0x68, 0xBB, 0, 0, 1, 0x65, 0xCC};
+  const std::vector<uint8_t> slice{0, 0, 0, 1, 0x09, 0x30, 0, 0, 1, 0x41, 0xDD};  // AUD, then a non-IDR slice (1)
+  const std::vector<uint8_t> cut{0, 0, 1};
+  CHECK(isKeyframe(Codec::H264, idr));
+  CHECK_FALSE(isKeyframe(Codec::H264, slice));
+  CHECK_FALSE(isKeyframe(Codec::H264, cut));
+  CHECK_FALSE(isKeyframe(Codec::H264, std::vector<uint8_t>{}));
+  CHECK(hasNalType(Codec::H264, idr, 7));
+  CHECK(hasNalType(Codec::H264, idr, 8));
+  CHECK(hasNalType(Codec::H264, idr, 5));
+  CHECK_FALSE(hasNalType(Codec::H264, slice, 7));
+}
+
+TEST_CASE("a keyframe of one codec is not a keyframe when read as the other") {
+  const std::vector<uint8_t> hevcIdr{0, 0, 0, 1, 0x26, 1, 0xBB};  // HEVC IDR (19); read as H.264 the byte is type 6
+  const std::vector<uint8_t> h264Idr{0, 0, 0, 1, 0x65, 0xCC};     // H.264 IDR (5); read as HEVC the byte is type 50
+  CHECK_FALSE(isKeyframe(Codec::H264, hevcIdr));
+  CHECK_FALSE(isKeyframe(Codec::Hevc, h264Idr));
 }
 
 TEST_CASE("alphaTop rounds up to 16 and codedHeight doubles it only with alpha") {

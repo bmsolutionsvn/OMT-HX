@@ -81,7 +81,7 @@ void Sender::sendVideo(const VideoFormat& fmt, std::span<const uint8_t> bgra, bo
 
   if (!d_->encoder || !(fmt == d_->format)) {
     d_->encoder = std::make_unique<Encoder>(fmt.width, codedHeight(fmt), fmt.fpsN, fmt.fpsD,
-                                            targetBitrate(fmt, d_->quality));
+                                            targetBitrate(fmt, d_->quality, Codec::Hevc));
     d_->format = fmt;
     d_->policy = KeyframePolicy();
     d_->stamps.clear();
@@ -244,7 +244,7 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
   if (d_->haveLast && isGap(d_->lastTimestamp, f->Timestamp, fmt.fpsN, fmt.fpsD)) d_->waiting = true;
   d_->lastTimestamp = f->Timestamp;
   d_->haveLast = true;
-  if (d_->waiting && !isKeyframe(au)) {
+  if (d_->waiting && !isKeyframe(Codec::Hevc, au)) {
     d_->discard();
     return false;
   }

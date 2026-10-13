@@ -16,12 +16,16 @@ struct SwsContext;
 namespace omthx {
 
 inline constexpr int kCodecHevc = 0x43564548;  // 'HEVC' as OMT writes FourCCs
+inline constexpr int kCodecH264 = 0x34363248;  // 'H264'
 inline constexpr char kKeyframeRequest[] = "<OMTHX Keyframe=\"true\" />";
 
 // ---- pure functions (src/pure.cpp) ----
-int64_t targetBitrate(const VideoFormat& format, Quality quality);
-bool hasNalType(std::span<const uint8_t> annexB, int type);
-bool isKeyframe(std::span<const uint8_t> annexB);
+int codecTag(Codec codec);                 // the tag an Hx frame of this codec carries
+bool codecFromTag(int tag, Codec& out);    // false for a tag that is not an Hx codec
+const char* codecName(Codec codec);        // "hevc" or "h264"
+int64_t targetBitrate(const VideoFormat& format, Quality quality, Codec codec);
+bool hasNalType(Codec codec, std::span<const uint8_t> annexB, int type);
+bool isKeyframe(Codec codec, std::span<const uint8_t> annexB);
 int alphaTop(int height);                       // row where the alpha picture starts
 int codedHeight(const VideoFormat& format);     // height of the picture the encoder sees
 bool isGap(int64_t previous, int64_t current, int fpsN, int fpsD);

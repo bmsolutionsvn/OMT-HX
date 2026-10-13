@@ -10,6 +10,7 @@ namespace omthx {
 
 enum class Mode { Full, Hx };  // Full = plain OMT with VMX; Hx = HEVC inside OMT
 enum class Quality { Low, Medium, High };
+enum class Codec { Hevc, H264 };  // the video codec of an Hx source
 
 struct VideoFormat {
   int width = 0;  // the picture as displayed

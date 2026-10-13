@@ -14,20 +14,39 @@ extern "C" {
 
 namespace omthx {
 
-int64_t targetBitrate(const VideoFormat& f, Quality q) {
+int64_t targetBitrate(const VideoFormat& f, Quality q, Codec codec) {
   static constexpr double kBitsPerPixel[] = {0.12, 0.24, 0.40};
   double bits = kBitsPerPixel[static_cast<int>(q)] * f.width * f.height * f.fpsN / f.fpsD;
   if (f.alpha) bits *= 1.25;
+  if (codec == Codec::H264) bits *= 1.4;  // H.264 needs more bits than HEVC for the same picture
   return std::llround(bits);
 }
 
+int codecTag(Codec codec) { return codec == Codec::H264 ? kCodecH264 : kCodecHevc; }
+
+bool codecFromTag(int tag, Codec& out) {
+  if (tag == kCodecHevc) {
+    out = Codec::Hevc;
+    return true;
+  }
+  if (tag == kCodecH264) {
+    out = Codec::H264;
+    return true;
+  }
+  return false;
+}
+
+const char* codecName(Codec codec) { return codec == Codec::H264 ? "h264" : "hevc"; }
+
 namespace {
 // Calls fn(type) for each NAL unit and stops at the first true.
+// The type sits in a different place in each codec's NAL header byte.
 template <typename F>
-bool anyNal(std::span<const uint8_t> d, F fn) {
+bool anyNal(Codec codec, std::span<const uint8_t> d, F fn) {
   for (size_t i = 0; i + 3 < d.size(); ++i) {
     if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1) {
-      if (fn((d[i + 3] >> 1) & 0x3F)) return true;
+      const int header = d[i + 3];
+      if (fn(codec == Codec::H264 ? (header & 0x1F) : ((header >> 1) & 0x3F))) return true;
       i += 2;
     }
   }
@@ -35,13 +54,13 @@ bool anyNal(std::span<const uint8_t> d, F fn) {
 }
 }  // namespace
 
-bool hasNalType(std::span<const uint8_t> d, int type) {
-  return anyNal(d, [type](int t) { return t == type; });
+bool hasNalType(Codec codec, std::span<const uint8_t> d, int type) {
+  return anyNal(codec, d, [type](int t) { return t == type; });
 }
 
-// HEVC types 16 to 23 are the pictures a decoder can start from.
-bool isKeyframe(std::span<const uint8_t> d) {
-  return anyNal(d, [](int t) { return t >= 16 && t <= 23; });
+// The pictures a decoder can start from: HEVC types 16 to 23, H.264 type 5 (IDR).
+bool isKeyframe(Codec codec, std::span<const uint8_t> d) {
+  return anyNal(codec, d, [codec](int t) { return codec == Codec::H264 ? t == 5 : (t >= 16 && t <= 23); });
 }
 
 int alphaTop(int height) { return (height + 15) / 16 * 16; }

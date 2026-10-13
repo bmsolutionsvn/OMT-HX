@@ -14,7 +14,8 @@ namespace {
 // Null, with a visible message, on a PC that has no hardware HEVC encoder.
 std::unique_ptr<Encoder> openEncoder(const VideoFormat& f) {
   try {
-    return std::make_unique<Encoder>(f.width, codedHeight(f), f.fpsN, f.fpsD, targetBitrate(f, Quality::Medium));
+    return std::make_unique<Encoder>(f.width, codedHeight(f), f.fpsN, f.fpsD,
+                                     targetBitrate(f, Quality::Medium, Codec::Hevc));
   } catch (const std::runtime_error& e) {
     MESSAGE("SKIPPED, no hardware HEVC encoder on this PC: " << e.what());
     return nullptr;
@@ -43,12 +44,12 @@ TEST_CASE("Encoder: first packet is a self-contained keyframe, then no keyframes
   const std::vector<Packet> all = encodePattern(*enc, f, 30, 20);
   REQUIRE(all.size() >= 29);  // low delay: the encoder holds back one picture at most
   CHECK(all[0].keyframe);
-  CHECK(hasNalType(all[0].data, 32));  // VPS
-  CHECK(hasNalType(all[0].data, 33));  // SPS
-  CHECK(hasNalType(all[0].data, 34));  // PPS
+  CHECK(hasNalType(Codec::Hevc, all[0].data, 32));  // VPS
+  CHECK(hasNalType(Codec::Hevc, all[0].data, 33));  // SPS
+  CHECK(hasNalType(Codec::Hevc, all[0].data, 34));  // PPS
   for (size_t i = 1; i < 20; ++i) CHECK_FALSE(all[i].keyframe);
   CHECK(all[20].keyframe);
-  CHECK(hasNalType(all[20].data, 32));  // a late joiner can start here
+  CHECK(hasNalType(Codec::Hevc, all[20].data, 32));  // a late joiner can start here
 }
 
 TEST_CASE("a picture with alpha survives pack, encode, decode and unpack") {
