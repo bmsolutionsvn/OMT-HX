@@ -99,7 +99,7 @@ v1.0.0.19) was read for this design:
 - **The C wrapper** passes the frame struct straight to the .NET library, so
   it needs no change. `omthx` defines the `HEVC` tag value itself.
 
-The patch, 31 added lines of C# in three files:
+The patch, 32 added lines of C# in three files:
 
 1. Add `HEVC = 0x43564548` to `OMTCodec`.
 2. In `SendVideo`, treat `HEVC` exactly like the existing `VMX1` pass-through,

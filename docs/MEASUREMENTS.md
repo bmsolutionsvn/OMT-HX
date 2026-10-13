@@ -9,7 +9,7 @@ each runs slower than it would alone. Each row is the median of a 20 s run after
 - GPU: AMD Radeon RX 6600
 - CPU: AMD Ryzen 7 5700X 8-Core Processor
 - Encoder: hevc_amf   Decoder: hevc (d3d11va)
-- Codec: HEVC (H.265) in version 1; H.264 is under research
+- Codec: HEVC (H.265) and H.264 (AVC), HEVC the default; see "H.264 beside HEVC" below
 - Run: `scripts\measure.ps1 -Seconds 20`
 - The PC was not idle: other programs used 13 to 56% of the CPU, and a remote-desktop program was
   using the same hardware encoder. Figures move by a few ms from run to run.
