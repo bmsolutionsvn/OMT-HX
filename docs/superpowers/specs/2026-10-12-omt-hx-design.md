@@ -34,10 +34,10 @@ shared library in its own repository, used by both apps.
 |---|---|---|
 | H1 | Relation to OMT | HX is a codec inside OMT, not a new protocol. Discovery, connection, audio, tally and metadata are OMT's, unchanged. |
 | H2 | Carriage | HEVC frames travel as normal OMT video frames with the codec tag `HEVC`. This needs a small patch to the OMT library (section 5), because stock libomt refuses any tag but its own. |
-| H3 | Codec | HEVC Main, 8-bit 4:2:0, full-range BT.709, progressive. No B-frames. |
+| H3 | Codec | HEVC Main, 8-bit 4:2:0, full-range BT.709, progressive. No B-frames. H.264 (AVC) is under research, not implemented in version 1. |
 | H4 | Encoder | The GPU's hardware encoder through FFmpeg. The first of `hevc_nvenc`, `hevc_amf`, `hevc_qsv`, `hevc_mf` that opens is used. This is the pattern BreadCamera's preview encoder already uses. No software encoder. |
 | H5 | Decoder | FFmpeg's HEVC decoder, with D3D11 hardware decoding when the GPU offers it. Software decoding is the fallback; it uses several threads and so adds about three frames of delay. |
-| H6 | Alpha | Fill and alpha are packed into one picture: fill on top, alpha below as a grey image (section 7). Fill is premultiplied on the wire. |
+| H6 | Alpha | Alpha is off by default (the format's `Alpha` flag). When on, fill and alpha are packed into one picture: fill on top, alpha below as a grey image (section 7). Fill is premultiplied on the wire. |
 | H7 | Bitrate | Constant bitrate from bits per pixel, by quality level: Low 0.12, Medium 0.24, High 0.40. At 1080p60 that is 15, 30 and 50 Mbps. Alpha adds 25%. These are starting values, tuned by measurement in milestone H2. |
 | H8 | Keyframes | A keyframe is sent at start, when a receiver asks for one, when the library reports a dropped frame, and every 2 seconds (section 8). |
 | H9 | One library for both modes | `omthx` wraps libomt. Its sender sends plain OMT or OMT-HX; its receiver reads both and returns the same frame type. Apps use `omthx` and never call libomt directly. |
