@@ -133,9 +133,9 @@ sweeps.
 ## Limits of version 1
 
 8-bit 4:2:0 only. Colour conversion runs on the CPU. A program that speaks only stock OMT sees an
-OMT-HX source with audio and no picture. Both ends must run this build of libomt.dll: an older
-OMT-HX receiver, like a stock OMT program, sees an H.264 source with audio and no picture. See
-sections 3 and 17 of the design.
+OMT-HX source with audio and no picture. An H.264 source needs both ends on this build of
+libomt.dll: an older OMT-HX receiver, like a stock OMT program, sees it with audio and no picture.
+See sections 3 and 17 of the design.
 
 ## Licence
 
