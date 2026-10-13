@@ -1,7 +1,10 @@
 #include "codec.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <execution>
+#include <iterator>
 #include <stdexcept>
 
 extern "C" {
@@ -115,14 +118,29 @@ void Packer::pack(const VideoFormat& f, std::span<const uint8_t> bgra, bool prem
   const uint8_t* src = bgra.data();
   if (f.alpha && !premultiplied) {
     scratch_.resize(bgra.size());
-    for (size_t i = 0; i < bgra.size(); i += 4) {
-      const unsigned a = bgra[i + 3];
-      scratch_[i] = scale(bgra[i], a);
-      scratch_[i + 1] = scale(bgra[i + 1], a);
-      scratch_[i + 2] = scale(bgra[i + 2], a);
-      scratch_[i + 3] = static_cast<uint8_t>(a);
-    }
-    src = scratch_.data();
+    const uint8_t* in = bgra.data();
+    uint8_t* dst = scratch_.data();
+    // Bands of rows on the thread pool: a fade makes every pixel need the multiply, which one core
+    // cannot do for 1080p inside a 60 fps frame.
+    static constexpr int kBands[] = {0, 1, 2, 3, 4, 5, 6, 7};
+    const size_t rowBytes = static_cast<size_t>(w) * 4;
+    std::for_each(std::execution::par, std::begin(kBands), std::end(kBands), [=](int band) {
+      const size_t end = rowBytes * (static_cast<size_t>(h) * (band + 1) / std::size(kBands));
+      for (size_t i = rowBytes * (static_cast<size_t>(h) * band / std::size(kBands)); i < end; i += 4) {
+        const unsigned a = in[i + 3];
+        if (a == 255) {  // most pixels of a key are opaque or fully transparent: no multiply
+          std::memcpy(dst + i, in + i, 4);
+        } else if (a == 0) {
+          std::memset(dst + i, 0, 4);
+        } else {
+          dst[i] = scale(in[i], a);
+          dst[i + 1] = scale(in[i + 1], a);
+          dst[i + 2] = scale(in[i + 2], a);
+          dst[i + 3] = static_cast<uint8_t>(a);
+        }
+      }
+    });
+    src = dst;
   }
 
   const uint8_t* srcPlanes[4] = {src, nullptr, nullptr, nullptr};
