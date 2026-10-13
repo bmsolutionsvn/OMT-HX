@@ -1,7 +1,8 @@
 # OMT-HX: design
 
 **Status:** approved by the owner 2026-10-12, with the MIT licence. Section 5 was
-proven by a throwaway build on 2026-10-13; nothing else is built yet. Section 17, added 2026-10-13,
+proven by a throwaway build on 2026-10-13. Sections 1 to 17 are implemented, tested and measured; HX
+ships HEVC and H.264, with the figures in `docs/MEASUREMENTS.md`. Section 17, added 2026-10-13,
 makes H.264 a second HX codec; where sections 1 to 16 say HEVC, section 17 says what differs.
 
 **Parent decisions:** broadcast roadmap R11 and R12

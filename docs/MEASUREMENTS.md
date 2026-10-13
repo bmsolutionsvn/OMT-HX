@@ -119,12 +119,14 @@ Sender and receiver on one PC, as in the table at the top.
 
 ## H.264 beside HEVC
 
-Measured 2026-10-13 with `hevc_amf` and `h264_amf` in one session, on the same PC as above, by
-`scripts\measure.ps1 -Only "60"` (the H.264 rows use `--codec h264`). Each HEVC row sits directly
-above its H.264 partner.
+Measured 2026-10-13 with `hevc_amf` and `h264_amf`, on the same PC as above, by
+`scripts\measure.ps1` with `-Only "60"` for the 1080p60 rows and `-Only "720p60"` for the 720p60
+rows (the H.264 rows use `--codec h264`). Each HEVC row sits directly above its H.264 partner.
 
 | Case | Sender fps | Recv fps | Mbps | Send ms | Receive ms | Delay avg ms | Delay max ms | Discarded |
 |------|-----------|----------|------|---------|------------|--------------|--------------|-----------|
+| hx 720p60 | 60 | 60 | 13.0 | 5.3 | 6.9 | 29.8 | 35.9 | 29 |
+| h264 720p60 | 60 | 60 | 18.6 | 5.2 | 6.2 | 29.2 | 33.4 | 28 |
 | hx 1080p60 | 60 | 60 | 29.8 | 11.2 | 14.3 | 43.4 | 47.7 | 28 |
 | h264 1080p60 | 60 | 60 | 41.8 | 10.5 | 13.3 | 41.4 | 233.9 | 59 |
 | hx 1080p60 low | 60 | 60 | 15.0 | 10.9 | 13.7 | 42.3 | 56.9 | 28 |
@@ -143,6 +145,8 @@ Notes:
   median of 57 fps.
 - At 1080p60 medium the two codecs are close. H.264 encoded in 10.5 ms against HEVC's 11.2 ms, and
   decoded in 13.3 ms against 14.3 ms: about 0.7 ms faster to send and 1.0 ms faster to receive.
+- Read past one outlier: `h264 1080p60` shows `Delay max 233.9 ms` and 59 discarded against the
+  usual ~28, a single stall in that run, not the steady state the rest of the table shows.
 - The alpha stream decoded as `h264 (d3d11va)`. The taller 1920x2176 picture still takes D3D11
   hardware.
 

@@ -74,7 +74,7 @@ modes spend bandwidth to save latency.
 |------|-------|-------------------|---------|-------|------------|
 | OMT (full) | VMX, intra, visually lossless | ~200 Mbps | ~9 ms | yes, in the BGRA frame | libomt owns it, no GPU codec |
 | OMT-HX, HEVC | HEVC (H.265), GPU hardware | 15 / 30 / 50 Mbps | 29-42 ms | optional, stacked plane | ~5-11 ms to send, ~6-13 ms to receive, CPU colour conversion included |
-| OMT-HX, H.264 | H.264, GPU hardware | 21 / 42 / 70 Mbps | 33-44 ms | optional, stacked plane | ~7-11 ms to send, ~8-13 ms to receive, CPU colour conversion included |
+| OMT-HX, H.264 | H.264, GPU hardware | 21 / 42 / 70 Mbps | 29-41 ms | optional, stacked plane | ~5-11 ms to send, ~6-13 ms to receive, CPU colour conversion included |
 | NDI (High Bandwidth) | SpeedHQ, intra | ~150 Mbps | ~16 ms | yes, RGBA 4:4:4:4 | CPU |
 | NDI\|HX | H.264 / HEVC | 1-50 Mbps | 80-200 ms | limited, 4:2:0 | CPU or GPU |
 
@@ -135,7 +135,7 @@ sweeps.
 8-bit 4:2:0 only. Colour conversion runs on the CPU. A program that speaks only stock OMT sees an
 OMT-HX source with audio and no picture. Both ends must run this build of libomt.dll: an older
 OMT-HX receiver, like a stock OMT program, sees an H.264 source with audio and no picture. See
-section 13 of the design.
+sections 3 and 17 of the design.
 
 ## Licence
 

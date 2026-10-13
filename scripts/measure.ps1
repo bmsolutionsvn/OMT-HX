@@ -29,6 +29,7 @@ $cases = @(
   @{ Tag = 'h264 1080p60 high';  Mode = 'hx';   Codec = 'h264'; Q = 'high';   Size = '1920x1080'; Fps = 60;  Alpha = $false },
   @{ Tag = 'h264 720p60 alpha';  Mode = 'hx';   Codec = 'h264'; Q = 'medium'; Size = '1280x720';  Fps = 60;  Alpha = $true },
   @{ Tag = 'h264 1080p60 alpha'; Mode = 'hx';   Codec = 'h264'; Q = 'medium'; Size = '1920x1080'; Fps = 60;  Alpha = $true },
+  @{ Tag = 'h264 720p60';        Mode = 'hx';   Codec = 'h264'; Q = 'medium'; Size = '1280x720';  Fps = 60;  Alpha = $false },
   @{ Tag = 'full 720p60';      Mode = 'full'; Q = 'medium'; Size = '1280x720';  Fps = 60;  Alpha = $false },
   @{ Tag = 'full 1080p60';     Mode = 'full'; Q = 'medium'; Size = '1920x1080'; Fps = 60;  Alpha = $false }
 )
