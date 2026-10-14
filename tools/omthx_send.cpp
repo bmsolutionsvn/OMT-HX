@@ -4,6 +4,7 @@
 #include <timeapi.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -19,9 +20,10 @@ using namespace omthx;
 namespace {
 [[noreturn]] void usage() {
   std::puts("omthx-send [--name TEXT] [--mode hx|full] [--codec hevc|h264] [--quality low|medium|high]\n"
-            "           [--size WxH] [--fps N] [--alpha] [--seconds N]\n"
+            "           [--size WxH] [--fps N] [--alpha] [--tone] [--seconds N]\n"
             "Defaults: --name \"OMT-HX Test\" --mode hx --codec hevc --quality medium --size 1920x1080 --fps 60,\n"
-            "runs until Ctrl+C. --codec is ignored with --mode full.");
+            "runs until Ctrl+C. --codec is ignored with --mode full.\n"
+            "--tone adds a 1 kHz tone at -20 dBFS, stereo, 48 kHz.\n");
   std::exit(2);
 }
 }  // namespace
@@ -33,6 +35,8 @@ int main(int argc, char** argv) {
   Codec codec = Codec::Hevc;
   VideoFormat f{1920, 1080, 60, 1, false};
   int seconds = 0;
+  bool tone = false;
+  std::vector<float> block;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto value = [&]() -> std::string {
@@ -56,6 +60,8 @@ int main(int argc, char** argv) {
       f.alpha = true;
     } else if (a == "--seconds") {
       seconds = std::atoi(value().c_str());
+    } else if (a == "--tone") {
+      tone = true;
     } else {
       usage();
     }
@@ -80,6 +86,15 @@ int main(int argc, char** argv) {
     const int64_t total = static_cast<int64_t>(seconds) * f.fpsN / f.fpsD;
     for (int64_t i = 0; seconds == 0 || i < total; ++i) {
       sender.sendVideo(f, loop[static_cast<size_t>(i % 16)], false, epoch + i * 10'000'000LL * f.fpsD / f.fpsN);
+      if (tone) {  // one block per frame, sized so the sample count never drifts from the frame count
+        const int64_t first = i * 48000 * f.fpsD / f.fpsN;
+        const size_t n = static_cast<size_t>((i + 1) * 48000 * f.fpsD / f.fpsN - first);
+        block.resize(2 * n);
+        for (size_t k = 0; k < n; ++k)
+          block[k] = block[n + k] =
+              0.1f * static_cast<float>(std::sin(2 * 3.141592653589793 * 1000 * static_cast<double>(first + static_cast<int64_t>(k)) / 48000));
+        sender.sendAudio(block, 48000, 2, epoch + i * 10'000'000LL * f.fpsD / f.fpsN);
+      }
       std::this_thread::sleep_until(t0 + std::chrono::nanoseconds((i + 1) * 1'000'000'000LL * f.fpsD / f.fpsN));
       if (Clock::now() >= report) {
         report += std::chrono::seconds(1);

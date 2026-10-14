@@ -110,4 +110,18 @@ class Receiver {
 // Names of the OMT sources seen on the network so far. Discovery needs a second or two after start.
 std::vector<std::string> discover();
 
+// What a source sends, read from the header of one of its video frames.
+struct SourceInfo {
+  Mode mode = Mode::Full;
+  Codec codec = Codec::Hevc;  // Hx only
+  VideoFormat format;          // the picture at its full size
+};
+
+// Connects to one source for at most timeoutMs, reads the header of its first video frame, and disconnects.
+// Nothing is decoded and no keyframe is asked for: a plain OMT sender sends this receiver only its small
+// preview, an Hx sender its stream as it is. The sender's tally is not touched.
+// False when no picture arrived in time. libomt drops a frame in a format it does not know, so a source
+// sending one also gives false.
+bool probe(const std::string& address, int timeoutMs, SourceInfo& out);
+
 }  // namespace omthx

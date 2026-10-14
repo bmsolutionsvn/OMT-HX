@@ -316,6 +316,31 @@ ReceiverStats Receiver::stats() {
   return s;
 }
 
+bool probe(const std::string& address, int timeoutMs, SourceInfo& out) {
+  // Preview: a plain OMT sender sends only the preview part of each VMX frame, and the header keeps the full
+  // size. CompressedOnly: libomt does not decode, so it does not rewrite the header to the preview's size.
+  omt_receive_t* rx = omt_receive_create(
+      address.c_str(), OMTFrameType_Video, OMTPreferredVideoFormat_BGRA,
+      static_cast<OMTReceiveFlags>(OMTReceiveFlags_Preview | OMTReceiveFlags_CompressedOnly));
+  if (!rx) return false;
+  const auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
+  bool found = false;
+  for (;;) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+    if (left <= 0) break;
+    const OMTMediaFrame* f = omt_receive(rx, OMTFrameType_Video, static_cast<int>(left));
+    if (!f || f->Width <= 0 || f->Height <= 0) continue;
+    Codec codec = Codec::Hevc;
+    out.mode = codecFromTag(static_cast<int>(f->Codec), codec) ? Mode::Hx : Mode::Full;
+    out.codec = codec;
+    out.format = VideoFormat{f->Width, f->Height, f->FrameRateN, f->FrameRateD, (f->Flags & OMTVideoFlags_Alpha) != 0};
+    found = true;
+    break;
+  }
+  omt_receive_destroy(rx);
+  return found;
+}
+
 std::vector<std::string> discover() {
   int count = 0;
   char** names = omt_discovery_getaddresses(&count);

@@ -203,6 +203,39 @@ TEST_CASE("a source that comes back with the other codec is picked up by the sam
   CHECK(frame.format == f);
 }
 
+TEST_CASE("probe reads a plain OMT source's full size from its preview") {
+  const VideoFormat f{1280, 720, 50, 1, true};
+  Sender sender("omthx-test-probe-full", Mode::Full, Quality::Medium);
+  Pump pump(sender, f);
+  SourceInfo info;
+  REQUIRE(probe(sender.address(), 3000, info));
+  CHECK(info.mode == Mode::Full);
+  CHECK(info.format == f);  // the full size, though only the preview was sent
+  CHECK(sender.tally() == Tally{});  // a probe never lights the sender's tally
+}
+
+TEST_CASE("probe names an HX source's codec") {
+  Codec codec = Codec::Hevc;
+  SUBCASE("hevc") { codec = Codec::Hevc; }
+  SUBCASE("h264") { codec = Codec::H264; }
+  if (!hardware(codec)) return;
+  const VideoFormat f{640, 360, 60, 1, false};
+  Sender sender(std::string("omthx-test-probe-") + codecName(codec), Mode::Hx, Quality::Medium, codec);
+  Pump pump(sender, f);
+  SourceInfo info;
+  REQUIRE(probe(sender.address(), 3000, info));
+  CHECK(info.mode == Mode::Hx);
+  CHECK(info.codec == codec);
+  CHECK(info.format == f);
+}
+
+TEST_CASE("probe gives up on an address with nothing there") {
+  SourceInfo info;
+  const auto t0 = Clock::now();
+  CHECK_FALSE(probe("NOWHERE (omthx-test-absent)", 1000, info));
+  CHECK(Clock::now() - t0 < std::chrono::seconds(3));
+}
+
 TEST_CASE("Sender rejects input it cannot use") {
   Sender sender("omthx-test-bad", Mode::Hx, Quality::Medium);
   const std::vector<uint8_t> tooSmall(16);
