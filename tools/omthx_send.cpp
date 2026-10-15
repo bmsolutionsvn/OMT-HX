@@ -88,7 +88,8 @@ int main(int argc, char** argv) {
       sender.sendVideo(f, loop[static_cast<size_t>(i % 16)], false, epoch + i * 10'000'000LL * f.fpsD / f.fpsN);
       if (tone) {  // one block per frame, sized so the sample count never drifts from the frame count
         const int64_t first = i * 48000 * f.fpsD / f.fpsN;
-        const size_t n = static_cast<size_t>((i + 1) * 48000 * f.fpsD / f.fpsN - first);
+        const int64_t samples = (i + 1) * 48000 * f.fpsD / f.fpsN - first;
+        const size_t n = samples > 0 ? static_cast<size_t>(samples) : 1;
         block.resize(2 * n);
         for (size_t k = 0; k < n; ++k)
           block[k] = block[n + k] =
