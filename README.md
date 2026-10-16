@@ -61,8 +61,11 @@ A fourth `Sender` argument picks the HX codec: `omthx::Codec::Hevc` (the default
 `omthx::Codec::H264`. The receiver needs no setting; it reads whichever arrives, and follows a
 source that comes back with the other codec.
 
-Timestamps must be one frame duration apart. A larger step tells the receiver a frame was
-skipped, and it holds the last picture until the next keyframe.
+Timestamps are in OMT units, one frame duration apart. A frame the app skips leaves a larger step,
+and the receiver plays on: the encoder never saw that frame, so the stream has no hole. Each HX
+frame carries its number in OMT's per-frame metadata (`<OMTHX Seq="n" />`); a jump in that number
+means a frame was lost on the way, and the receiver holds the last picture until the next keyframe.
+A source from before the numbering is judged by its timestamps instead.
 
 ## How it compares
 

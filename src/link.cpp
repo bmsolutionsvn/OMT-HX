@@ -37,6 +37,8 @@ struct Sender::Impl {
   KeyframePolicy policy;
   std::atomic<bool> appKeyframe{false};
   std::deque<int64_t> stamps;  // timestamps of pictures the encoder still holds
+  uint64_t seq = 0;            // number of the next coded frame, carried in its metadata
+  std::string seqMeta;
   Clock::time_point start = Clock::now();
   std::mutex statsMutex;
   SenderStats stats;
@@ -112,11 +114,15 @@ void Sender::sendVideo(const VideoFormat& fmt, std::span<const uint8_t> bgra, bo
   f.Flags = static_cast<OMTVideoFlags>(fmt.alpha ? (OMTVideoFlags_Alpha | OMTVideoFlags_PreMultiplied) : 0);
   uint64_t keyframes = 0;
   for (Packet& p : packets) {
-    if (d_->stamps.empty()) break;
+    const uint64_t seq = d_->seq++;  // numbered even when not sent, so the receiver sees the loss
+    if (d_->stamps.empty()) continue;
     f.Timestamp = d_->stamps.front();
     d_->stamps.pop_front();
     f.Data = p.data.data();
     f.DataLength = static_cast<int>(p.data.size());
+    d_->seqMeta = seqMetadata(seq);
+    f.FrameMetadata = d_->seqMeta.data();
+    f.FrameMetadataLength = static_cast<int>(d_->seqMeta.size() + 1);  // with the terminating null
     omt_send(d_->tx, &f);
     keyframes += p.keyframe ? 1 : 0;
   }
@@ -177,6 +183,8 @@ struct Receiver::Impl {
   bool waiting = true;  // Hx: discard until a keyframe
   bool haveLast = false;
   int64_t lastTimestamp = 0;
+  bool haveSeq = false;  // the source numbers its frames (this version on); older ones are judged by timestamp
+  uint64_t lastSeq = 0;
   Clock::time_point lastAsk{};
   std::mutex statsMutex;
   ReceiverStats stats;
@@ -248,7 +256,20 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
     d_->decoder.reset();
     d_->waiting = true;
   }
-  if (d_->haveLast && isGap(d_->lastTimestamp, f->Timestamp, fmt.fpsN, fmt.fpsD)) d_->waiting = true;
+  // A lost coded frame breaks the picture until the next keyframe. A frame the app skipped does not:
+  // the encoder never saw it. Only the frame number tells them apart.
+  uint64_t seq = 0;
+  const bool numbered = f->FrameMetadata && f->FrameMetadataLength > 0 &&
+                        parseSeq(std::string_view(static_cast<const char*>(f->FrameMetadata),
+                                                  static_cast<size_t>(f->FrameMetadataLength)),
+                                 seq);
+  if (numbered) {
+    if (d_->haveSeq && seq != d_->lastSeq + 1) d_->waiting = true;
+    d_->lastSeq = seq;
+  } else if (d_->haveLast && isGap(d_->lastTimestamp, f->Timestamp, fmt.fpsN, fmt.fpsD)) {
+    d_->waiting = true;
+  }
+  d_->haveSeq = numbered;
   d_->lastTimestamp = f->Timestamp;
   d_->haveLast = true;
   if (d_->waiting && !isKeyframe(codec, au)) {

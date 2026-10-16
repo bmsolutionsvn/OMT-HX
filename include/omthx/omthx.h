@@ -48,11 +48,12 @@ class Sender {
   Sender& operator=(const Sender&) = delete;
 
   // bgra: width * height * 4 bytes, top row first. premultiplied says how the colour relates to its alpha.
-  // timestamp: OMT units, 10,000,000 per second, one frame duration apart from the previous frame.
+  // timestamp: OMT units, 10,000,000 per second. A frame the app skips leaves a larger step, which is fine:
+  // the receiver keeps playing, as the coded stream has no hole.
   void sendVideo(const VideoFormat& format, std::span<const uint8_t> bgra, bool premultiplied, int64_t timestamp);
   // planar: all samples of channel 0, then all of channel 1, and so on.
   void sendAudio(std::span<const float> planar, int sampleRate, int channels, int64_t timestamp);
-  void requestKeyframe();  // call when the app skipped a frame
+  void requestKeyframe();  // the next frame is coded as a keyframe (at most one per 500 ms)
   Tally tally();
   SenderStats stats();
   std::string address() const;  // "HOSTNAME (name)", the string a Receiver connects to

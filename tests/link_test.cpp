@@ -152,6 +152,33 @@ TEST_CASE("a receiver that joins a running HX source gets a picture") {
   CHECK(frame.bgra[3] == 255);  // no alpha in this source
 }
 
+TEST_CASE("a frame the app skips does not freeze the receiver") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{640, 360, 60, 1, false};
+  Sender sender("omthx-test-skip", Mode::Hx, Quality::Medium);
+  Receiver receiver(sender.address());
+  std::vector<uint8_t> bgra;
+  VideoFrame frame;
+  int sent = 0, got = 0;
+  uint64_t discardedAtFirst = 0;
+  auto next = Clock::now();
+  for (int tick = 0; tick < 600 && sent < 240; ++tick) {
+    if (got > 0 && tick % 4 == 3) continue;  // once playing, skip every fourth tick, as a late camera does
+    drawPattern(bgra, f.width, f.height, tick, false);
+    sender.sendVideo(f, bgra, false, 1'000'000 + tick * kFrame);
+    if (got > 0) ++sent;
+    next += std::chrono::microseconds(16'667);
+    while (receiver.receiveVideo(frame, 0)) {
+      if (got++ == 0) discardedAtFirst = receiver.stats().framesDiscarded;
+    }
+    std::this_thread::sleep_until(next);
+  }
+  receiveSome(receiver, frame, 1, 1);  // the last one or two still in flight
+  REQUIRE(sent == 240);
+  CHECK(receiver.stats().framesDiscarded == discardedAtFirst);
+  CHECK(receiver.stats().framesReceived >= 230);
+}
+
 TEST_CASE("a change of picture size reaches the receiver") {
   if (!hardware(Codec::Hevc)) return;
   const VideoFormat small{640, 360, 60, 1, false};

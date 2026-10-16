@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "omthx/omthx.h"
@@ -29,6 +30,10 @@ bool isKeyframe(Codec codec, std::span<const uint8_t> annexB);
 int alphaTop(int height);                       // row where the alpha picture starts
 int codedHeight(const VideoFormat& format);     // height of the picture the encoder sees
 bool isGap(int64_t previous, int64_t current, int fpsN, int fpsD);
+// Per-frame metadata that numbers each coded frame, so a receiver can tell a frame lost on the way
+// (the number jumps) from a frame the app never sent (only the timestamp jumps).
+std::string seqMetadata(uint64_t seq);
+bool parseSeq(std::string_view metadata, uint64_t& out);  // false when the metadata carries no number
 
 // Decides when the sender must force a keyframe (spec section 8). Time is passed in, so it is testable.
 class KeyframePolicy {

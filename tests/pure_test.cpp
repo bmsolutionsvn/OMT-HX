@@ -93,6 +93,20 @@ TEST_CASE("isGap flags a timestamp step of more than one and a half frames, or b
   CHECK_FALSE(isGap(0, 5, 0, 1));    // unknown frame rate: never a gap
 }
 
+TEST_CASE("frame numbers round-trip through the per-frame metadata") {
+  uint64_t n = 0;
+  CHECK(parseSeq(seqMetadata(0), n));
+  CHECK(n == 0);
+  CHECK(parseSeq(seqMetadata(18'446'744'073'709'551'615ULL), n));
+  CHECK(n == 18'446'744'073'709'551'615ULL);
+  CHECK(parseSeq("<other /><OMTHX Seq=\"42\" />", n));
+  CHECK(n == 42);
+  CHECK_FALSE(parseSeq("", n));
+  CHECK_FALSE(parseSeq("<OMTHX Keyframe=\"true\" />", n));
+  CHECK_FALSE(parseSeq("<OMTHX Seq=\"\" />", n));
+  CHECK_FALSE(parseSeq("<OMTHX Seq=\"12", n));  // cut short
+}
+
 TEST_CASE("KeyframePolicy: first frame, requests limited to one per 500 ms, new drops, every 2 s") {
   KeyframePolicy p;
   CHECK(p.next(0, 0, false));          // first frame

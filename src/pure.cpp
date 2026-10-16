@@ -1,6 +1,7 @@
 #include "codec.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 #include <execution>
@@ -72,6 +73,17 @@ bool isGap(int64_t previous, int64_t current, int fpsN, int fpsD) {
   const int64_t frame = 10'000'000LL * fpsD / fpsN;
   const int64_t step = current - previous;
   return step <= 0 || step > frame + frame / 2;
+}
+
+std::string seqMetadata(uint64_t seq) { return "<OMTHX Seq=\"" + std::to_string(seq) + "\" />"; }
+
+bool parseSeq(std::string_view m, uint64_t& out) {
+  static constexpr std::string_view kKey = "<OMTHX Seq=\"";
+  const size_t at = m.find(kKey);
+  if (at == std::string_view::npos) return false;
+  const char* first = m.data() + at + kKey.size();
+  const auto [end, ec] = std::from_chars(first, m.data() + m.size(), out);
+  return ec == std::errc() && end != first && end < m.data() + m.size() && *end == '"';
 }
 
 bool KeyframePolicy::next(int64_t nowMs, uint64_t dropped, bool requested) {
