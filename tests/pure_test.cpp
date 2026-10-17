@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -105,6 +106,22 @@ TEST_CASE("frame numbers round-trip through the per-frame metadata") {
   CHECK_FALSE(parseSeq("<OMTHX Keyframe=\"true\" />", n));
   CHECK_FALSE(parseSeq("<OMTHX Seq=\"\" />", n));
   CHECK_FALSE(parseSeq("<OMTHX Seq=\"12", n));  // cut short
+}
+
+TEST_CASE("copyNv12 drops row padding and stretches limited range to full") {
+  const VideoFormat f{4, 2, 60, 1, false};
+  const std::vector<uint8_t> y{16, 235, 126, 0, 9, 9, 16, 235, 126, 255, 9, 9};  // stride 6
+  const std::vector<uint8_t> uv{16, 240, 128, 128, 9, 9};                          // stride 6
+  Nv12 out;
+  copyNv12(f, y.data(), 6, uv.data(), 6, false, out);
+  CHECK(out.width == 4);
+  CHECK(out.height == 2);
+  CHECK(out.y == std::vector<uint8_t>{0, 255, 128, 0, 0, 255, 128, 255});
+  CHECK(out.uv == std::vector<uint8_t>{1, 255, 128, 128});  // chroma 16 rounds to 1
+  copyNv12(f, y.data(), 6, uv.data(), 6, true, out);
+  CHECK(out.y == std::vector<uint8_t>{16, 235, 126, 0, 16, 235, 126, 255});
+  CHECK_THROWS_AS(copyNv12(VideoFormat{3, 2, 60, 1, false}, y.data(), 6, uv.data(), 6, true, out),
+                  std::invalid_argument);
 }
 
 TEST_CASE("KeyframePolicy: first frame, requests limited to one per 500 ms, new drops, every 2 s") {

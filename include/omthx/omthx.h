@@ -51,6 +51,10 @@ class Sender {
   // timestamp: OMT units, 10,000,000 per second. A frame the app skips leaves a larger step, which is fine:
   // the receiver keeps playing, as the coded stream has no hole.
   void sendVideo(const VideoFormat& format, std::span<const uint8_t> bgra, bool premultiplied, int64_t timestamp);
+  // Hx without alpha only: an NV12 picture (BT.709) goes to the encoder with no colour conversion, the
+  // cheap path for an app that already has NV12. Strides are in bytes; fullRange false means 16-235.
+  void sendVideoNv12(const VideoFormat& format, const uint8_t* y, int yStride, const uint8_t* uv, int uvStride,
+                     bool fullRange, int64_t timestamp);
   // planar: all samples of channel 0, then all of channel 1, and so on.
   void sendAudio(std::span<const float> planar, int sampleRate, int channels, int64_t timestamp);
   void requestKeyframe();  // the next frame is coded as a keyframe (at most one per 500 ms)

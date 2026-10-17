@@ -55,6 +55,10 @@ struct Nv12 {
 };
 
 // BGRA to the packed NV12 picture and back (spec section 7). Added in Task 3.
+// An NV12 picture with any row strides into `out` (full range). Limited range is stretched to full.
+void copyNv12(const VideoFormat& format, const uint8_t* y, int yStride, const uint8_t* uv, int uvStride, bool fullRange,
+              Nv12& out);
+
 class Packer {
  public:
   Packer() = default;

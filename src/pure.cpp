@@ -1,6 +1,7 @@
 #include "codec.h"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <cstring>
@@ -115,6 +116,42 @@ void checkSize(const VideoFormat& f) {
 
 uint8_t scale(unsigned colour, unsigned alpha) { return static_cast<uint8_t>((colour * alpha + 127) / 255); }
 }  // namespace
+
+// ponytail: one core, a table lookup per byte (about 1 ms for 1080p). Upgrade path: hand over full range.
+void copyNv12(const VideoFormat& f, const uint8_t* y, int yStride, const uint8_t* uv, int uvStride, bool fullRange,
+              Nv12& out) {
+  checkSize(f);
+  const int w = f.width, h = f.height;
+  out.width = w;
+  out.height = h;
+  out.y.resize(static_cast<size_t>(w) * h);
+  out.uv.resize(static_cast<size_t>(w) * h / 2);
+  // Limited range (luma 16-235, chroma 16-240) stretched to the full range the stream carries.
+  static const auto kLuma = [] {
+    std::array<uint8_t, 256> t{};
+    for (int i = 0; i < 256; ++i) t[i] = static_cast<uint8_t>(std::clamp((i - 16) * 255 / 219.0 + 0.5, 0.0, 255.0));
+    return t;
+  }();
+  static const auto kChroma = [] {
+    std::array<uint8_t, 256> t{};
+    for (int i = 0; i < 256; ++i)
+      t[i] = static_cast<uint8_t>(std::clamp((i - 128) * 255 / 224.0 + 128.5, 0.0, 255.0));
+    return t;
+  }();
+  auto copy = [&](uint8_t* dst, const uint8_t* src, int stride, int rows, const std::array<uint8_t, 256>& t) {
+    for (int r = 0; r < rows; ++r) {
+      const uint8_t* s = src + static_cast<size_t>(r) * stride;
+      uint8_t* d = dst + static_cast<size_t>(r) * w;
+      if (fullRange) {
+        std::memcpy(d, s, w);
+      } else {
+        for (int x = 0; x < w; ++x) d[x] = t[s[x]];
+      }
+    }
+  };
+  copy(out.y.data(), y, yStride, h, kLuma);
+  copy(out.uv.data(), uv, uvStride, h / 2, kChroma);
+}
 
 Packer::~Packer() {
   sws_freeContext(toNv12_);

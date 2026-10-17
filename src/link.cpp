@@ -42,7 +42,61 @@ struct Sender::Impl {
   Clock::time_point start = Clock::now();
   std::mutex statsMutex;
   SenderStats stats;
+
+  void openEncoder(const VideoFormat& fmt);
+  void sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock::time_point t0, OMTMediaFrame& f);
 };
+
+// Opens the encoder for this format, or keeps the one already open for it.
+void Sender::Impl::openEncoder(const VideoFormat& fmt) {
+  if (encoder && fmt == format) return;
+  encoder = std::make_unique<Encoder>(codec, fmt.width, codedHeight(fmt), fmt.fpsN, fmt.fpsD,
+                                      targetBitrate(fmt, quality, codec));
+  format = fmt;
+  policy = KeyframePolicy();
+  stamps.clear();
+}
+
+// Codes `picture` and sends what the encoder gives back. t0 is when the work on this frame began.
+void Sender::Impl::sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock::time_point t0, OMTMediaFrame& f) {
+  bool requested = appKeyframe.exchange(false);
+  while (OMTMediaFrame* m = omt_send_receive(tx, 0)) {  // messages from receivers
+    if (m->Data && m->DataLength > 0 &&
+        std::string_view(static_cast<const char*>(m->Data), static_cast<size_t>(m->DataLength)).find("<OMTHX Keyframe") !=
+            std::string_view::npos)
+      requested = true;
+  }
+  OMTStatistics omt = {};
+  omt_send_getvideostatistics(tx, &omt);
+  const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
+  const bool key = policy.next(nowMs, static_cast<uint64_t>(omt.FramesDropped), requested);
+
+  std::vector<Packet> packets = encoder->encode(picture, key);
+  stamps.push_back(timestamp);  // after encode, so a throw leaves the deque unchanged
+  const double encodeMs = msSince(t0);
+
+  f.Codec = static_cast<OMTCodec>(codecTag(codec));
+  f.Flags = static_cast<OMTVideoFlags>(fmt.alpha ? (OMTVideoFlags_Alpha | OMTVideoFlags_PreMultiplied) : 0);
+  uint64_t keyframes = 0;
+  for (Packet& p : packets) {
+    const uint64_t n = seq++;  // numbered even when not sent, so the receiver sees the loss
+    if (stamps.empty()) continue;
+    f.Timestamp = stamps.front();
+    stamps.pop_front();
+    f.Data = p.data.data();
+    f.DataLength = static_cast<int>(p.data.size());
+    seqMeta = seqMetadata(n);
+    f.FrameMetadata = seqMeta.data();
+    f.FrameMetadataLength = static_cast<int>(seqMeta.size() + 1);  // with the terminating null
+    omt_send(tx, &f);
+    keyframes += p.keyframe ? 1 : 0;
+  }
+  std::lock_guard lock(statsMutex);
+  stats.encoder = encoder->name();
+  stats.framesSent += packets.size();
+  stats.keyframes += keyframes;
+  stats.lastEncodeMs = encodeMs;
+}
 
 Sender::Sender(const std::string& name, Mode mode, Quality quality, Codec codec) : d_(std::make_unique<Impl>()) {
   static constexpr OMTQuality kOmtQuality[] = {OMTQuality_Low, OMTQuality_Medium, OMTQuality_High};
@@ -83,54 +137,30 @@ void Sender::sendVideo(const VideoFormat& fmt, std::span<const uint8_t> bgra, bo
     return;
   }
 
-  if (!d_->encoder || !(fmt == d_->format)) {
-    d_->encoder = std::make_unique<Encoder>(d_->codec, fmt.width, codedHeight(fmt), fmt.fpsN, fmt.fpsD,
-                                            targetBitrate(fmt, d_->quality, d_->codec));
-    d_->format = fmt;
-    d_->policy = KeyframePolicy();
-    d_->stamps.clear();
-  }
-
+  d_->openEncoder(fmt);
   const auto t0 = Clock::now();
   d_->packer.pack(fmt, bgra, premultiplied, d_->picture);
+  d_->sendPicture(fmt, timestamp, t0, f);
+}
 
-  bool requested = d_->appKeyframe.exchange(false);
-  while (OMTMediaFrame* m = omt_send_receive(d_->tx, 0)) {  // messages from receivers
-    if (m->Data && m->DataLength > 0 &&
-        std::string_view(static_cast<const char*>(m->Data), static_cast<size_t>(m->DataLength)).find("<OMTHX Keyframe") !=
-            std::string_view::npos)
-      requested = true;
-  }
-  OMTStatistics omt = {};
-  omt_send_getvideostatistics(d_->tx, &omt);
-  const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - d_->start).count();
-  const bool key = d_->policy.next(nowMs, static_cast<uint64_t>(omt.FramesDropped), requested);
-
-  std::vector<Packet> packets = d_->encoder->encode(d_->picture, key);
-  d_->stamps.push_back(timestamp);  // after encode, so a throw leaves the deque unchanged
-  const double encodeMs = msSince(t0);
-
-  f.Codec = static_cast<OMTCodec>(codecTag(d_->codec));
-  f.Flags = static_cast<OMTVideoFlags>(fmt.alpha ? (OMTVideoFlags_Alpha | OMTVideoFlags_PreMultiplied) : 0);
-  uint64_t keyframes = 0;
-  for (Packet& p : packets) {
-    const uint64_t seq = d_->seq++;  // numbered even when not sent, so the receiver sees the loss
-    if (d_->stamps.empty()) continue;
-    f.Timestamp = d_->stamps.front();
-    d_->stamps.pop_front();
-    f.Data = p.data.data();
-    f.DataLength = static_cast<int>(p.data.size());
-    d_->seqMeta = seqMetadata(seq);
-    f.FrameMetadata = d_->seqMeta.data();
-    f.FrameMetadataLength = static_cast<int>(d_->seqMeta.size() + 1);  // with the terminating null
-    omt_send(d_->tx, &f);
-    keyframes += p.keyframe ? 1 : 0;
-  }
-  std::lock_guard lock(d_->statsMutex);
-  d_->stats.encoder = d_->encoder->name();
-  d_->stats.framesSent += packets.size();
-  d_->stats.keyframes += keyframes;
-  d_->stats.lastEncodeMs = encodeMs;
+void Sender::sendVideoNv12(const VideoFormat& fmt, const uint8_t* y, int yStride, const uint8_t* uv, int uvStride,
+                           bool fullRange, int64_t timestamp) {
+  if (d_->mode != Mode::Hx || fmt.alpha)
+    throw std::invalid_argument("sendVideoNv12 is for an Hx source without alpha");
+  if (!y || !uv || yStride < fmt.width || uvStride < fmt.width)
+    throw std::invalid_argument("each NV12 plane needs a stride of at least the width");
+  OMTMediaFrame f = {};
+  f.Type = OMTFrameType_Video;
+  f.Width = fmt.width;
+  f.Height = fmt.height;
+  f.FrameRateN = fmt.fpsN;
+  f.FrameRateD = fmt.fpsD;
+  f.AspectRatio = static_cast<float>(fmt.width) / static_cast<float>(fmt.height);
+  f.ColorSpace = OMTColorSpace_BT709;
+  d_->openEncoder(fmt);
+  const auto t0 = Clock::now();
+  copyNv12(fmt, y, yStride, uv, uvStride, fullRange, d_->picture);
+  d_->sendPicture(fmt, timestamp, t0, f);
 }
 
 void Sender::sendAudio(std::span<const float> planar, int sampleRate, int channels, int64_t timestamp) {

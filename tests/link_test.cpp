@@ -179,6 +179,39 @@ TEST_CASE("a frame the app skips does not freeze the receiver") {
   CHECK(receiver.stats().framesReceived >= 230);
 }
 
+TEST_CASE("an NV12 picture is sent without conversion and arrives as BGRA") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{640, 360, 60, 1, false};
+  Sender sender("omthx-test-nv12", Mode::Hx, Quality::Medium);
+  Receiver receiver(sender.address());
+  // Limited-range white over the left half, black over the right; rows padded to 704 bytes.
+  const int stride = 704;
+  std::vector<uint8_t> y(static_cast<size_t>(stride) * 360), uv(static_cast<size_t>(stride) * 180, 128);
+  for (int r = 0; r < 360; ++r)
+    for (int x = 0; x < 640; ++x) y[static_cast<size_t>(r) * stride + x] = x < 320 ? 235 : 16;
+  VideoFrame frame;
+  bool got = false;
+  auto next = Clock::now();
+  for (int i = 0; i < 300 && !got; ++i) {
+    sender.sendVideoNv12(f, y.data(), stride, uv.data(), stride, false, 1'000'000 + i * kFrame);
+    got = receiver.receiveVideo(frame, 0);
+    next += std::chrono::microseconds(16'667);
+    std::this_thread::sleep_until(next);
+  }
+  REQUIRE(got);
+  CHECK(frame.format == f);
+  const size_t middle = static_cast<size_t>(180) * 640 * 4;
+  CHECK(frame.bgra[middle + 100 * 4] > 245);  // white, so the range was stretched
+  CHECK(frame.bgra[middle + 540 * 4] < 10);   // black
+  CHECK(sender.stats().lastEncodeMs > 0);
+
+  Sender full("omthx-test-nv12-full", Mode::Full, Quality::Medium);
+  CHECK_THROWS_AS(full.sendVideoNv12(f, y.data(), stride, uv.data(), stride, false, 0), std::invalid_argument);
+  CHECK_THROWS_AS(sender.sendVideoNv12(VideoFormat{640, 360, 60, 1, true}, y.data(), stride, uv.data(), stride,
+                                       false, 0),
+                  std::invalid_argument);
+}
+
 TEST_CASE("a change of picture size reaches the receiver") {
   if (!hardware(Codec::Hevc)) return;
   const VideoFormat small{640, 360, 60, 1, false};
