@@ -13,14 +13,18 @@ plain OMT or OMT-HX; one `Receiver` reads both.
 
 ## Build and test
 
-Needs Windows x64, Visual Studio 2026 with the C++ desktop workload, the .NET 8 SDK and git.
+Needs Windows x64, Visual Studio 2022 or newer with the C++ desktop workload, the .NET 8 SDK and git.
 
 ```powershell
+git clone --recurse-submodules https://github.com/bmsolutionsvn/OMT-HX
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test.ps1
 ```
 
-The first run builds the patched `libomt.dll` (see `patches/libomtnet-hx.patch`) and installs
-FFmpeg through vcpkg.
+Open Media Transport is built from source, from three submodules in `omt/`: forks of
+[libomtnet](https://github.com/bmsolutionsvn/libomtnet), [libomt](https://github.com/bmsolutionsvn/libomt)
+and [libvmx](https://github.com/bmsolutionsvn/libvmx). OMT-HX's changes to OMT are commits in the
+libomtnet fork, on top of upstream. One CMake run builds everything: `libvmx.dll` from C++,
+`libomt.dll` from C# with .NET Native AOT, then omthx. The first run also installs FFmpeg through vcpkg.
 
 ## Try it
 
@@ -35,7 +39,9 @@ Add `--codec h264` to `omthx-send` to send H.264 instead of HEVC.
 
 ## Use it from an app
 
-The app's `vcpkg.json` needs FFmpeg with `avcodec`, `swscale`, `nvcodec` and `amf`.
+The app's `vcpkg.json` needs FFmpeg with `avcodec`, `swscale`, `nvcodec` and `amf`, and the OMT-HX checkout
+needs its submodules (`git submodule update --init`). An app with its own FFmpeg can instead
+`include(<OMT-HX>/cmake/omt.cmake)` for libomt and libvmx alone, as BreadStudio does.
 
 ```cmake
 set(OMTHX_ROOT "${CMAKE_SOURCE_DIR}/../OMT-HX" CACHE PATH "OMT-HX checkout")
@@ -101,8 +107,8 @@ modes spend bandwidth to save latency.
 ## Technical detail
 
 **Transport.** OMT-HX is not a new protocol. In version 1 it sends HEVC or H.264 as ordinary OMT
-video frames tagged `HEVC` or `H264` (a small patch lets stock libomt carry, rather than reject, a
-foreign tag).
+video frames tagged `HEVC` or `H264` (a small change to OMT, in the libomtnet fork, lets it carry
+rather than reject a foreign tag).
 Discovery, connection, audio, tally and metadata stay OMT's, so an OMT-HX source is found and
 connected to exactly like a plain OMT one.
 
@@ -142,5 +148,5 @@ See sections 3 and 17 of the design.
 
 ## Licence
 
-MIT. The bundled `libomt.dll` and `libvmx.dll` are MIT, from the Open Media Transport project,
-with one patch.
+MIT. `libomt.dll` and `libvmx.dll` are MIT, built from forks of the Open Media Transport project;
+only libomtnet carries changes.

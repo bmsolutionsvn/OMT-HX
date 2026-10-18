@@ -1,4 +1,5 @@
-// Proves the patch: HEVC- and H264-tagged frames pass through libomt untouched, and plain OMT is unchanged.
+// Proves the libomtnet fork's change: HEVC- and H264-tagged frames pass through libomt untouched, and plain
+// OMT is unchanged.
 #include <doctest/doctest.h>
 
 #include <chrono>

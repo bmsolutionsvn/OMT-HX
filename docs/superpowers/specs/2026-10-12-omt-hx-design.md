@@ -112,11 +112,14 @@ The patch, 32 added lines of C# in three files:
 Nothing changes for any codec stock OMT knows, so the patched library still
 talks to vMix and every other OMT program.
 
-The patch is kept as a file, `patches/libomtnet-hx.patch`, against the pinned
-commit. A script clones the two upstream repositories, applies it, and builds
-`libomt.dll` with `dotnet publish -r win-x64 -c Release` (.NET 8 SDK, already
-on this PC). `libvmx.dll` comes from the pinned upstream release, checked by
-SHA-256. No fork repository is needed.
+*Updated 2026-10-18.* The change lives in forks, not a patch file: libomtnet,
+libomt and libvmx are forked to `bmsolutionsvn` and pinned as git submodules
+in `omt/`. The change is commits on the libomtnet fork, on top of the upstream
+commit, so `git log` there shows exactly what differs from OMT. CMake
+(`cmake/omt.cmake`) builds `libvmx.dll` from its C++ sources and `libomt.dll`
+with .NET Native AOT (.NET 8 SDK) whenever their sources change. (Until then,
+a script applied `patches/libomtnet-hx.patch` to clones of upstream and took
+`libvmx.dll` from an upstream release.)
 
 **Proven on this PC, 2026-10-13.** A clean clone, patched and built by the
 script, passed a throwaway test: 1000 bytes sent with the `HEVC` tag arrived
@@ -261,7 +264,7 @@ called working.
 
 | Risk | Handling |
 |---|---|
-| The patched library drifts from upstream OMT. | The patch is one small file against a pinned commit, re-applied on each upgrade. Offering it upstream is an owner decision (section 15). |
+| The patched library drifts from upstream OMT. | The change is a few commits on the libomtnet fork; an upgrade merges upstream into the fork and moves the submodule. Offering it upstream is an owner decision (section 15). |
 | Low-delay behaviour differs between NVIDIA, AMD and Intel encoders. | Per-encoder settings table; measurements recorded per encoder in `MEASUREMENTS.md`. |
 | Hardware encoder session limits. NVIDIA allows 8 at once per system on consumer cards, and BreadCamera also encodes previews and SRT outputs. | `Sender` reports a clear error when the encoder will not open. BreadCamera's spec states the budget. |
 | HEVC is covered by patent pools. | OMT-HX ships no HEVC encoder of its own; it drives the one in the GPU driver. Decoding uses FFmpeg, as OBS itself does. The owner should confirm this is acceptable; AV1 is the royalty-free alternative but this PC's GPU cannot encode it. |

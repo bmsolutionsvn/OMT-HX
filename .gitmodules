@@ -1,0 +1,9 @@
+[submodule "omt/libomtnet"]
+	path = omt/libomtnet
+	url = https://github.com/bmsolutionsvn/libomtnet.git
+[submodule "omt/libomt"]
+	path = omt/libomt
+	url = https://github.com/bmsolutionsvn/libomt.git
+[submodule "omt/libvmx"]
+	path = omt/libvmx
+	url = https://github.com/bmsolutionsvn/libvmx.git
