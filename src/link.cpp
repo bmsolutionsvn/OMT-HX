@@ -182,11 +182,33 @@ void Sender::sendVideo(const VideoFormat& fmt, std::span<const uint8_t> bgra, bo
 
 void Sender::sendVideoNv12(const VideoFormat& fmt, const uint8_t* y, int yStride, const uint8_t* uv, int uvStride,
                            bool fullRange, int64_t timestamp) {
-  if (d_->mode != Mode::Hx || fmt.alpha)
-    throw std::invalid_argument("sendVideoNv12 is for an Hx source without alpha");
-  if (!y || !uv || yStride < fmt.width || uvStride < fmt.width)
-    throw std::invalid_argument("each NV12 plane needs a stride of at least the width");
+  if (fmt.alpha) throw std::invalid_argument("sendVideoNv12 is for a picture without alpha");
+  if (!y || !uv || yStride < fmt.width || uvStride < fmt.width || fmt.width < 2 || fmt.height < 2 || fmt.width % 2 ||
+      fmt.height % 2)
+    throw std::invalid_argument("NV12 needs an even size and a stride of at least the width for each plane");
   OMTMediaFrame f = videoHeader(fmt, timestamp);
+
+  if (d_->mode == Mode::Full) {
+    // VMX takes limited-range NV12 as it is and makes its 4:2:2 itself. libomt reads the chroma plane right after
+    // the luma plane, so planes that are apart, or a full-range picture, are copied first.
+    if (fullRange) throw std::invalid_argument("plain OMT takes limited-range NV12 only");
+    const size_t plane = static_cast<size_t>(yStride) * fmt.height;
+    f.Codec = OMTCodec_NV12;
+    f.Stride = yStride;
+    f.Data = const_cast<uint8_t*>(y);
+    if (uv != y + plane || uvStride != yStride) {
+      const size_t row = static_cast<size_t>(fmt.width);
+      d_->uyva.resize(row * fmt.height * 3 / 2);
+      for (int r = 0; r < fmt.height; ++r) std::memcpy(d_->uyva.data() + r * row, y + static_cast<size_t>(r) * yStride, row);
+      for (int r = 0; r < fmt.height / 2; ++r)
+        std::memcpy(d_->uyva.data() + row * fmt.height + r * row, uv + static_cast<size_t>(r) * uvStride, row);
+      f.Stride = static_cast<int>(row);
+      f.Data = d_->uyva.data();
+    }
+    f.DataLength = f.Stride * fmt.height * 3 / 2;
+    d_->sendFull(f);
+    return;
+  }
   d_->openEncoder(fmt);
   const auto t0 = Clock::now();
   copyNv12(fmt, y, yStride, uv, uvStride, fullRange, d_->picture);

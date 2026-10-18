@@ -100,8 +100,9 @@ class OMTHX_API Sender {
   // timestamp: OMT units, 10,000,000 per second. A frame the app skips leaves a larger step, which is fine:
   // the receiver keeps playing, as the coded stream has no hole.
   void sendVideo(const VideoFormat& format, std::span<const uint8_t> bgra, bool premultiplied, int64_t timestamp);
-  // Hx without alpha only: an NV12 picture (BT.709) goes to the encoder with no colour conversion, the
-  // cheap path for an app that already has NV12. Strides are in bytes; fullRange false means 16-235.
+  // Without alpha: an NV12 picture (BT.709) with no colour conversion, the cheap path for an app that already
+  // has NV12. Hx hands it to the encoder; Full hands it to VMX, limited range only (fullRange false, 16-235;
+  // a full-range picture throws std::invalid_argument). Strides are in bytes.
   void sendVideoNv12(const VideoFormat& format, const uint8_t* y, int yStride, const uint8_t* uv, int uvStride,
                      bool fullRange, int64_t timestamp);
   // Either mode: 8-bit 4:2:2 UYVY (BT.709, 16-235), even width, rows `stride` bytes apart. With format.alpha,

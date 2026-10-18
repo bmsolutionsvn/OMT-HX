@@ -207,7 +207,7 @@ TEST_CASE("an NV12 picture is sent without conversion and arrives as BGRA") {
   CHECK(sender.stats().lastEncodeMs > 0);
 
   Sender full("omthx-test-nv12-full", Mode::Full, Quality::Medium);
-  CHECK_THROWS_AS(full.sendVideoNv12(f, y.data(), stride, uv.data(), stride, false, 0), std::invalid_argument);
+  CHECK_THROWS_AS(full.sendVideoNv12(f, y.data(), stride, uv.data(), stride, true, 0), std::invalid_argument);
   CHECK_THROWS_AS(sender.sendVideoNv12(VideoFormat{640, 360, 60, 1, true}, y.data(), stride, uv.data(), stride,
                                        false, 0),
                   std::invalid_argument);
@@ -510,4 +510,30 @@ TEST_CASE("a plain OMT relay passes VMX frames on without decoding them") {
   CHECK(out.format == f);
   CHECK(out.uyvy.size() == 640u * 360 * 3);
   CHECK_FALSE(out.premultiplied);  // the pump's straight alpha, flags passed on untouched
+}
+
+TEST_CASE("a limited-range NV12 picture goes to VMX as it is") {
+  const VideoFormat f{640, 360, 60, 1, false};
+  Sender sender("omthx-test-nv12-vmx", Mode::Full, Quality::Medium);
+  Receiver receiver(sender.address());
+  // White over the left half, black over the right; rows padded to 704 bytes, chroma in its own buffer.
+  const int stride = 704;
+  std::vector<uint8_t> y(static_cast<size_t>(stride) * 360), uv(static_cast<size_t>(stride) * 180, 128);
+  for (int r = 0; r < 360; ++r)
+    for (int x = 0; x < 640; ++x) y[static_cast<size_t>(r) * stride + x] = x < 320 ? 235 : 16;
+  VideoFrame frame;
+  bool got = false;
+  auto next = Clock::now();
+  for (int i = 0; i < 300 && !got; ++i) {
+    sender.sendVideoNv12(f, y.data(), stride, uv.data(), stride, false, 1'000'000 + i * kFrame);
+    got = receiver.receiveVideo(frame, 0);
+    next += std::chrono::microseconds(16'667);
+    std::this_thread::sleep_until(next);
+  }
+  REQUIRE(got);
+  CHECK(frame.format == f);
+  const size_t middle = static_cast<size_t>(180) * 640 * 4;
+  CHECK(frame.bgra[middle + 100 * 4] > 245);  // white
+  CHECK(frame.bgra[middle + 540 * 4] < 10);   // black
+  CHECK(receiver.stats().mode == Mode::Full);
 }
