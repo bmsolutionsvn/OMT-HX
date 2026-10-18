@@ -6,6 +6,20 @@
 #include <string>
 #include <vector>
 
+// omthx.dll by default, as in the binary release. Building omthx from source into your program, define
+// OMTHX_STATIC (OMT-HX's CMake target omthx does it for you).
+#if defined(OMTHX_STATIC)
+#define OMTHX_API
+#elif defined(OMTHX_BUILD_DLL)
+#define OMTHX_API __declspec(dllexport)
+#else
+#define OMTHX_API __declspec(dllimport)
+#endif
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4251)  // std:: members of exported classes: callers use the same MSVC runtime
+#endif
+
 namespace omthx {
 
 enum class Mode { Full, Hx };  // Full = plain OMT with VMX; Hx = HEVC or H.264 inside OMT
@@ -39,7 +53,7 @@ struct SenderStats {
 
 // One OMT source. sendVideo and sendAudio may run on two threads, but each must stay on its own.
 // requestKeyframe, tally and stats are safe from any thread.
-class Sender {
+class OMTHX_API Sender {
  public:
   // codec picks the Hx video codec and is ignored in Mode::Full. The receiver needs no setting.
   Sender(const std::string& name, Mode mode, Quality quality, Codec codec = Codec::Hevc);
@@ -94,7 +108,7 @@ struct ReceiverStats {
 
 // Reads one OMT source in either mode. receiveVideo and receiveAudio may run on two threads,
 // but each must stay on its own.
-class Receiver {
+class OMTHX_API Receiver {
  public:
   explicit Receiver(const std::string& address);
   ~Receiver();
@@ -113,7 +127,7 @@ class Receiver {
 };
 
 // Names of the OMT sources seen on the network so far. Discovery needs a second or two after start.
-std::vector<std::string> discover();
+OMTHX_API std::vector<std::string> discover();
 
 // What a source sends, read from the header of one of its video frames.
 struct SourceInfo {
@@ -127,6 +141,10 @@ struct SourceInfo {
 // preview, an Hx sender its stream as it is. The sender's tally is not touched.
 // False when no picture arrived in time. libomt drops a frame in a format it does not know, so a source
 // sending one also gives false.
-bool probe(const std::string& address, int timeoutMs, SourceInfo& out);
+OMTHX_API bool probe(const std::string& address, int timeoutMs, SourceInfo& out);
 
 }  // namespace omthx
+
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif

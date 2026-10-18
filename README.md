@@ -11,6 +11,17 @@ plain OMT or OMT-HX; one `Receiver` reads both.
 - Design: [docs/superpowers/specs/2026-10-12-omt-hx-design.md](docs/superpowers/specs/2026-10-12-omt-hx-design.md)
 - Measured figures: [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md), reproduced with `scripts\measure.ps1`
 
+## Binary release
+
+Each `v*` tag publishes `OMT-HX.Binaries.Release.<tag>.zip` on the
+[releases page](https://github.com/bmsolutionsvn/OMT-HX/releases), laid out like Open Media
+Transport's own release. To use it from C++ (Visual Studio 2022 or newer, `/MD`): add
+`Libraries\Winx64\include` to the include path, `#include "omthx/omthx.h"`, link `omthx.lib`, and put
+every DLL in `Libraries\Winx64` beside your executable. The zip also holds `libomt.h`/`libomt.lib` for
+OMT's C API, the .NET `libomtnet.dll`, the test tools and the licences. Every push is built and tested
+by `.github/workflows/build.yml`. A build from source that compiles omthx into your program defines
+`OMTHX_STATIC`; the CMake target `omthx` does it for you.
+
 ## Build and test
 
 Needs Windows x64, Visual Studio 2022 or newer with the C++ desktop workload, the .NET 8 SDK and git.

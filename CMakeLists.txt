@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(OMTHX_BUILD_TESTS "Build the omthx tests and tools" ${PROJECT_IS_TOP_LEVEL})
+option(OMTHX_SHARED "Also build omthx.dll, the binary release; the tools then use it" OFF)
 include(cmake/omt.cmake)  # libomt and libvmx, built from the omt/ submodules
 
 find_package(FFMPEG REQUIRED)
@@ -15,16 +16,29 @@ function(omthx_warnings target)
 endfunction()
 
 # ---- library ----
-add_library(omthx STATIC
-  src/pure.cpp
-  src/encoder.cpp
-  src/decoder.cpp
-  src/link.cpp
-)
-target_include_directories(omthx PUBLIC include PRIVATE src ${FFMPEG_INCLUDE_DIRS})
-target_link_directories(omthx PUBLIC ${FFMPEG_LIBRARY_DIRS})
-target_link_libraries(omthx PUBLIC ${FFMPEG_LIBRARIES} libomt)
-omthx_warnings(omthx)
+set(OMTHX_SOURCES src/pure.cpp src/encoder.cpp src/decoder.cpp src/link.cpp)
+function(omthx_library target type)
+  add_library(${target} ${type} ${OMTHX_SOURCES})
+  target_include_directories(${target} PUBLIC include PRIVATE src ${FFMPEG_INCLUDE_DIRS})
+  target_link_directories(${target} PUBLIC ${FFMPEG_LIBRARY_DIRS})
+  target_link_libraries(${target} PUBLIC ${FFMPEG_LIBRARIES} libomt)
+  omthx_warnings(${target})
+endfunction()
+
+# Static, for apps that build omthx in (BreadCamera) and for the tests, which reach past the public API.
+omthx_library(omthx STATIC)
+target_compile_definitions(omthx PUBLIC OMTHX_STATIC)
+
+# omthx.dll and its import library omthx.lib: what the binary release ships beside omthx.h.
+if(OMTHX_SHARED)
+  set_target_properties(omthx PROPERTIES OUTPUT_NAME omthx_static)  # frees the name omthx.lib
+  omthx_library(omthx_dll SHARED)
+  set_target_properties(omthx_dll PROPERTIES OUTPUT_NAME omthx)
+  target_compile_definitions(omthx_dll PRIVATE OMTHX_BUILD_DLL)
+  set(OMTHX_TOOL_LIB omthx_dll)
+else()
+  set(OMTHX_TOOL_LIB omthx)
+endif()
 
 if(OMTHX_BUILD_TESTS)
   find_package(doctest CONFIG REQUIRED)
@@ -45,7 +59,7 @@ if(OMTHX_BUILD_TESTS)
   # ---- tools ----
   foreach(tool send recv)
     add_executable(omthx-${tool} tools/omthx_${tool}.cpp)
-    target_link_libraries(omthx-${tool} PRIVATE omthx)
+    target_link_libraries(omthx-${tool} PRIVATE ${OMTHX_TOOL_LIB})
     omthx_warnings(omthx-${tool})
     omthx_copy_runtime(omthx-${tool})
   endforeach()

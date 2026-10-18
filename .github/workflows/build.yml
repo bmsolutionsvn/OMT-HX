@@ -1,0 +1,161 @@
+# Builds and tests OMT-HX on every push and pull request. A tag v* also publishes a binary release laid out
+# like Open Media Transport's own: download, include omthx.h (or libomt.h), link the .lib, ship the DLLs.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read # only the release job, on a tag, may write
+
+jobs:
+  windows-x64:
+    runs-on: windows-2025
+    outputs:
+      name: ${{ steps.package.outputs.name }}
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\..\vcpkg-cache
+    steps:
+      - name: Check out OMT-HX and its OMT forks
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      # The MSVC developer environment: the C++ build, and .NET Native AOT's link of libomt.dll.
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      - name: Point at the runner's vcpkg
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          git -C $env:VCPKG_INSTALLATION_ROOT fetch -q # vcpkg.json's builtin-baseline must be in its history
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+
+      # FFmpeg from source takes most of an hour; its built packages are kept between runs.
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-
+
+      - name: Configure
+        run: cmake --preset release -DOMTHX_SHARED=ON
+
+      - name: Build
+        run: cmake --build --preset release
+
+      # The runner has no GPU: the tests that need a hardware encoder say SKIPPED and pass.
+      - name: Test
+        working-directory: build/release
+        run: .\omthx_tests.exe
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "dev-$($env:GITHUB_SHA.Substring(0, 7))" }
+          $name = "OMT-HX.Binaries.Release.$version"
+          $root = Join-Path $env:RUNNER_TEMP $name
+          $lib = Join-Path $root 'Libraries\Winx64'
+          $build = 'build\release'
+          New-Item -ItemType Directory -Force (Join-Path $lib 'include\omthx'), (Join-Path $root 'libomtnet\netstandard2.0'), (Join-Path $root 'licenses') | Out-Null
+
+          # omthx: header, import library, DLL; libomt's C API beside it; every DLL they load at run time
+          Copy-Item include\omthx\omthx.h (Join-Path $lib 'include\omthx')
+          Copy-Item omt\libomt\libomt.h, omt\libomt\bin\Release\net8.0\win-x64\native\libomt.lib $lib
+          Copy-Item "$build\omthx.lib", "$build\omthx-send.exe", "$build\omthx-recv.exe" $lib
+          Copy-Item "$build\*.dll" $lib
+          # libomtnet for .NET programs, with the same change
+          Copy-Item omt\libomtnet\bin\Release\netstandard2.0\libomtnet.dll (Join-Path $root 'libomtnet\netstandard2.0')
+
+          Copy-Item LICENSE (Join-Path $root 'LICENSE.txt')
+          Copy-Item omt\libomtnet\LICENSE.txt (Join-Path $root 'licenses\OpenMediaTransport.txt')
+          Get-ChildItem "$build\vcpkg_installed\x64-windows\share\*\copyright" | ForEach-Object {
+            Copy-Item $_ (Join-Path $root "licenses\$($_.Directory.Name).txt")
+          }
+
+          @"
+          OMT-HX $version, Windows x64
+
+          Libraries\Winx64
+            omthx.h (include\omthx), omthx.lib, omthx.dll   OMT-HX: send and receive OMT or OMT-HX (HEVC / H.264)
+            libomt.h, libomt.lib, libomt.dll                Open Media Transport's C API, with OMT-HX's change
+            libvmx.dll                                      the VMX codec of plain OMT
+            other *.dll                                     FFmpeg and what it needs
+            omthx-send.exe, omthx-recv.exe                  test sender and receiver
+
+          libomtnet\netstandard2.0\libomtnet.dll            the .NET library, with the same change
+
+          C++ (Visual Studio 2022 or newer, /MD): add Libraries\Winx64\include to the include path,
+          #include "omthx/omthx.h", link omthx.lib, and put every DLL of Libraries\Winx64 beside your .exe.
+          Source: https://github.com/bmsolutionsvn/OMT-HX
+          "@ | Set-Content (Join-Path $root 'README.txt')
+
+          $zip = Join-Path $env:RUNNER_TEMP "$name.zip"
+          Compress-Archive -Path $root -DestinationPath $zip
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+          "name=$name" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.zip }}
+
+  # Separate, so the build above never holds write access. GitHub's own actions and the gh CLI only.
+  release:
+    needs: windows-x64
+    if: github.ref_type == 'tag'
+    runs-on: windows-2025
+    permissions:
+      contents: write
+    steps:
+      - name: Check out OMT-HX and its OMT forks, with history
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0 # the notes list the forks' commits on top of upstream
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.windows-x64.outputs.name }}
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $forks = foreach ($m in 'libomtnet', 'libomt', 'libvmx') {
+            git -C "omt\$m" fetch -q "https://github.com/openmediatransport/$m.git" master
+            $changes = git -C "omt\$m" log --format='  - %h %s' FETCH_HEAD..HEAD
+            "- **$m** ``$(git -C "omt\$m" rev-parse --short HEAD)``" + $(if ($changes) { "`n$($changes -join "`n")" } else { ', unchanged from upstream' })
+          }
+          @"
+          This is a prebuilt binary release of OMT-HX for Windows x64.
+
+          **omthx**
+          Shared library for C++ applications: send and receive plain OMT or OMT-HX (HEVC / H.264)
+
+          **libomt**
+          Open Media Transport's shared library for C/C++ applications, with OMT-HX's change
+
+          **libvmx**
+          Shared library for the VMX video codec
+
+          **libomtnet**
+          .NET Standard 2.0 library, with OMT-HX's change
+
+          Built from these Open Media Transport forks (changes on top of upstream):
+          $($forks -join "`n")
+          "@ | Set-Content notes.md
+          gh release create $env:GITHUB_REF_NAME "${{ needs.windows-x64.outputs.name }}.zip" --title "OMT-HX Binaries Release $env:GITHUB_REF_NAME" --notes-file notes.md
