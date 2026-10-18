@@ -69,6 +69,12 @@ class OMTHX_API Sender {
   // cheap path for an app that already has NV12. Strides are in bytes; fullRange false means 16-235.
   void sendVideoNv12(const VideoFormat& format, const uint8_t* y, int yStride, const uint8_t* uv, int uvStride,
                      bool fullRange, int64_t timestamp);
+  // Either mode: 8-bit 4:2:2 UYVY (BT.709, 16-235), even width, rows `stride` bytes apart. With format.alpha,
+  // `alpha` is a width * height plane, rows `alphaStride` bytes apart, full range; otherwise it is ignored.
+  // Full hands it to VMX as it is (no conversion; zero copy when the alpha plane follows the UYVY plane with
+  // stride / 2, as in OMT's and NDI's UYVA). Hx makes the NV12 picture without a colour matrix.
+  void sendVideoUyvy(const VideoFormat& format, const uint8_t* uyvy, int stride, const uint8_t* alpha,
+                     int alphaStride, bool premultiplied, int64_t timestamp);
   // planar: all samples of channel 0, then all of channel 1, and so on.
   void sendAudio(std::span<const float> planar, int sampleRate, int channels, int64_t timestamp);
   void requestKeyframe();  // the next frame is coded as a keyframe (at most one per 500 ms)
@@ -81,11 +87,17 @@ class OMTHX_API Sender {
   std::unique_ptr<Impl> d_;
 };
 
+// What a Receiver hands back. Uyvy keeps the 4:2:2 picture VMX and NDI carry, for an app that passes video on.
+enum class PixelFormat { Bgra, Uyvy };
+
 struct VideoFrame {
   VideoFormat format;
   bool premultiplied = false;
   int64_t timestamp = 0;
-  std::vector<uint8_t> bgra;  // width * height * 4
+  std::vector<uint8_t> bgra;  // Bgra receivers: width * height * 4
+  // Uyvy receivers: UYVY (BT.709, 16-235), rows of width * 2 bytes, then with alpha the width * height alpha
+  // plane: OMT's and NDI's UYVA layout.
+  std::vector<uint8_t> uyvy;
 };
 
 struct AudioFrame {
@@ -110,7 +122,7 @@ struct ReceiverStats {
 // but each must stay on its own.
 class OMTHX_API Receiver {
  public:
-  explicit Receiver(const std::string& address);
+  explicit Receiver(const std::string& address, PixelFormat pixels = PixelFormat::Bgra);
   ~Receiver();
   Receiver(const Receiver&) = delete;
   Receiver& operator=(const Receiver&) = delete;

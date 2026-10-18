@@ -58,6 +58,13 @@ struct Nv12 {
 // An NV12 picture with any row strides into `out` (full range). Limited range is stretched to full.
 void copyNv12(const VideoFormat& format, const uint8_t* y, int yStride, const uint8_t* uv, int uvStride, bool fullRange,
               Nv12& out);
+// UYVY (limited range) and, with alpha, its alpha plane to the packed NV12 picture, with no colour matrix:
+// values are re-ranged by table and chroma rows averaged 4:2:2 to 4:2:0. Straight colour is premultiplied in YUV.
+void packUyvy(const VideoFormat& format, const uint8_t* uyvy, int stride, const uint8_t* alpha, int alphaStride,
+              bool premultiplied, Nv12& out);
+// Back to UYVY rows of width * 2 bytes, followed with alpha by the width * height alpha plane: the UYVA layout
+// OMT and NDI share. Chroma rows repeat; colour stays premultiplied when there is alpha.
+void unpackUyvy(const VideoFormat& format, const Nv12& in, std::vector<uint8_t>& uyva);
 
 class Packer {
  public:

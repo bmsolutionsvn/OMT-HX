@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -303,4 +304,84 @@ TEST_CASE("Sender rejects input it cannot use") {
   const std::vector<float> three(3);
   CHECK_THROWS_AS(sender.sendAudio(three, 48000, 2, 0), std::invalid_argument);
   CHECK_THROWS_AS(sender.sendAudio(three, 48000, 0, 0), std::invalid_argument);
+}
+
+namespace {
+// Left half white and opaque, right half black at quarter alpha, laid out as UYVA: the UYVY plane, then the
+// alpha plane right after it with half its stride, as OMT and NDI lay it out.
+std::vector<uint8_t> uyvaPicture(int w, int h) {
+  std::vector<uint8_t> p(static_cast<size_t>(w) * h * 3);
+  for (int r = 0; r < h; ++r) {
+    for (int x = 0; x < w; ++x) {
+      uint8_t* px = &p[(static_cast<size_t>(r) * w + x) * 2];
+      px[0] = 128;
+      px[1] = x < w / 2 ? 235 : 16;
+      p[static_cast<size_t>(w) * h * 2 + static_cast<size_t>(r) * w + x] = x < w / 2 ? 255 : 64;
+    }
+  }
+  return p;
+}
+
+bool closeTo(int value, int want) { return std::abs(value - want) <= 8; }
+
+// Sends the UYVA picture at 60 fps until the receiver hands one back, for at most five seconds.
+bool sendUyvaUntilReceived(Sender& sender, Receiver& receiver, const VideoFormat& f, VideoFrame& frame) {
+  const std::vector<uint8_t> pic = uyvaPicture(f.width, f.height);
+  const uint8_t* alpha = pic.data() + static_cast<size_t>(f.width) * f.height * 2;
+  auto next = Clock::now();
+  for (int i = 0; i < 300; ++i) {
+    sender.sendVideoUyvy(f, pic.data(), f.width * 2, alpha, f.width, false, 1'000'000 + i * kFrame);
+    if (receiver.receiveVideo(frame, 0)) return true;
+    next += std::chrono::microseconds(16'667);
+    std::this_thread::sleep_until(next);
+  }
+  return false;
+}
+
+void checkUyva(const VideoFrame& frame, int w, int h) {
+  REQUIRE(frame.uyvy.size() == static_cast<size_t>(w) * h * 3);
+  const size_t row = static_cast<size_t>(h / 2) * w;
+  const uint8_t* alpha = frame.uyvy.data() + static_cast<size_t>(w) * h * 2;
+  CHECK(closeTo(frame.uyvy[row * 2 + 100 * 2 + 1], 235));  // white
+  CHECK(closeTo(frame.uyvy[row * 2 + 100 * 2], 128));      // neutral colour
+  CHECK(closeTo(frame.uyvy[row * 2 + 540 * 2 + 1], 16));   // black
+  CHECK(closeTo(alpha[row + 100], 255));
+  CHECK(closeTo(alpha[row + 540], 64));
+}
+}  // namespace
+
+TEST_CASE("a UYVA picture goes through plain OMT and arrives as UYVA") {
+  const VideoFormat f{640, 360, 60, 1, true};
+  Sender sender("omthx-test-uyvy-full", Mode::Full, Quality::Medium);
+  Receiver receiver(sender.address(), PixelFormat::Uyvy);
+  VideoFrame frame;
+  REQUIRE(sendUyvaUntilReceived(sender, receiver, f, frame));
+  CHECK(frame.format == f);
+  CHECK_FALSE(frame.premultiplied);  // sent straight, and plain OMT keeps it
+  CHECK(frame.bgra.empty());
+  checkUyva(frame, 640, 360);
+}
+
+TEST_CASE("a UYVA picture goes through HX and arrives as UYVA") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{640, 360, 60, 1, true};
+  Sender sender("omthx-test-uyvy-hx", Mode::Hx, Quality::Medium);
+  Receiver receiver(sender.address(), PixelFormat::Uyvy);
+  VideoFrame frame;
+  REQUIRE(sendUyvaUntilReceived(sender, receiver, f, frame));
+  CHECK(frame.format == f);
+  CHECK(frame.premultiplied);  // HX carries premultiplied colour; black stays black
+  checkUyva(frame, 640, 360);
+  CHECK(sender.stats().lastEncodeMs > 0);
+}
+
+TEST_CASE("sendVideoUyvy rejects input it cannot use") {
+  Sender sender("omthx-test-uyvy-bad", Mode::Hx, Quality::Medium);
+  const std::vector<uint8_t> pic(640u * 360 * 3);
+  CHECK_THROWS_AS(sender.sendVideoUyvy(VideoFormat{639, 360, 60, 1, false}, pic.data(), 1280, nullptr, 0, false, 0),
+                  std::invalid_argument);  // odd width
+  CHECK_THROWS_AS(sender.sendVideoUyvy(VideoFormat{640, 360, 60, 1, false}, pic.data(), 1000, nullptr, 0, false, 0),
+                  std::invalid_argument);  // stride under width * 2
+  CHECK_THROWS_AS(sender.sendVideoUyvy(VideoFormat{640, 360, 60, 1, true}, pic.data(), 1280, nullptr, 0, false, 0),
+                  std::invalid_argument);  // alpha without its plane
 }

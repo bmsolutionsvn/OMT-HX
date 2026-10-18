@@ -74,6 +74,11 @@ if (receiver.receiveVideo(frame, 100)) { /* frame.bgra, premultiplied when it ha
 receiver.setTally({.preview = false, .program = true});
 ```
 
+An app that passes video on (a bridge, a router) can stay in 4:2:2 YUV, the format VMX and NDI carry:
+`Sender::sendVideoUyvy` takes UYVY or UYVA (alpha plane after the UYVY plane, as OMT and NDI lay it out),
+and `Receiver(address, omthx::PixelFormat::Uyvy)` hands frames back in `VideoFrame::uyvy`. Plain OMT then
+needs no colour conversion at all, and HX converts 4:2:2 to 4:2:0 without a colour matrix.
+
 A fourth `Sender` argument picks the HX codec: `omthx::Codec::Hevc` (the default) or
 `omthx::Codec::H264`. The receiver needs no setting; it reads whichever arrives, and follows a
 source that comes back with the other codec.

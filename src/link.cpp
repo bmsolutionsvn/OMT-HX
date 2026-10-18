@@ -21,6 +21,26 @@ void checkBgra(const VideoFormat& f, std::span<const uint8_t> bgra) {
   if (f.width <= 0 || f.height <= 0 || bgra.size() != static_cast<size_t>(f.width) * f.height * 4)
     throw std::invalid_argument("bgra must be width * height * 4 bytes");
 }
+
+OMTMediaFrame videoHeader(const VideoFormat& fmt, int64_t timestamp) {
+  OMTMediaFrame f = {};
+  f.Type = OMTFrameType_Video;
+  f.Timestamp = timestamp;
+  f.Width = fmt.width;
+  f.Height = fmt.height;
+  f.FrameRateN = fmt.fpsN;
+  f.FrameRateD = fmt.fpsD;
+  f.AspectRatio = static_cast<float>(fmt.width) / static_cast<float>(fmt.height);
+  f.ColorSpace = OMTColorSpace_BT709;
+  return f;
+}
+
+OMTVideoFlags alphaFlags(const VideoFormat& fmt, bool premultiplied) {
+  int flags = 0;
+  if (fmt.alpha) flags |= OMTVideoFlags_Alpha;
+  if (fmt.alpha && premultiplied) flags |= OMTVideoFlags_PreMultiplied;
+  return static_cast<OMTVideoFlags>(flags);
+}
 }  // namespace
 
 // ---------------------------------------------------------------- Sender
@@ -34,6 +54,7 @@ struct Sender::Impl {
   std::unique_ptr<Encoder> encoder;
   Packer packer;
   Nv12 picture;
+  std::vector<uint8_t> uyva;  // Full: a UYVA picture whose alpha plane did not follow its UYVY plane
   KeyframePolicy policy;
   std::atomic<bool> appKeyframe{false};
   std::deque<int64_t> stamps;  // timestamps of pictures the encoder still holds
@@ -45,6 +66,11 @@ struct Sender::Impl {
 
   void openEncoder(const VideoFormat& fmt);
   void sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock::time_point t0, OMTMediaFrame& f);
+  void sendFull(OMTMediaFrame& f) {  // libomt encodes VMX itself
+    omt_send(tx, &f);
+    std::lock_guard lock(statsMutex);
+    ++stats.framesSent;
+  }
 };
 
 // Opens the encoder for this format, or keeps the one already open for it.
@@ -112,28 +138,15 @@ Sender::~Sender() { omt_send_destroy(d_->tx); }
 
 void Sender::sendVideo(const VideoFormat& fmt, std::span<const uint8_t> bgra, bool premultiplied, int64_t timestamp) {
   checkBgra(fmt, bgra);
-  OMTMediaFrame f = {};
-  f.Type = OMTFrameType_Video;
-  f.Timestamp = timestamp;
-  f.Width = fmt.width;
-  f.Height = fmt.height;
-  f.FrameRateN = fmt.fpsN;
-  f.FrameRateD = fmt.fpsD;
-  f.AspectRatio = static_cast<float>(fmt.width) / static_cast<float>(fmt.height);
-  f.ColorSpace = OMTColorSpace_BT709;
+  OMTMediaFrame f = videoHeader(fmt, timestamp);
 
-  if (d_->mode == Mode::Full) {  // libomt encodes VMX itself
-    int flags = 0;
-    if (fmt.alpha) flags |= OMTVideoFlags_Alpha;
-    if (fmt.alpha && premultiplied) flags |= OMTVideoFlags_PreMultiplied;
-    f.Flags = static_cast<OMTVideoFlags>(flags);
+  if (d_->mode == Mode::Full) {
+    f.Flags = alphaFlags(fmt, premultiplied);
     f.Codec = OMTCodec_BGRA;
     f.Stride = fmt.width * 4;
     f.Data = const_cast<uint8_t*>(bgra.data());
     f.DataLength = static_cast<int>(bgra.size());
-    omt_send(d_->tx, &f);
-    std::lock_guard lock(d_->statsMutex);
-    ++d_->stats.framesSent;
+    d_->sendFull(f);
     return;
   }
 
@@ -149,17 +162,49 @@ void Sender::sendVideoNv12(const VideoFormat& fmt, const uint8_t* y, int yStride
     throw std::invalid_argument("sendVideoNv12 is for an Hx source without alpha");
   if (!y || !uv || yStride < fmt.width || uvStride < fmt.width)
     throw std::invalid_argument("each NV12 plane needs a stride of at least the width");
-  OMTMediaFrame f = {};
-  f.Type = OMTFrameType_Video;
-  f.Width = fmt.width;
-  f.Height = fmt.height;
-  f.FrameRateN = fmt.fpsN;
-  f.FrameRateD = fmt.fpsD;
-  f.AspectRatio = static_cast<float>(fmt.width) / static_cast<float>(fmt.height);
-  f.ColorSpace = OMTColorSpace_BT709;
+  OMTMediaFrame f = videoHeader(fmt, timestamp);
   d_->openEncoder(fmt);
   const auto t0 = Clock::now();
   copyNv12(fmt, y, yStride, uv, uvStride, fullRange, d_->picture);
+  d_->sendPicture(fmt, timestamp, t0, f);
+}
+
+void Sender::sendVideoUyvy(const VideoFormat& fmt, const uint8_t* uyvy, int stride, const uint8_t* alpha,
+                           int alphaStride, bool premultiplied, int64_t timestamp) {
+  if (fmt.width < 2 || fmt.height < 2 || fmt.width % 2 || !uyvy || stride < fmt.width * 2 ||
+      (fmt.alpha && (!alpha || alphaStride < fmt.width)))
+    throw std::invalid_argument("uyvy needs an even width and a stride of at least width * 2, and alpha a plane");
+  OMTMediaFrame f = videoHeader(fmt, timestamp);
+
+  if (d_->mode == Mode::Full) {
+    const size_t plane = static_cast<size_t>(stride) * fmt.height;
+    f.Flags = alphaFlags(fmt, premultiplied);
+    f.Codec = fmt.alpha ? OMTCodec_UYVA : OMTCodec_UYVY;
+    f.Stride = stride;
+    f.Data = const_cast<uint8_t*>(uyvy);
+    f.DataLength = static_cast<int>(plane);
+    if (fmt.alpha) {
+      // libvmx reads the alpha plane from Data + Stride * Height, rows Stride / 2 apart.
+      if (alpha != uyvy + plane || stride % 2 || alphaStride != stride / 2) {
+        const size_t row = static_cast<size_t>(fmt.width) * 2;
+        d_->uyva.resize(row * fmt.height * 3 / 2);
+        for (int r = 0; r < fmt.height; ++r) {
+          std::memcpy(d_->uyva.data() + r * row, uyvy + static_cast<size_t>(r) * stride, row);
+          std::memcpy(d_->uyva.data() + row * fmt.height + r * row / 2, alpha + static_cast<size_t>(r) * alphaStride,
+                      row / 2);
+        }
+        f.Stride = static_cast<int>(row);
+        f.Data = d_->uyva.data();
+      }
+      f.DataLength = f.Stride * fmt.height * 3 / 2;
+    }
+    d_->sendFull(f);
+    return;
+  }
+
+  d_->openEncoder(fmt);
+  const auto t0 = Clock::now();
+  packUyvy(fmt, uyvy, stride, alpha, alphaStride, premultiplied, d_->picture);
   d_->sendPicture(fmt, timestamp, t0, f);
 }
 
@@ -207,6 +252,7 @@ std::string Sender::address() const {
 
 struct Receiver::Impl {
   omt_receive_t* rx = nullptr;
+  PixelFormat pixels = PixelFormat::Bgra;
   std::unique_ptr<Decoder> decoder;
   Packer packer;
   Nv12 picture;
@@ -236,10 +282,12 @@ struct Receiver::Impl {
   }
 };
 
-Receiver::Receiver(const std::string& address) : d_(std::make_unique<Impl>()) {
+Receiver::Receiver(const std::string& address, PixelFormat pixels) : d_(std::make_unique<Impl>()) {
+  d_->pixels = pixels;
   d_->rx = omt_receive_create(
       address.c_str(), static_cast<OMTFrameType>(OMTFrameType_Video | OMTFrameType_Audio | OMTFrameType_Metadata),
-      OMTPreferredVideoFormat_BGRA, OMTReceiveFlags_None);
+      pixels == PixelFormat::Uyvy ? OMTPreferredVideoFormat_UYVYorUYVA : OMTPreferredVideoFormat_BGRA,
+      OMTReceiveFlags_None);
   if (!d_->rx) throw std::runtime_error("cannot connect to the OMT source \"" + address + "\"");
 }
 
@@ -257,15 +305,29 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
 
   Codec codec = Codec::Hevc;
   if (!codecFromTag(static_cast<int>(f->Codec), codec)) {
-    // Plain OMT: libomt already decoded VMX to BGRA.
-    if (f->Codec != OMTCodec_BGRA || !f->Data || fmt.width <= 0 || fmt.height <= 0) return false;
-    const size_t rowBytes = static_cast<size_t>(fmt.width) * 4;
-    out.bgra.resize(rowBytes * fmt.height);
-    for (int r = 0; r < fmt.height; ++r) {
-      std::memcpy(out.bgra.data() + r * rowBytes, static_cast<const uint8_t*>(f->Data) + static_cast<size_t>(r) * f->Stride,
-                  rowBytes);
+    // Plain OMT: libomt already decoded VMX to the format asked for.
+    const bool uyvy = d_->pixels == PixelFormat::Uyvy;
+    if (!f->Data || fmt.width <= 0 || fmt.height <= 0) return false;
+    if (uyvy ? (f->Codec != OMTCodec_UYVY && f->Codec != OMTCodec_UYVA) : f->Codec != OMTCodec_BGRA) return false;
+    if (uyvy) fmt.alpha = fmt.alpha && f->Codec == OMTCodec_UYVA;
+    const size_t rowBytes = static_cast<size_t>(fmt.width) * (uyvy ? 2 : 4);
+    const size_t plane = static_cast<size_t>(f->Stride) * fmt.height;
+    const size_t needed =  // the bytes the copies below read
+        uyvy && fmt.alpha ? plane + static_cast<size_t>(f->Stride / 2) * (fmt.height - 1) + rowBytes / 2 : plane;
+    if (static_cast<size_t>(f->Stride) < rowBytes || f->DataLength < 0 || static_cast<size_t>(f->DataLength) < needed)
+      return false;  // a header that does not match its data
+    const auto* data = static_cast<const uint8_t*>(f->Data);
+    std::vector<uint8_t>& dst = uyvy ? out.uyvy : out.bgra;
+    dst.resize(rowBytes * fmt.height + (uyvy && fmt.alpha ? rowBytes / 2 * fmt.height : 0));
+    for (int r = 0; r < fmt.height; ++r)
+      std::memcpy(dst.data() + r * rowBytes, data + static_cast<size_t>(r) * f->Stride, rowBytes);
+    if (uyvy && fmt.alpha) {  // libomt's UYVA: the alpha plane follows, rows Stride / 2 apart
+      const size_t alphaRow = rowBytes / 2;
+      for (int r = 0; r < fmt.height; ++r)
+        std::memcpy(dst.data() + rowBytes * fmt.height + r * alphaRow,
+                    data + plane + static_cast<size_t>(r) * (f->Stride / 2), alphaRow);
     }
-    if (!fmt.alpha) {
+    if (!uyvy && !fmt.alpha) {
       for (size_t i = 3; i < out.bgra.size(); i += 4) out.bgra[i] = 255;
     }
     out.format = fmt;
@@ -318,7 +380,11 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
   bool ok = result == Decoded::Picture;
   if (ok) {
     try {
-      d_->packer.unpack(fmt, d_->picture, out.bgra);
+      if (d_->pixels == PixelFormat::Uyvy) {
+        unpackUyvy(fmt, d_->picture, out.uyvy);
+      } else {
+        d_->packer.unpack(fmt, d_->picture, out.bgra);
+      }
     } catch (const std::invalid_argument&) {
       ok = false;  // the picture does not match its header: treat it like a decode error
     }

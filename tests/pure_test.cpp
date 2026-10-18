@@ -252,3 +252,63 @@ TEST_CASE("pack leaves opaque pixels as sent and turns fully transparent ones bl
     CHECK(near(straight.y[static_cast<size_t>(r) * 32 + 31], premultiplied.y[0]));
   }
 }
+
+TEST_CASE("packUyvy re-ranges without a colour matrix and unpackUyvy reverses it") {
+  const VideoFormat f{4, 2, 60, 1, false};
+  // Rows 10 bytes apart: white then black. Chroma 64 over 192 on the left pair, neutral on the right.
+  const std::vector<uint8_t> src{64,  235, 64,  235, 128, 16, 128, 16, 9, 9,
+                                 192, 235, 192, 235, 128, 16, 128, 16, 9, 9};
+  Nv12 pic;
+  packUyvy(f, src.data(), 10, nullptr, 0, false, pic);
+  CHECK(pic.height == 2);
+  CHECK(pic.y == std::vector<uint8_t>{255, 255, 0, 0, 255, 255, 0, 0});
+  CHECK(pic.uv == std::vector<uint8_t>{128, 128, 128, 128});  // 64 and 192 are 55 and 201 in full range: mean 128
+
+  std::vector<uint8_t> back;
+  unpackUyvy(f, pic, back);
+  CHECK(back == std::vector<uint8_t>{128, 235, 128, 235, 128, 16, 128, 16, 128, 235, 128, 235, 128, 16, 128, 16});
+  CHECK_THROWS_AS(packUyvy(VideoFormat{3, 2, 60, 1, false}, src.data(), 10, nullptr, 0, false, pic),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(packUyvy(f, src.data(), 7, nullptr, 0, false, pic), std::invalid_argument);
+}
+
+TEST_CASE("packUyvy stacks the alpha plane and premultiplies straight colour in YUV") {
+  const VideoFormat f{64, 40, 60, 1, true};  // alphaTop(40) is 48, so the coded height is 96
+  const int stride = 140, alphaStride = 70;  // both padded
+  std::vector<uint8_t> uyvy(static_cast<size_t>(stride) * 40), alpha(static_cast<size_t>(alphaStride) * 40);
+  for (int r = 0; r < 40; ++r) {
+    for (int x = 0; x < 64; ++x) {
+      uint8_t* p = &uyvy[static_cast<size_t>(r) * stride + 2 * x];
+      p[0] = x % 2 ? 200 : 60;  // U before an even pixel's luma, V before an odd one's
+      p[1] = 235;
+      alpha[static_cast<size_t>(r) * alphaStride + x] = x < 32 ? 128 : 255;  // left half see-through
+    }
+  }
+  Nv12 straight, premultiplied;
+  packUyvy(f, uyvy.data(), stride, alpha.data(), alphaStride, false, straight);
+  packUyvy(f, uyvy.data(), stride, alpha.data(), alphaStride, true, premultiplied);
+  REQUIRE(straight.height == 96);
+  // alpha picture: brightness is alpha, colour is neutral, padding rows repeat the row above
+  CHECK(straight.y[48 * 64 + 0] == 128);
+  CHECK(straight.y[48 * 64 + 63] == 255);
+  CHECK(straight.y[95 * 64 + 63] == 255);
+  CHECK(straight.uv[24 * 64 + 10] == 128);
+  CHECK(straight.y[47 * 64 + 5] == straight.y[39 * 64 + 5]);
+  // opaque half as sent; see-through half: luma and the distance from neutral chroma scaled by 128/255
+  CHECK(straight.y[20 * 64 + 40] == premultiplied.y[20 * 64 + 40]);
+  CHECK(premultiplied.y[20 * 64 + 8] == 255);
+  CHECK(straight.y[20 * 64 + 8] == 128);
+  const int u = premultiplied.uv[10 * 64 + 8], v = premultiplied.uv[10 * 64 + 9];
+  CHECK(near(straight.uv[10 * 64 + 8], 128 + (u - 128) * 128 / 255));
+  CHECK(near(straight.uv[10 * 64 + 9], 128 + (v - 128) * 128 / 255));
+
+  std::vector<uint8_t> back;
+  unpackUyvy(f, straight, back);
+  const size_t plane = 64u * 2 * 40;
+  REQUIRE(back.size() == plane + 64u * 40);
+  CHECK(back[plane + 20 * 64 + 8] == 128);  // the alpha plane follows the UYVY plane
+  CHECK(back[plane + 20 * 64 + 40] == 255);
+  CHECK(back[20 * 128 + 2 * 40 + 1] == 235);                       // opaque luma
+  CHECK(near(back[20 * 128 + 2 * 8 + 1], 16 + 219 * 128 / 255));  // see-through luma stays premultiplied
+  CHECK_THROWS_AS(packUyvy(f, uyvy.data(), stride, nullptr, 0, false, straight), std::invalid_argument);
+}
