@@ -126,7 +126,7 @@ modes spend bandwidth to save latency.
   visually lossless. OMT-HX keeps OMT discovery, audio and tally; NDI|HX keeps NDI's.
 - Resolution and frame rate are bounded by the time each end needs per frame, not by the
   transport: on the test PC, with sender and receiver sharing one CPU and GPU, HX holds 60 fps up to
-  1440p (13 Mbps at 720p, 30 at 1080p, 53 at 1440p) and 1080p at 120 fps; 4K reaches 45 fps. The
+  1440p (13 Mbps at 720p, 30 at 1080p, 53 at 1440p) and 1080p at 120 fps; 4K reaches about 43 fps. The
   optional alpha mode doubles the coded picture; 720p60, 1080p30 and 1080p60 alpha hold real time.
   The full sweeps are in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md).
 
@@ -161,7 +161,7 @@ alpha frames into a single frame", and its runtime has a `codec_h264_hevc_alpha`
 Full-bandwidth NDI carries alpha as 4:2:2:4 instead.
 
 **Measured ceiling.** On the test PC (Radeon RX 6600, Ryzen 7 5700X), HX holds 60 fps up to 1440p
-(about 53 Mbps at medium) and 1080p120, and reaches 45 fps at 4K. Alone, the hardware codec encodes
+(about 53 Mbps at medium) and 1080p120, and reaches about 43 fps at 4K. Alone, the hardware codec encodes
 the 1080p alpha picture at 195 fps and decodes it at 305 fps. See
 [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md) for the resolution, frame-rate, quality and alpha
 sweeps.

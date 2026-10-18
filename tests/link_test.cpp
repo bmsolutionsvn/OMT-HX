@@ -403,10 +403,13 @@ int relayed(Relay relay, Receiver& downstream, VideoFrame& out, int wanted) {
 
 TEST_CASE("an HX source re-coded through a Gpu receiver stays in video memory") {
   if (!hardware(Codec::Hevc) || !hardware(Codec::H264)) return;
+  Codec to = Codec::H264;
+  SUBCASE("to h264") { to = Codec::H264; }
+  SUBCASE("to hevc") { to = Codec::Hevc; }
   const VideoFormat f{640, 360, 60, 1, true};
   Sender source("omthx-test-gpu-in", Mode::Hx, Quality::Medium, Codec::Hevc);
   Receiver gpu(source.address(), PixelFormat::Gpu);
-  Sender recoded("omthx-test-gpu-out", Mode::Hx, Quality::Medium, Codec::H264);
+  Sender recoded("omthx-test-gpu-out", Mode::Hx, Quality::Medium, to);
   Receiver downstream(recoded.address(), PixelFormat::Uyvy);
   Pump pump(source, f);
   VideoFrame frame, out;
@@ -421,7 +424,7 @@ TEST_CASE("an HX source re-coded through a Gpu receiver stays in video memory") 
   CHECK(out.format == f);
   CHECK(out.premultiplied);
   CHECK(out.uyvy.size() == 640u * 360 * 3);
-  CHECK(downstream.stats().codec == Codec::H264);
+  CHECK(downstream.stats().codec == to);
   MESSAGE("re-coded by " << recoded.stats().encoder);
   CHECK(recoded.stats().encoder.find("(d3d11)") != std::string::npos);  // no copy through memory
   REQUIRE(frame.gpu);
