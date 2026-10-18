@@ -51,8 +51,43 @@ struct SenderStats {
   int connections = 0;
 };
 
+// What a Receiver hands back.
+// Bgra and Uyvy: decoded pictures in memory. Uyvy keeps the 4:2:2 picture VMX and NDI carry, for an app that passes
+// video on. Gpu: an HX picture stays in video memory (VideoFrame::gpu) and a plain OMT picture arrives as Uyvy;
+// Sender::sendVideo(frame) re-codes it without a copy to memory. Coded: nothing is decoded; read the frames as the
+// source sent them with receiveCoded, and send them on with Sender::sendCoded.
+enum class PixelFormat { Bgra, Uyvy, Gpu, Coded };
+
+struct GpuPicture;  // a decoded HX picture in video memory, alpha packed as on the wire; opaque
+
+struct VideoFrame {
+  VideoFormat format;
+  bool premultiplied = false;
+  int64_t timestamp = 0;
+  std::vector<uint8_t> bgra;  // Bgra receivers: width * height * 4
+  // Uyvy receivers, and plain OMT on Gpu receivers: UYVY (BT.709, 16-235), rows of width * 2 bytes, then with
+  // alpha the width * height alpha plane: OMT's and NDI's UYVA layout.
+  std::vector<uint8_t> uyvy;
+  // Gpu receivers, HX sources: the picture, set; otherwise null. Hold only a few at a time: they are the
+  // decoder's own surfaces.
+  std::shared_ptr<const GpuPicture> gpu;
+};
+
+// One coded video frame as the source sent it, for an app that republishes a source without re-coding it.
+struct CodedFrame {
+  Mode mode = Mode::Full;     // Full: one VMX frame; Hx: one HEVC or H.264 access unit
+  Codec codec = Codec::Hevc;  // Hx only
+  VideoFormat format;
+  bool keyframe = true;       // VMX frames are all keyframes
+  uint64_t seq = 0;           // Hx: the frame's number; the next Sender passes it on, so a gap stays visible
+  int64_t timestamp = 0;
+  int flags = 0;              // OMT's video flags and colour space, as they came: pass them on untouched
+  int colorSpace = 0;
+  std::vector<uint8_t> data;
+};
+
 // One OMT source. sendVideo and sendAudio may run on two threads, but each must stay on its own.
-// requestKeyframe, tally and stats are safe from any thread.
+// requestKeyframe, keyframeRequested, tally and stats are safe from any thread.
 class OMTHX_API Sender {
  public:
   // codec picks the Hx video codec and is ignored in Mode::Full. The receiver needs no setting.
@@ -75,6 +110,15 @@ class OMTHX_API Sender {
   // stride / 2, as in OMT's and NDI's UYVA). Hx makes the NV12 picture without a colour matrix.
   void sendVideoUyvy(const VideoFormat& format, const uint8_t* uyvy, int stride, const uint8_t* alpha,
                      int alphaStride, bool premultiplied, int64_t timestamp);
+  // Sends what a Receiver handed back, whichever picture it holds, at frame.timestamp. A Gpu picture to an Hx
+  // sender is encoded where it is, in video memory, when the GPU encoder takes it, and through memory otherwise.
+  void sendVideo(const VideoFrame& frame);
+  // Sends a coded frame on untouched, whatever this sender's mode (no encoder runs). Feed a sender either coded
+  // frames or pictures, not both. Keyframe requests from this sender's receivers show in keyframeRequested.
+  void sendCoded(const CodedFrame& frame);
+  // True once after a receiver of this source asked for a keyframe, or lost a frame on its link: a relay passes
+  // it to its own source with Receiver::requestKeyframe. Only sendCoded collects them.
+  bool keyframeRequested();
   // planar: all samples of channel 0, then all of channel 1, and so on.
   void sendAudio(std::span<const float> planar, int sampleRate, int channels, int64_t timestamp);
   void requestKeyframe();  // the next frame is coded as a keyframe (at most one per 500 ms)
@@ -87,18 +131,9 @@ class OMTHX_API Sender {
   std::unique_ptr<Impl> d_;
 };
 
-// What a Receiver hands back. Uyvy keeps the 4:2:2 picture VMX and NDI carry, for an app that passes video on.
-enum class PixelFormat { Bgra, Uyvy };
-
-struct VideoFrame {
-  VideoFormat format;
-  bool premultiplied = false;
-  int64_t timestamp = 0;
-  std::vector<uint8_t> bgra;  // Bgra receivers: width * height * 4
-  // Uyvy receivers: UYVY (BT.709, 16-235), rows of width * 2 bytes, then with alpha the width * height alpha
-  // plane: OMT's and NDI's UYVA layout.
-  std::vector<uint8_t> uyvy;
-};
+// Fills frame.bgra or frame.uyvy (pixels Bgra or Uyvy) from frame.gpu, for a Gpu receiver's app that also
+// needs the picture in memory. False when frame.gpu is null or the copy fails.
+OMTHX_API bool download(VideoFrame& frame, PixelFormat pixels);
 
 struct AudioFrame {
   int sampleRate = 0;
@@ -111,15 +146,15 @@ struct AudioFrame {
 struct ReceiverStats {
   Mode mode = Mode::Full;        // what the source is sending
   Codec codec = Codec::Hevc;     // Hx only: which codec the source is sending
-  std::string decoder;           // "vmx", "hevc (d3d11va)", "h264 (software)", ...
-  uint64_t framesReceived = 0;   // pictures handed to the caller
+  std::string decoder;           // "vmx", "hevc (d3d11va)", "h264 (software)", "none" (Coded), ...
+  uint64_t framesReceived = 0;   // pictures or coded frames handed to the caller
   uint64_t framesDiscarded = 0;  // Hx frames dropped while waiting for a keyframe
   uint64_t bytesReceived = 0;    // wire bytes
   double lastDecodeMs = 0;       // Hx only: decode and unpack of the last frame
 };
 
-// Reads one OMT source in either mode. receiveVideo and receiveAudio may run on two threads,
-// but each must stay on its own.
+// Reads one OMT source in either mode. receiveVideo (or receiveCoded) and receiveAudio may run on two threads,
+// but each must stay on its own. requestKeyframe is safe from any thread.
 class OMTHX_API Receiver {
  public:
   explicit Receiver(const std::string& address, PixelFormat pixels = PixelFormat::Bgra);
@@ -128,8 +163,13 @@ class OMTHX_API Receiver {
   Receiver& operator=(const Receiver&) = delete;
 
   // False means no picture yet: a timeout, or a frame discarded while waiting for a keyframe. Call again.
+  // Coded receivers: always false; use receiveCoded.
   bool receiveVideo(VideoFrame& out, int timeoutMs);
+  // Coded receivers only. HX frames start at a keyframe and, after a lost frame, wait for the next one, as
+  // receiveVideo does; so the frames handed back always decode.
+  bool receiveCoded(CodedFrame& out, int timeoutMs);
   bool receiveAudio(AudioFrame& out, int timeoutMs);
+  void requestKeyframe();  // asks an Hx source for a keyframe, at most once per 500 ms
   void setTally(Tally tally);
   ReceiverStats stats();
 

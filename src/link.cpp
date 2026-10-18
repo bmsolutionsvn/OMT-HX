@@ -9,6 +9,10 @@
 #include <stdexcept>
 #include <string_view>
 
+extern "C" {
+#include <libavutil/frame.h>
+}
+
 #include <libomt.h>
 
 namespace omthx {
@@ -41,6 +45,10 @@ OMTVideoFlags alphaFlags(const VideoFormat& fmt, bool premultiplied) {
   if (fmt.alpha && premultiplied) flags |= OMTVideoFlags_PreMultiplied;
   return static_cast<OMTVideoFlags>(flags);
 }
+
+VideoFormat formatOf(const OMTMediaFrame* f) {
+  return VideoFormat{f->Width, f->Height, f->FrameRateN, f->FrameRateD, (f->Flags & OMTVideoFlags_Alpha) != 0};
+}
 }  // namespace
 
 // ---------------------------------------------------------------- Sender
@@ -50,13 +58,18 @@ struct Sender::Impl {
   Quality quality = Quality::Medium;
   Codec codec = Codec::Hevc;
   omt_send_t* tx = nullptr;
-  VideoFormat format;  // what the encoder was opened for
+  VideoFormat format;          // what the encoder was opened for
+  const void* gpuKey = nullptr;  // and the D3D11 frames context it takes pictures from, or null
+  bool gpuRefused = false;     // no GPU encoder took D3D11 pictures: they go through memory
   std::unique_ptr<Encoder> encoder;
   Packer packer;
   Nv12 picture;
   std::vector<uint8_t> uyva;  // Full: a UYVA picture whose alpha plane did not follow its UYVY plane
+  std::vector<uint8_t> gpuUyva;  // Full: a Gpu picture copied to memory
   KeyframePolicy policy;
   std::atomic<bool> appKeyframe{false};
+  std::atomic<bool> forward{false};  // sendCoded: a receiver asked for a keyframe
+  uint64_t codedDropped = 0;
   std::deque<int64_t> stamps;  // timestamps of pictures the encoder still holds
   uint64_t seq = 0;            // number of the next coded frame, carried in its metadata
   std::string seqMeta;
@@ -64,8 +77,10 @@ struct Sender::Impl {
   std::mutex statsMutex;
   SenderStats stats;
 
-  void openEncoder(const VideoFormat& fmt);
-  void sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock::time_point t0, OMTMediaFrame& f);
+  void openEncoder(const VideoFormat& fmt, AVBufferRef* gpuFrames = nullptr);
+  bool askedForKeyframe();
+  void sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock::time_point t0, OMTMediaFrame& f,
+                   const AVFrame* gpu = nullptr);
   void sendFull(OMTMediaFrame& f) {  // libomt encodes VMX itself
     omt_send(tx, &f);
     std::lock_guard lock(statsMutex);
@@ -73,31 +88,40 @@ struct Sender::Impl {
   }
 };
 
-// Opens the encoder for this format, or keeps the one already open for it.
-void Sender::Impl::openEncoder(const VideoFormat& fmt) {
-  if (encoder && fmt == format) return;
+// Opens the encoder for this format and source of pictures, or keeps the one already open for them.
+void Sender::Impl::openEncoder(const VideoFormat& fmt, AVBufferRef* gpuFrames) {
+  const void* key = gpuFrames ? gpuFrames->data : nullptr;
+  if (encoder && fmt == format && key == gpuKey) return;
   encoder = std::make_unique<Encoder>(codec, fmt.width, codedHeight(fmt), fmt.fpsN, fmt.fpsD,
-                                      targetBitrate(fmt, quality, codec));
+                                      targetBitrate(fmt, quality, codec), gpuFrames);
   format = fmt;
-  policy = KeyframePolicy();
-  stamps.clear();
+  gpuKey = key;
+  policy = KeyframePolicy();  // a new encoder starts with a keyframe
+  stamps.clear();             // and owes nothing the old one held
 }
 
-// Codes `picture` and sends what the encoder gives back. t0 is when the work on this frame began.
-void Sender::Impl::sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock::time_point t0, OMTMediaFrame& f) {
-  bool requested = appKeyframe.exchange(false);
+// True when a receiver of this source sent a keyframe request since the last call.
+bool Sender::Impl::askedForKeyframe() {
+  bool asked = false;
   while (OMTMediaFrame* m = omt_send_receive(tx, 0)) {  // messages from receivers
     if (m->Data && m->DataLength > 0 &&
         std::string_view(static_cast<const char*>(m->Data), static_cast<size_t>(m->DataLength)).find("<OMTHX Keyframe") !=
             std::string_view::npos)
-      requested = true;
+      asked = true;
   }
+  return asked;
+}
+
+// Codes `picture`, or `gpu` when set, and sends what the encoder gives back. t0 is when the work on this frame began.
+void Sender::Impl::sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock::time_point t0, OMTMediaFrame& f,
+                               const AVFrame* gpu) {
+  const bool requested = appKeyframe.exchange(false) | askedForKeyframe();
   OMTStatistics omt = {};
   omt_send_getvideostatistics(tx, &omt);
   const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
   const bool key = policy.next(nowMs, static_cast<uint64_t>(omt.FramesDropped), requested);
 
-  std::vector<Packet> packets = encoder->encode(picture, key);
+  std::vector<Packet> packets = gpu ? encoder->encodeGpu(gpu, key) : encoder->encode(picture, key);
   stamps.push_back(timestamp);  // after encode, so a throw leaves the deque unchanged
   const double encodeMs = msSince(t0);
 
@@ -118,7 +142,7 @@ void Sender::Impl::sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock:
     keyframes += p.keyframe ? 1 : 0;
   }
   std::lock_guard lock(statsMutex);
-  stats.encoder = encoder->name();
+  stats.encoder = encoder->name() + (gpu ? " (d3d11)" : "");
   stats.framesSent += packets.size();
   stats.keyframes += keyframes;
   stats.lastEncodeMs = encodeMs;
@@ -208,6 +232,79 @@ void Sender::sendVideoUyvy(const VideoFormat& fmt, const uint8_t* uyvy, int stri
   d_->sendPicture(fmt, timestamp, t0, f);
 }
 
+void Sender::sendVideo(const VideoFrame& frame) {
+  const VideoFormat& fmt = frame.format;
+  const size_t w = static_cast<size_t>(fmt.width), h = static_cast<size_t>(fmt.height);
+  if (frame.gpu) {
+    const AVFrame* pic = frame.gpu->frame;
+    if (pic->width != fmt.width || pic->height != codedHeight(fmt))
+      throw std::invalid_argument("the Gpu picture does not match its format");
+    if (d_->mode == Mode::Hx) {
+      OMTMediaFrame f = videoHeader(fmt, frame.timestamp);
+      const auto t0 = Clock::now();
+      if (frame.gpu->inVideoMemory() && !d_->gpuRefused) {
+        try {
+          d_->openEncoder(fmt, pic->hw_frames_ctx);
+        } catch (const std::runtime_error&) {
+          d_->gpuRefused = true;  // no GPU encoder takes D3D11 pictures: from now on, through memory
+        }
+        if (!d_->gpuRefused) {
+          d_->sendPicture(fmt, frame.timestamp, t0, f, pic);
+          return;
+        }
+      }
+      // Through memory. The picture is already packed as the encoder wants it: alpha stacked, premultiplied.
+      if (!downloadNv12(pic, d_->picture)) throw std::runtime_error("cannot copy the picture from video memory");
+      d_->openEncoder(fmt);
+      d_->sendPicture(fmt, frame.timestamp, t0, f);
+      return;
+    }
+    if (!downloadNv12(pic, d_->picture)) throw std::runtime_error("cannot copy the picture from video memory");
+    unpackUyvy(fmt, d_->picture, d_->gpuUyva);
+    const uint8_t* p = d_->gpuUyva.data();
+    sendVideoUyvy(fmt, p, fmt.width * 2, fmt.alpha ? p + w * 2 * h : nullptr, fmt.width, frame.premultiplied,
+                  frame.timestamp);
+    return;
+  }
+  if (!frame.uyvy.empty()) {
+    if (frame.uyvy.size() < w * h * (fmt.alpha ? 3 : 2)) throw std::invalid_argument("uyvy is smaller than its format");
+    const uint8_t* p = frame.uyvy.data();
+    sendVideoUyvy(fmt, p, fmt.width * 2, fmt.alpha ? p + w * 2 * h : nullptr, fmt.width, frame.premultiplied,
+                  frame.timestamp);
+    return;
+  }
+  sendVideo(fmt, frame.bgra, frame.premultiplied, frame.timestamp);
+}
+
+void Sender::sendCoded(const CodedFrame& c) {
+  if (c.data.empty() || c.format.width <= 0 || c.format.height <= 0)
+    throw std::invalid_argument("a coded frame needs its data and its size");
+  OMTMediaFrame f = videoHeader(c.format, c.timestamp);
+  f.Flags = static_cast<OMTVideoFlags>(c.flags);
+  f.ColorSpace = static_cast<OMTColorSpace>(c.colorSpace);
+  f.Codec = c.mode == Mode::Hx ? static_cast<OMTCodec>(codecTag(c.codec)) : OMTCodec_VMX1;
+  f.Data = const_cast<uint8_t*>(c.data.data());
+  f.DataLength = static_cast<int>(c.data.size());
+  if (c.mode == Mode::Hx) {  // the source's own number, so a frame lost before this sender shows downstream too
+    d_->seqMeta = seqMetadata(c.seq);
+    f.FrameMetadata = d_->seqMeta.data();
+    f.FrameMetadataLength = static_cast<int>(d_->seqMeta.size() + 1);
+  }
+  // A keyframe request, or a frame libomt dropped for a slow receiver, is for this source's source to answer.
+  OMTStatistics omt = {};
+  omt_send_getvideostatistics(d_->tx, &omt);
+  const uint64_t dropped = static_cast<uint64_t>(omt.FramesDropped);
+  if (d_->askedForKeyframe() || dropped > d_->codedDropped) d_->forward = true;
+  d_->codedDropped = dropped;
+  omt_send(d_->tx, &f);
+  std::lock_guard lock(d_->statsMutex);
+  d_->stats.encoder = "none";
+  ++d_->stats.framesSent;
+  d_->stats.keyframes += c.mode == Mode::Hx && c.keyframe ? 1 : 0;
+}
+
+bool Sender::keyframeRequested() { return d_->forward.exchange(false); }
+
 void Sender::sendAudio(std::span<const float> planar, int sampleRate, int channels, int64_t timestamp) {
   if (channels <= 0 || channels > 32 || planar.empty() || planar.size() % static_cast<size_t>(channels) != 0)
     throw std::invalid_argument("audio must hold the same number of samples for each of 1 to 32 channels");
@@ -257,20 +354,20 @@ struct Receiver::Impl {
   Packer packer;
   Nv12 picture;
   bool waiting = true;  // Hx: discard until a keyframe
+  bool haveCodec = false;
+  Codec lastCodec = Codec::Hevc;
   bool haveLast = false;
   int64_t lastTimestamp = 0;
   bool haveSeq = false;  // the source numbers its frames (this version on); older ones are judged by timestamp
   uint64_t lastSeq = 0;
+  uint64_t count = 0;    // Hx frames seen, the number given to frames of a source that does not number them
   Clock::time_point lastAsk{};
+  std::atomic<bool> askPending{false};  // requestKeyframe, served on the receiving thread
   std::mutex statsMutex;
   ReceiverStats stats;
 
-  // Count a discarded frame and ask the sender for a keyframe, at most once per 500 ms.
-  void discard() {
-    {
-      std::lock_guard lock(statsMutex);
-      ++stats.framesDiscarded;
-    }
+  // Asks the sender for a keyframe, at most once per 500 ms. Receiving thread only.
+  void ask() {
     const auto now = Clock::now();
     if (now - lastAsk < std::chrono::milliseconds(500)) return;
     lastAsk = now;
@@ -280,33 +377,70 @@ struct Receiver::Impl {
     m.DataLength = sizeof(kKeyframeRequest);
     omt_receive_send(rx, &m);
   }
+
+  // Counts a discarded frame and asks for a keyframe.
+  void discard() {
+    {
+      std::lock_guard lock(statsMutex);
+      ++stats.framesDiscarded;
+    }
+    ask();
+  }
+
+  // Hx: true when this access unit can be used. A lost coded frame breaks the picture until the next keyframe;
+  // a frame the app skipped does not, as the encoder never saw it. Only the frame number tells them apart.
+  bool admit(const OMTMediaFrame* f, Codec codec, std::span<const uint8_t> au, uint64_t& seqOut) {
+    if (haveCodec && codec != lastCodec) waiting = true;  // the source came back with the other codec
+    haveCodec = true;
+    lastCodec = codec;
+    uint64_t seq = 0;
+    const bool numbered = f->FrameMetadata && f->FrameMetadataLength > 0 &&
+                          parseSeq(std::string_view(static_cast<const char*>(f->FrameMetadata),
+                                                    static_cast<size_t>(f->FrameMetadataLength)),
+                                   seq);
+    if (numbered) {
+      if (haveSeq && seq != lastSeq + 1) waiting = true;
+      lastSeq = seq;
+    } else if (haveLast && isGap(lastTimestamp, f->Timestamp, f->FrameRateN, f->FrameRateD)) {
+      waiting = true;
+    }
+    haveSeq = numbered;
+    lastTimestamp = f->Timestamp;
+    haveLast = true;
+    seqOut = numbered ? seq : count;
+    ++count;
+    if (waiting && !isKeyframe(codec, au)) {
+      discard();
+      return false;
+    }
+    return true;
+  }
 };
 
 Receiver::Receiver(const std::string& address, PixelFormat pixels) : d_(std::make_unique<Impl>()) {
   d_->pixels = pixels;
+  const bool uyvy = pixels == PixelFormat::Uyvy || pixels == PixelFormat::Gpu;
   d_->rx = omt_receive_create(
       address.c_str(), static_cast<OMTFrameType>(OMTFrameType_Video | OMTFrameType_Audio | OMTFrameType_Metadata),
-      pixels == PixelFormat::Uyvy ? OMTPreferredVideoFormat_UYVYorUYVA : OMTPreferredVideoFormat_BGRA,
-      OMTReceiveFlags_None);
+      uyvy ? OMTPreferredVideoFormat_UYVYorUYVA : OMTPreferredVideoFormat_BGRA,
+      pixels == PixelFormat::Coded ? OMTReceiveFlags_CompressedOnly : OMTReceiveFlags_None);
   if (!d_->rx) throw std::runtime_error("cannot connect to the OMT source \"" + address + "\"");
+  if (pixels == PixelFormat::Coded) d_->stats.decoder = "none";
 }
 
 Receiver::~Receiver() { omt_receive_destroy(d_->rx); }
 
 bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
+  if (d_->pixels == PixelFormat::Coded) return false;
+  if (d_->askPending.exchange(false)) d_->ask();
   OMTMediaFrame* f = omt_receive(d_->rx, OMTFrameType_Video, timeoutMs);
   if (!f) return false;
-  VideoFormat fmt;
-  fmt.width = f->Width;
-  fmt.height = f->Height;
-  fmt.fpsN = f->FrameRateN;
-  fmt.fpsD = f->FrameRateD;
-  fmt.alpha = (f->Flags & OMTVideoFlags_Alpha) != 0;
+  VideoFormat fmt = formatOf(f);
 
   Codec codec = Codec::Hevc;
   if (!codecFromTag(static_cast<int>(f->Codec), codec)) {
     // Plain OMT: libomt already decoded VMX to the format asked for.
-    const bool uyvy = d_->pixels == PixelFormat::Uyvy;
+    const bool uyvy = d_->pixels != PixelFormat::Bgra;
     if (!f->Data || fmt.width <= 0 || fmt.height <= 0) return false;
     if (uyvy ? (f->Codec != OMTCodec_UYVY && f->Codec != OMTCodec_UYVA) : f->Codec != OMTCodec_BGRA) return false;
     if (uyvy) fmt.alpha = fmt.alpha && f->Codec == OMTCodec_UYVA;
@@ -327,9 +461,8 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
         std::memcpy(dst.data() + rowBytes * fmt.height + r * alphaRow,
                     data + plane + static_cast<size_t>(r) * (f->Stride / 2), alphaRow);
     }
-    if (!uyvy && !fmt.alpha) {
-      for (size_t i = 3; i < out.bgra.size(); i += 4) out.bgra[i] = 255;
-    }
+    // Without alpha libomt decodes BGRX, and libvmx fills its alpha with 255 (VMX_DecodeBGRX), so BGRA is opaque.
+    out.gpu.reset();
     out.format = fmt;
     out.premultiplied = fmt.alpha && (f->Flags & OMTVideoFlags_PreMultiplied) != 0;
     out.timestamp = f->Timestamp;
@@ -344,41 +477,25 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
   if (!f->CompressedData || f->CompressedLength <= 0) return false;
   const std::span<const uint8_t> au(static_cast<const uint8_t*>(f->CompressedData),
                                     static_cast<size_t>(f->CompressedLength));
-  if (d_->decoder && d_->decoder->codec() != codec) {  // the source came back with the other codec
-    d_->decoder.reset();
-    d_->waiting = true;
-  }
-  // A lost coded frame breaks the picture until the next keyframe. A frame the app skipped does not:
-  // the encoder never saw it. Only the frame number tells them apart.
+  if (d_->decoder && d_->decoder->codec() != codec) d_->decoder.reset();  // the source came back with the other codec
   uint64_t seq = 0;
-  const bool numbered = f->FrameMetadata && f->FrameMetadataLength > 0 &&
-                        parseSeq(std::string_view(static_cast<const char*>(f->FrameMetadata),
-                                                  static_cast<size_t>(f->FrameMetadataLength)),
-                                 seq);
-  if (numbered) {
-    if (d_->haveSeq && seq != d_->lastSeq + 1) d_->waiting = true;
-    d_->lastSeq = seq;
-  } else if (d_->haveLast && isGap(d_->lastTimestamp, f->Timestamp, fmt.fpsN, fmt.fpsD)) {
-    d_->waiting = true;
-  }
-  d_->haveSeq = numbered;
-  d_->lastTimestamp = f->Timestamp;
-  d_->haveLast = true;
-  if (d_->waiting && !isKeyframe(codec, au)) {
-    d_->discard();
-    return false;
-  }
+  if (!d_->admit(f, codec, au, seq)) return false;
   if (!d_->decoder) d_->decoder = std::make_unique<Decoder>(codec);
 
   const auto t0 = Clock::now();
   int64_t timestamp = 0;
-  const Decoded result = d_->decoder->decode(au, f->Timestamp, d_->picture, timestamp);
+  const bool gpu = d_->pixels == PixelFormat::Gpu;
+  std::shared_ptr<GpuPicture> picture = gpu ? std::make_shared<GpuPicture>() : nullptr;
+  const Decoded result = gpu ? d_->decoder->decodeFrame(au, f->Timestamp, picture->frame, timestamp)
+                             : d_->decoder->decode(au, f->Timestamp, d_->picture, timestamp);
   if (result == Decoded::NeedMore) {  // the decoder took the keyframe and is filling its pipeline
     d_->waiting = false;
     return false;
   }
   bool ok = result == Decoded::Picture;
-  if (ok) {
+  if (ok && gpu) {
+    ok = picture->frame->width == fmt.width && picture->frame->height == codedHeight(fmt);
+  } else if (ok) {
     try {
       if (d_->pixels == PixelFormat::Uyvy) {
         unpackUyvy(fmt, d_->picture, out.uyvy);
@@ -395,6 +512,7 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
     return false;
   }
   d_->waiting = false;
+  out.gpu = std::move(picture);
   out.format = fmt;
   out.premultiplied = fmt.alpha;
   out.timestamp = timestamp;
@@ -406,6 +524,43 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
   ++d_->stats.framesReceived;
   return true;
 }
+
+bool Receiver::receiveCoded(CodedFrame& out, int timeoutMs) {
+  if (d_->pixels != PixelFormat::Coded) return false;
+  if (d_->askPending.exchange(false)) d_->ask();
+  const OMTMediaFrame* f = omt_receive(d_->rx, OMTFrameType_Video, timeoutMs);
+  if (!f || !f->CompressedData || f->CompressedLength <= 0 || f->Width <= 0 || f->Height <= 0) return false;
+  const std::span<const uint8_t> data(static_cast<const uint8_t*>(f->CompressedData),
+                                      static_cast<size_t>(f->CompressedLength));
+  Codec codec = Codec::Hevc;
+  if (codecFromTag(static_cast<int>(f->Codec), codec)) {
+    uint64_t seq = 0;
+    if (!d_->admit(f, codec, data, seq)) return false;
+    d_->waiting = false;
+    out.mode = Mode::Hx;
+    out.codec = codec;
+    out.keyframe = isKeyframe(codec, data);
+    out.seq = seq;
+  } else if (f->Codec == OMTCodec_VMX1) {
+    out.mode = Mode::Full;
+    out.keyframe = true;
+    out.seq = 0;
+  } else {
+    return false;
+  }
+  out.format = formatOf(f);
+  out.timestamp = f->Timestamp;
+  out.flags = static_cast<int>(f->Flags);
+  out.colorSpace = static_cast<int>(f->ColorSpace);
+  out.data.assign(data.begin(), data.end());
+  std::lock_guard lock(d_->statsMutex);
+  d_->stats.mode = out.mode;
+  d_->stats.codec = codec;
+  ++d_->stats.framesReceived;
+  return true;
+}
+
+void Receiver::requestKeyframe() { d_->askPending = true; }
 
 bool Receiver::receiveAudio(AudioFrame& out, int timeoutMs) {
   OMTMediaFrame* f = omt_receive(d_->rx, OMTFrameType_Audio, timeoutMs);
@@ -450,7 +605,7 @@ bool probe(const std::string& address, int timeoutMs, SourceInfo& out) {
     Codec codec = Codec::Hevc;
     out.mode = codecFromTag(static_cast<int>(f->Codec), codec) ? Mode::Hx : Mode::Full;
     out.codec = codec;
-    out.format = VideoFormat{f->Width, f->Height, f->FrameRateN, f->FrameRateD, (f->Flags & OMTVideoFlags_Alpha) != 0};
+    out.format = formatOf(f);
     found = true;
     break;
   }

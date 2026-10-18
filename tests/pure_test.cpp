@@ -124,7 +124,7 @@ TEST_CASE("copyNv12 drops row padding and stretches limited range to full") {
                   std::invalid_argument);
 }
 
-TEST_CASE("KeyframePolicy: first frame, requests limited to one per 500 ms, new drops, every 2 s") {
+TEST_CASE("KeyframePolicy: first frame, requests limited to one per 500 ms, new drops, every 10 s") {
   KeyframePolicy p;
   CHECK(p.next(0, 0, false));          // first frame
   CHECK_FALSE(p.next(16, 0, false));
@@ -135,7 +135,9 @@ TEST_CASE("KeyframePolicy: first frame, requests limited to one per 500 ms, new 
   CHECK_FALSE(p.next(600, 1, false));  // libomt dropped a frame
   CHECK(p.next(1000, 1, false));
   CHECK_FALSE(p.next(1016, 1, false)); // same drop count: nothing new
-  CHECK(p.next(3000, 1, false));       // 2 seconds since the last keyframe
+  CHECK_FALSE(p.next(3000, 1, false)); // 2 seconds: no longer a reason
+  CHECK_FALSE(p.next(10999, 1, false));
+  CHECK(p.next(11000, 1, false));      // 10 seconds since the last keyframe
 }
 
 #include <cstdlib>
@@ -311,4 +313,11 @@ TEST_CASE("packUyvy stacks the alpha plane and premultiplies straight colour in 
   CHECK(back[20 * 128 + 2 * 40 + 1] == 235);                       // opaque luma
   CHECK(near(back[20 * 128 + 2 * 8 + 1], 16 + 219 * 128 / 255));  // see-through luma stays premultiplied
   CHECK_THROWS_AS(packUyvy(f, uyvy.data(), stride, nullptr, 0, false, straight), std::invalid_argument);
+}
+
+TEST_CASE("mulDiv255 equals the rounded divide it replaces, for every value and alpha") {
+  int wrong = 0;
+  for (unsigned v = 0; v < 256; ++v)
+    for (unsigned a = 0; a < 256; ++a) wrong += mulDiv255(v, a) != (v * a + 127) / 255;
+  CHECK(wrong == 0);
 }

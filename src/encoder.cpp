@@ -2,10 +2,14 @@
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
 }
 
+#include <chrono>
 #include <stdexcept>
+
+#include <windows.h>
 
 namespace omthx {
 namespace {
@@ -48,7 +52,8 @@ const std::vector<std::string>& Encoder::order(Codec codec) {
   return codec == Codec::H264 ? h264 : hevc;
 }
 
-Encoder::Encoder(Codec codec, int w, int h, int fpsN, int fpsD, int64_t bitrate) : codec_(codec) {
+Encoder::Encoder(Codec codec, int w, int h, int fpsN, int fpsD, int64_t bitrate, AVBufferRef* gpuFrames)
+    : codec_(codec) {
   std::string tried;
   for (const std::string& name : order(codec)) {
     const AVCodec* av = avcodec_find_encoder_by_name(name.c_str());
@@ -62,7 +67,12 @@ Encoder::Encoder(Codec codec, int w, int h, int fpsN, int fpsD, int64_t bitrate)
     c->time_base = {fpsD, fpsN};
     c->framerate = {fpsN, fpsD};
     c->pix_fmt = AV_PIX_FMT_NV12;
-    c->gop_size = 10 * fpsN / fpsD;  // a backstop only; the sender's KeyframePolicy asks for one every 2 s
+    if (gpuFrames) {  // pictures in video memory, on the decoder's own D3D11 device: nothing is copied
+      c->pix_fmt = AV_PIX_FMT_D3D11;
+      c->hw_frames_ctx = av_buffer_ref(gpuFrames);
+      c->hw_device_ctx = av_buffer_ref(reinterpret_cast<AVHWFramesContext*>(gpuFrames->data)->device_ref);
+    }
+    c->gop_size = static_cast<int>(2 * KeyframePolicy::kPeriodicMs / 1000 * fpsN / fpsD);  // beyond the KeyframePolicy
     c->max_b_frames = 0;
     c->bit_rate = bitrate;
     c->rc_max_rate = bitrate;
@@ -87,13 +97,17 @@ Encoder::Encoder(Codec codec, int w, int h, int fpsN, int fpsD, int64_t bitrate)
   }
   if (!ctx_) {
     throw std::runtime_error(std::string("no hardware ") + (codec == Codec::H264 ? "H.264" : "HEVC") +
-                             " encoder could be opened: " + tried);
+                             (gpuFrames ? " encoder took D3D11 pictures: " : " encoder could be opened: ") + tried);
   }
   frame_ = av_frame_alloc();
   packet_ = av_packet_alloc();
+  frameUs_ = 1'000'000LL * fpsD / fpsN;
+  // Sleep() waits whole timer ticks (up to 15.6 ms); this timer wakes within about half a millisecond.
+  timer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
 }
 
 Encoder::~Encoder() {
+  if (timer_) CloseHandle(timer_);
   av_packet_free(&packet_);
   av_frame_free(&frame_);
   avcodec_free_context(&ctx_);
@@ -111,26 +125,60 @@ std::vector<Packet> Encoder::encode(const Nv12& pic, bool forceKeyframe) {
   frame_->linesize[0] = pic.width;
   frame_->data[1] = const_cast<uint8_t*>(pic.uv.data());
   frame_->linesize[1] = pic.width;
+  return send(forceKeyframe);
+}
+
+std::vector<Packet> Encoder::encodeGpu(const AVFrame* pic, bool forceKeyframe) {
+  if (pic->width != ctx_->width || pic->height != ctx_->height || pic->format != ctx_->pix_fmt)
+    throw std::invalid_argument("the picture has the wrong size or kind for this encoder");
+  av_frame_unref(frame_);
+  if (av_frame_ref(frame_, pic) < 0) throw std::runtime_error("cannot reference the picture");
+  return send(forceKeyframe);
+}
+
+std::vector<Packet> Encoder::send(bool forceKeyframe) {
   frame_->color_range = AVCOL_RANGE_JPEG;
   frame_->colorspace = AVCOL_SPC_BT709;
   frame_->pts = index_++;
   frame_->pict_type = forceKeyframe ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
-
   const int rc = avcodec_send_frame(ctx_, frame_);
+  av_frame_unref(frame_);  // the encoder holds its own reference, or its own copy
   if (rc < 0) throw std::runtime_error(std::string(codecName(codec_)) + " encode failed: " + averr(rc));
+  ++owed_;
+  return drain();
+}
+
+// AMF hands the packet back a few ms after the picture, not inside avcodec_send_frame: taking only what is ready
+// would send every picture one frame late (16.7 ms at 60 fps). Waiting for it measured about 3 ms for 1080p on
+// hevc_amf. The wait stops after one frame time, so a stalled encoder costs one frame, as before.
+std::vector<Packet> Encoder::drain() {
   const int firstParameterSet = codec_ == Codec::H264 ? 7 : 32;  // SPS; VPS
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(frameUs_);
   std::vector<Packet> out;
-  while (avcodec_receive_packet(ctx_, packet_) >= 0) {
-    Packet p;
-    p.data.assign(packet_->data, packet_->data + packet_->size);
-    p.keyframe = isKeyframe(codec_, p.data);
-    // Safety net for an encoder that keeps its parameter sets out of band.
-    if (p.keyframe && !hasNalType(codec_, p.data, firstParameterSet) && ctx_->extradata_size > 4 &&
-        ctx_->extradata[0] == 0 && ctx_->extradata[1] == 0) {
-      p.data.insert(p.data.begin(), ctx_->extradata, ctx_->extradata + ctx_->extradata_size);
+  for (;;) {
+    const int rc = avcodec_receive_packet(ctx_, packet_);
+    if (rc >= 0) {
+      Packet p;
+      p.data.assign(packet_->data, packet_->data + packet_->size);
+      p.keyframe = isKeyframe(codec_, p.data);
+      // Safety net for an encoder that keeps its parameter sets out of band.
+      if (p.keyframe && !hasNalType(codec_, p.data, firstParameterSet) && ctx_->extradata_size > 4 &&
+          ctx_->extradata[0] == 0 && ctx_->extradata[1] == 0) {
+        p.data.insert(p.data.begin(), ctx_->extradata, ctx_->extradata + ctx_->extradata_size);
+      }
+      out.push_back(std::move(p));
+      av_packet_unref(packet_);
+      owed_ = owed_ > 0 ? owed_ - 1 : 0;
+      continue;
     }
-    out.push_back(std::move(p));
-    av_packet_unref(packet_);
+    if (rc != AVERROR(EAGAIN) || owed_ == 0 || std::chrono::steady_clock::now() >= deadline) break;
+    if (timer_) {
+      LARGE_INTEGER due{};
+      due.QuadPart = -2'000;  // 200 us, in 100 ns units; negative is relative
+      if (SetWaitableTimer(timer_, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer_, INFINITE);
+    } else {
+      SwitchToThread();
+    }
   }
   return out;
 }

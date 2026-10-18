@@ -79,6 +79,15 @@ An app that passes video on (a bridge, a router) can stay in 4:2:2 YUV, the form
 and `Receiver(address, omthx::PixelFormat::Uyvy)` hands frames back in `VideoFrame::uyvy`. Plain OMT then
 needs no colour conversion at all, and HX converts 4:2:2 to 4:2:0 without a colour matrix.
 
+Two more receiver kinds are for apps that republish a source. `PixelFormat::Gpu` keeps a decoded HX
+picture in video memory (`VideoFrame::gpu`), and `Sender::sendVideo(frame)` re-codes it there, for
+example HEVC in and H.264 out, with no copy to memory when the GPU encoder takes D3D11 pictures
+(`h264_amf` does on the test PC; otherwise the picture goes through memory, and `omthx::download`
+copies one out when the app needs it).
+`PixelFormat::Coded` decodes nothing: `receiveCoded` hands back the VMX or HEVC/H.264 frames as the
+source sent them and `Sender::sendCoded` sends them on, with keyframe requests passed back through
+`Sender::keyframeRequested` and `Receiver::requestKeyframe`.
+
 A fourth `Sender` argument picks the HX codec: `omthx::Codec::Hevc` (the default) or
 `omthx::Codec::H264`. The receiver needs no setting; it reads whichever arrives, and follows a
 source that comes back with the other codec.
@@ -98,27 +107,28 @@ modes spend bandwidth to save latency.
 | Mode | Codec | 1080p60 bandwidth | Latency | Alpha | Codec cost |
 |------|-------|-------------------|---------|-------|------------|
 | OMT (full) | VMX, intra, visually lossless | ~200 Mbps | ~9 ms | yes, in the BGRA frame | libomt owns it, no GPU codec |
-| OMT-HX, HEVC | HEVC (H.265), GPU hardware | 15 / 30 / 50 Mbps | 29-42 ms | optional, stacked plane | ~5-11 ms to send, ~6-13 ms to receive, CPU colour conversion included |
-| OMT-HX, H.264 | H.264, GPU hardware | 21 / 42 / 70 Mbps | 29-41 ms | optional, stacked plane | ~5-11 ms to send, ~6-13 ms to receive, CPU colour conversion included |
+| OMT-HX, HEVC | HEVC (H.265), GPU hardware | 15 / 30 / 50 Mbps | 10-15 ms | optional, stacked plane | ~4-7 ms to send, ~4-7 ms to receive, CPU colour conversion included |
+| OMT-HX, H.264 | H.264, GPU hardware | 21 / 42 / 70 Mbps | 10-16 ms | optional, stacked plane | ~5-8 ms to send, ~4-7 ms to receive, CPU colour conversion included |
 | NDI (High Bandwidth) | SpeedHQ, intra | ~150 Mbps | ~16 ms | yes, RGBA 4:4:4:4 | CPU |
 | NDI\|HX | H.264 / HEVC | 1-50 Mbps | 80-200 ms | limited, 4:2:0 | CPU or GPU |
 
 - The OMT and OMT-HX rows are measured on one PC over `localhost` ([docs/MEASUREMENTS.md](docs/MEASUREMENTS.md)),
   so they are codec and library figures with no network in the path. The NDI and NDI|HX rows are
   vendor-published typicals, not measured here. A real link adds its one-way time to every mode.
-- OMT-HX's delay is a floor of one receiver-held frame (about 17 ms at 60 fps) plus the
-  encode/decode round trip: it measured 29 ms at 720p60 and 42 ms at 1080p60. OMT full is
-  intra-only, so it has no such hold.
-- The GPU codec is the smaller part of the cost. At 1080p60 the hardware encode call takes about
-  3 ms and the decode about 4 ms; converting between BGRA and NV12 on one CPU core takes about 5 ms
-  at each end. OMT full spends no GPU codec time but carries the whole picture.
+- OMT-HX's delay is the encode/decode round trip, with no frame held at either end: it measured
+  10 ms at 720p60 and 15 ms at 1080p60 (29 and 42 ms before 2026-10-19, when every packet left the
+  sender one frame late). The sender waits the few ms the hardware encoder needs for each packet.
+- The GPU codec is now the larger part of the cost. At 1080p60 the hardware encode takes about
+  5 ms including that wait, and the decode with its copy to memory about 4 to 7 ms; converting
+  between BGRA and NV12 on swscale's threads takes about 1 ms at each end. OMT full spends no GPU
+  codec time but carries the whole picture.
 - Both compressed modes are lossy (OMT-HX is 8-bit 4:2:0 HEVC or H.264); OMT full and NDI are intra and
   visually lossless. OMT-HX keeps OMT discovery, audio and tally; NDI|HX keeps NDI's.
-- Resolution and frame rate are bounded by the time each end needs per frame, most of it CPU colour
-  conversion, and not by the transport or the GPU codec: on the test PC, HX holds 60 fps up to 1080p
-  (13 Mbps at 720p, 30 Mbps at 1080p) and drops below real time at 1440p and 4K. The optional alpha
-  mode doubles the coded picture. With alpha, 720p60 and 1080p30 hold; 1080p60 falls just short
-  (about 57 fps received) when sender and receiver share one PC. The full sweeps are in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md).
+- Resolution and frame rate are bounded by the time each end needs per frame, not by the
+  transport: on the test PC, with sender and receiver sharing one CPU and GPU, HX holds 60 fps up to
+  1440p (13 Mbps at 720p, 30 at 1080p, 53 at 1440p) and 1080p at 120 fps; 4K reaches 45 fps. The
+  optional alpha mode doubles the coded picture; 720p60, 1080p30 and 1080p60 alpha hold real time.
+  The full sweeps are in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md).
 
 ## Technical detail
 
@@ -135,29 +145,30 @@ AMD, `hevc_nvenc` and `h264_nvenc` on NVIDIA); decoding uses D3D11 hardware (`he
 `h264 (d3d11va)`). Plain OMT instead uses libomt's VMX codec, which is intra and has no GPU codec
 step.
 
-**Colour.** Buffers cross the API as BGRA and are converted to NV12 (BT.709, full range) on the CPU
-before the encoder. HX is 4:2:0, so chroma is halved and the picture is lossy, which is the point of
+**Colour.** Buffers cross the API as BGRA or UYVY and are converted to NV12 (BT.709, full range) on
+the CPU before the encoder. NV12 is not a choice: it is the input of every hardware encoder and the
+output of D3D11 decoding for 8-bit 4:2:0, and NDI's own HX codecs use it the same way (NVDEC's NV12
+is turned into UYVY by a CUDA kernel inside the NDI runtime). HX is 4:2:0, so chroma is halved and the picture is lossy, which is the point of
 the mode. Full OMT keeps the whole BGRA picture, so it is visually lossless.
 
 **Alpha (optional).** Alpha is off by default: it is a flag on the frame format
 (`VideoFormat::alpha`), and a run without it codes only the display picture at no extra cost. Turned
 on, the alpha plane is stacked under the colour in the same coded picture (a 1080p alpha source codes
 as 1920x2176), so it rides in the one stream with no second connection. Alpha is lossy and doubles
-the coded size. With alpha on, each end needs about 13 ms per 1080p frame when it runs alone, inside
-the 16.7 ms of a 60 fps frame. With sender and receiver on one PC they share the CPU and GPU, and
-1080p60 falls just short: a median of 57 fps received over ten minutes (720p60 and 1080p30 hold).
-Two PCs are not measured yet. For reference, full-bandwidth NDI carries RGBA 4:4:4:4 alpha cleanly, while NDI|HX is
-H.264/HEVC 4:2:0 and its encoders typically drop or heavily compress alpha.
+the coded size. With sender and receiver on one PC, 1080p60 alpha holds 60 fps at 27 ms delay. NDI|HX
+packs alpha the same way: NDI documents HX alpha as YUVA 4:2:0:4 "vertically stacking the video and
+alpha frames into a single frame", and its runtime has a `codec_h264_hevc_alpha` codec for it.
+Full-bandwidth NDI carries alpha as 4:2:2:4 instead.
 
-**Measured ceiling.** On the test PC (Radeon RX 6600, Ryzen 7 5700X), HX holds 60 fps up to 1080p
-(about 30 Mbps at medium) and drops below real time at 1440p and 4K. The hardware codec is not the
-limit: alone it encodes the 1080p alpha picture at 195 fps and decodes it at 305 fps. See
+**Measured ceiling.** On the test PC (Radeon RX 6600, Ryzen 7 5700X), HX holds 60 fps up to 1440p
+(about 53 Mbps at medium) and 1080p120, and reaches 45 fps at 4K. Alone, the hardware codec encodes
+the 1080p alpha picture at 195 fps and decodes it at 305 fps. See
 [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md) for the resolution, frame-rate, quality and alpha
 sweeps.
 
 ## Limits of version 1
 
-8-bit 4:2:0 only. Colour conversion runs on the CPU. A program that speaks only stock OMT sees an
+8-bit 4:2:0 only. Colour conversion runs on the CPU, except on the Gpu receiver to Sender path. A program that speaks only stock OMT sees an
 OMT-HX source with audio and no picture. An H.264 source needs both ends on this build of
 libomt.dll: an older OMT-HX receiver, like a stock OMT program, sees it with audio and no picture.
 See sections 3 and 17 of the design.

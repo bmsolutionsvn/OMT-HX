@@ -21,6 +21,7 @@ inline constexpr int kCodecH264 = 0x34363248;  // 'H264'
 inline constexpr char kKeyframeRequest[] = "<OMTHX Keyframe=\"true\" />";
 
 // ---- pure functions (src/pure.cpp) ----
+uint8_t mulDiv255(unsigned value, unsigned alpha);  // value * alpha / 255, rounded; both 0 to 255
 int codecTag(Codec codec);                 // the tag an Hx frame of this codec carries
 bool codecFromTag(int tag, Codec& out);    // false for a tag that is not an Hx codec
 const char* codecName(Codec codec);        // "hevc" or "h264"
@@ -38,6 +39,9 @@ bool parseSeq(std::string_view metadata, uint64_t& out);  // false when the meta
 // Decides when the sender must force a keyframe (spec section 8). Time is passed in, so it is testable.
 class KeyframePolicy {
  public:
+  // A backstop only: receivers ask for a keyframe when they join or lose a frame, within 500 ms. Each periodic
+  // keyframe is a bitrate spike or a quality dip on a two-frame rate buffer, so they are rare.
+  static constexpr int64_t kPeriodicMs = 10'000;
   bool next(int64_t nowMs, uint64_t dropped, bool requested);
 
  private:
@@ -92,23 +96,33 @@ struct Packet {
 // Hardware HEVC or H.264 through FFmpeg (src/encoder.cpp).
 class Encoder {
  public:
-  Encoder(Codec codec, int width, int height, int fpsN, int fpsD, int64_t bitrate);
+  // gpuFrames: null for NV12 pictures in memory; else a D3D11 frames context, whose pictures encode() then takes
+  // with encodeGpu. Throws std::runtime_error when no hardware encoder of this codec opens.
+  Encoder(Codec codec, int width, int height, int fpsN, int fpsD, int64_t bitrate, AVBufferRef* gpuFrames = nullptr);
   ~Encoder();
   Encoder(const Encoder&) = delete;
   Encoder& operator=(const Encoder&) = delete;
   static const std::vector<std::string>& order(Codec codec);
   Codec codec() const { return codec_; }
   const std::string& name() const { return name_; }
-  // Usually one packet per picture. An encoder may hold one picture back; packets come out in order.
+  // One packet per picture, normally this picture's: the call waits up to one frame time for it. A picture
+  // that takes longer comes out with a later call; packets come out in order.
   std::vector<Packet> encode(const Nv12& picture, bool forceKeyframe);
+  std::vector<Packet> encodeGpu(const AVFrame* picture, bool forceKeyframe);  // a frame of gpuFrames
 
  private:
+  std::vector<Packet> send(bool forceKeyframe);  // frame_ is set up
+  std::vector<Packet> drain();
+
   Codec codec_ = Codec::Hevc;
   AVCodecContext* ctx_ = nullptr;
   AVFrame* frame_ = nullptr;
   AVPacket* packet_ = nullptr;
   std::string name_;
   int64_t index_ = 0;
+  int64_t owed_ = 0;         // pictures sent whose packet has not come out yet
+  int64_t frameUs_ = 16'667;  // how long encode waits for its packet
+  void* timer_ = nullptr;     // a high-resolution waitable timer for the short waits
 };
 
 enum class Decoded { Picture, NeedMore, Error };
@@ -124,15 +138,31 @@ class Decoder {
   const std::string& name() const { return name_; }
   // timestamp travels with the access unit and comes back in outTimestamp with its picture.
   Decoded decode(std::span<const uint8_t> accessUnit, int64_t timestamp, Nv12& out, int64_t& outTimestamp);
+  // The same, leaving the picture where the decoder put it: `out` gets a reference to a D3D11 frame, or to a
+  // frame in memory when decoding runs in software.
+  Decoded decodeFrame(std::span<const uint8_t> accessUnit, int64_t timestamp, AVFrame* out, int64_t& outTimestamp);
 
  private:
   Codec codec_ = Codec::Hevc;
   AVCodecContext* ctx_ = nullptr;
   AVBufferRef* hw_ = nullptr;
   AVFrame* frame_ = nullptr;
-  AVFrame* sw_ = nullptr;
   AVPacket* packet_ = nullptr;
   std::string name_;
+};
+
+// A decoded frame, from video or system memory, copied into an NV12 picture. False for a frame omthx cannot
+// read (10-bit, 4:2:2, odd sizes) or a failed copy from video memory.
+bool downloadNv12(const AVFrame* frame, Nv12& out);
+
+// What a Gpu receiver hands out: a reference to one decoded frame, freed with the last copy of the pointer.
+struct GpuPicture {
+  AVFrame* frame = nullptr;
+  GpuPicture();
+  ~GpuPicture();
+  GpuPicture(const GpuPicture&) = delete;
+  GpuPicture& operator=(const GpuPicture&) = delete;
+  bool inVideoMemory() const;  // a D3D11 frame, rather than a software decoder's frame in memory
 };
 
 }  // namespace omthx

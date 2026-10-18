@@ -385,3 +385,126 @@ TEST_CASE("sendVideoUyvy rejects input it cannot use") {
   CHECK_THROWS_AS(sender.sendVideoUyvy(VideoFormat{640, 360, 60, 1, true}, pic.data(), 1280, nullptr, 0, false, 0),
                   std::invalid_argument);  // alpha without its plane
 }
+
+namespace {
+// Pumps `from` into `relay` (one call per round) and reads `downstream` until it has handed back `wanted`
+// pictures or ten seconds pass.
+template <typename Relay>
+int relayed(Relay relay, Receiver& downstream, VideoFrame& out, int wanted) {
+  int got = 0;
+  const auto deadline = Clock::now() + std::chrono::seconds(10);
+  while (got < wanted && Clock::now() < deadline) {
+    relay();
+    if (downstream.receiveVideo(out, 0)) ++got;
+  }
+  return got;
+}
+}  // namespace
+
+TEST_CASE("an HX source re-coded through a Gpu receiver stays in video memory") {
+  if (!hardware(Codec::Hevc) || !hardware(Codec::H264)) return;
+  const VideoFormat f{640, 360, 60, 1, true};
+  Sender source("omthx-test-gpu-in", Mode::Hx, Quality::Medium, Codec::Hevc);
+  Receiver gpu(source.address(), PixelFormat::Gpu);
+  Sender recoded("omthx-test-gpu-out", Mode::Hx, Quality::Medium, Codec::H264);
+  Receiver downstream(recoded.address(), PixelFormat::Uyvy);
+  Pump pump(source, f);
+  VideoFrame frame, out;
+  const int got = relayed(
+      [&] {
+        if (!gpu.receiveVideo(frame, 20)) return;
+        REQUIRE(frame.gpu);
+        recoded.sendVideo(frame);
+      },
+      downstream, out, 10);
+  REQUIRE(got == 10);
+  CHECK(out.format == f);
+  CHECK(out.premultiplied);
+  CHECK(out.uyvy.size() == 640u * 360 * 3);
+  CHECK(downstream.stats().codec == Codec::H264);
+  MESSAGE("re-coded by " << recoded.stats().encoder);
+  CHECK(recoded.stats().encoder.find("(d3d11)") != std::string::npos);  // no copy through memory
+  REQUIRE(frame.gpu);
+  CHECK(download(frame, PixelFormat::Uyvy));
+  CHECK(frame.uyvy.size() == 640u * 360 * 3);
+  CHECK(download(frame, PixelFormat::Bgra));
+  CHECK(frame.bgra.size() == 640u * 360 * 4);
+}
+
+TEST_CASE("a Gpu receiver of a plain OMT source hands back UYVY, which a Full sender takes") {
+  const VideoFormat f{640, 360, 60, 1, false};
+  Sender source("omthx-test-gpu-full-in", Mode::Full, Quality::Medium);
+  Receiver gpu(source.address(), PixelFormat::Gpu);
+  Sender out("omthx-test-gpu-full-out", Mode::Full, Quality::Medium);
+  Receiver downstream(out.address());
+  Pump pump(source, f);
+  VideoFrame frame, back;
+  const int got = relayed(
+      [&] {
+        if (!gpu.receiveVideo(frame, 20)) return;
+        CHECK_FALSE(frame.gpu);
+        CHECK(frame.uyvy.size() == 640u * 360 * 2);
+        out.sendVideo(frame);
+      },
+      downstream, back, 5);
+  CHECK(got == 5);
+  CHECK(back.format == f);
+}
+
+TEST_CASE("an HX relay passes coded frames on, and keyframe requests back") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{640, 360, 60, 1, false};
+  Sender source("omthx-test-relay-in", Mode::Hx, Quality::Medium, Codec::Hevc);
+  Receiver coded(source.address(), PixelFormat::Coded);
+  Sender relay("omthx-test-relay-out", Mode::Hx, Quality::Medium);
+  Pump pump(source, f);
+  CodedFrame c;
+  // Let the relay run before anyone watches it: the late receiver must get its keyframe by asking.
+  for (const auto until = Clock::now() + std::chrono::seconds(1); Clock::now() < until;) {
+    if (coded.receiveCoded(c, 20)) relay.sendCoded(c);
+  }
+  Receiver downstream(relay.address());
+  VideoFrame out;
+  uint64_t forwarded = 0;
+  const int got = relayed(
+      [&] {
+        if (relay.keyframeRequested()) {
+          ++forwarded;
+          coded.requestKeyframe();
+        }
+        if (coded.receiveCoded(c, 20)) {
+          CHECK(c.mode == Mode::Hx);
+          relay.sendCoded(c);
+        }
+      },
+      downstream, out, 10);
+  CHECK(got == 10);
+  CHECK(out.format == f);
+  CHECK(forwarded >= 1);  // the late receiver asked, and the relay passed it on
+  CHECK(relay.stats().encoder == "none");
+  CHECK(coded.stats().decoder == "none");
+  VideoFrame nothing;
+  CHECK_FALSE(coded.receiveVideo(nothing, 0));  // a Coded receiver decodes nothing
+}
+
+TEST_CASE("a plain OMT relay passes VMX frames on without decoding them") {
+  const VideoFormat f{640, 360, 60, 1, true};
+  Sender source("omthx-test-relay-vmx-in", Mode::Full, Quality::Medium);
+  Receiver coded(source.address(), PixelFormat::Coded);
+  Sender relay("omthx-test-relay-vmx-out", Mode::Full, Quality::Medium);
+  Receiver downstream(relay.address(), PixelFormat::Uyvy);
+  Pump pump(source, f);
+  CodedFrame c;
+  VideoFrame out;
+  const int got = relayed(
+      [&] {
+        if (!coded.receiveCoded(c, 20)) return;
+        CHECK(c.mode == Mode::Full);
+        relay.sendCoded(c);
+      },
+      downstream, out, 5);
+  CHECK(got == 5);
+  CHECK(out.format == f);
+  CHECK(out.uyvy.size() == 640u * 360 * 3);
+  CHECK_FALSE(out.premultiplied);  // the pump's straight alpha, flags passed on untouched
+}

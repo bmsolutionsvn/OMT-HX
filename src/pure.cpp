@@ -10,6 +10,8 @@
 #include <stdexcept>
 
 extern "C" {
+#include <libavutil/frame.h>
+#include <libavutil/opt.h>
 #include <libavutil/pixfmt.h>
 #include <libswscale/swscale.h>
 }
@@ -91,7 +93,7 @@ bool KeyframePolicy::next(int64_t nowMs, uint64_t dropped, bool requested) {
   if (dropped > dropped_ || requested) pending_ = true;
   dropped_ = dropped;
   const int64_t since = nowMs - lastKeyMs_;
-  const bool key = first_ || since >= 2000 || (pending_ && since >= 500);
+  const bool key = first_ || since >= kPeriodicMs || (pending_ && since >= 500);
   if (key) {
     first_ = false;
     pending_ = false;
@@ -100,13 +102,73 @@ bool KeyframePolicy::next(int64_t nowMs, uint64_t dropped, bool requested) {
   return key;
 }
 
+uint8_t mulDiv255(unsigned value, unsigned alpha) {
+  const unsigned x = value * alpha + 128;  // round(x / 255) without a divide: exact for x up to 255 * 255
+  return static_cast<uint8_t>((x + (x >> 8)) >> 8);
+}
+
 namespace {
+constexpr int kThreads = 8;  // bands of rows for the CPU passes, and swscale's slice threads
+
+// ponytail: swscale's own slice threads halve the 1080p BGRA <-> NV12 pass (measured 7.1 to 2.7 ms, 8 threads).
 SwsContext* makeConverter(int w, int h, AVPixelFormat from, AVPixelFormat to) {
-  SwsContext* c = sws_getContext(w, h, from, w, h, to, SWS_BILINEAR, nullptr, nullptr, nullptr);
+  SwsContext* c = sws_alloc_context();
   if (!c) throw std::runtime_error("cannot create the colour converter");
+  av_opt_set_int(c, "srcw", w, 0);
+  av_opt_set_int(c, "srch", h, 0);
+  av_opt_set_int(c, "src_format", from, 0);
+  av_opt_set_int(c, "dstw", w, 0);
+  av_opt_set_int(c, "dsth", h, 0);
+  av_opt_set_int(c, "dst_format", to, 0);
+  av_opt_set_int(c, "sws_flags", SWS_BILINEAR, 0);
+  av_opt_set_int(c, "threads", kThreads, 0);
+  av_opt_set_int(c, "src_range", 1, 0);  // full range on both sides
+  av_opt_set_int(c, "dst_range", 1, 0);
+  if (sws_init_context(c, nullptr, nullptr) < 0) {
+    sws_freeContext(c);
+    throw std::runtime_error("cannot create the colour converter");
+  }
   const int* bt709 = sws_getCoefficients(SWS_CS_ITU709);
-  sws_setColorspaceDetails(c, bt709, 1, bt709, 1, 0, 1 << 16, 1 << 16);  // full range on both sides
+  sws_setColorspaceDetails(c, bt709, 1, bt709, 1, 0, 1 << 16, 1 << 16);
   return c;
+}
+
+void borrowed(void*, uint8_t*) {}  // the buffer belongs to the caller
+
+// sws_scale_frame, not sws_scale: only the frame call uses the slice threads. The frames borrow the buffers
+// through references that free nothing; a destination without references would get buffers of its own.
+void convert(SwsContext* c, int w, int h, AVPixelFormat from, uint8_t* const src[2], const int srcStride[2],
+             AVPixelFormat to, uint8_t* const dst[2], const int dstStride[2]) {
+  AVFrame* in = av_frame_alloc();
+  AVFrame* out = av_frame_alloc();
+  auto borrow = [&](AVFrame* f, AVPixelFormat format, uint8_t* const data[2], const int stride[2]) {
+    f->format = format;
+    f->width = w;
+    f->height = h;
+    f->color_range = AVCOL_RANGE_JPEG;
+    f->colorspace = AVCOL_SPC_BT709;
+    for (int i = 0; i < 2 && data[i]; ++i) {
+      f->data[i] = data[i];
+      f->linesize[i] = stride[i];
+      f->buf[i] = av_buffer_create(data[i], static_cast<size_t>(stride[i]) * h, borrowed, nullptr, 0);
+    }
+  };
+  borrow(in, from, src, srcStride);
+  borrow(out, to, dst, dstStride);
+  const bool wrapped = in->buf[0] && out->buf[0] && (!dst[1] || out->buf[1]) && (!src[1] || in->buf[1]);
+  const int rc = wrapped ? sws_scale_frame(c, out, in) : AVERROR(ENOMEM);
+  av_frame_free(&in);
+  av_frame_free(&out);
+  if (rc < 0) throw std::runtime_error("the colour conversion failed");
+}
+
+// Runs fn(first, end) over `rows` split into kThreads bands on the thread pool.
+template <typename F>
+void inBands(int rows, F fn) {
+  static constexpr int kBands[] = {0, 1, 2, 3, 4, 5, 6, 7};
+  static_assert(std::size(kBands) == kThreads);
+  std::for_each(std::execution::par, std::begin(kBands), std::end(kBands),
+                [&](int b) { fn(rows * b / kThreads, rows * (b + 1) / kThreads); });
 }
 
 void checkSize(const VideoFormat& f) {
@@ -114,12 +176,12 @@ void checkSize(const VideoFormat& f) {
     throw std::invalid_argument("width and height must be even and at least 2");
 }
 
-uint8_t scale(unsigned colour, unsigned alpha) { return static_cast<uint8_t>((colour * alpha + 127) / 255); }
+uint8_t scale(unsigned colour, unsigned alpha) { return mulDiv255(colour, alpha); }
 
 // Chroma premultiplied in YUV: the distance from neutral is scaled, which equals scaling R, G and B.
 uint8_t scaleChroma(int chroma, int alpha) {
-  const int d = (chroma - 128) * alpha;
-  return static_cast<uint8_t>(128 + (d + (d >= 0 ? 127 : -127)) / 255);
+  const int d = chroma - 128;
+  return static_cast<uint8_t>(d >= 0 ? 128 + mulDiv255(d, alpha) : 128 - mulDiv255(-d, alpha));
 }
 
 using Table = std::array<uint8_t, 256>;
@@ -145,11 +207,17 @@ void stackAlpha(const VideoFormat& f, const uint8_t* a, size_t rowStride, size_t
   uint8_t* uv = out.uv.data();
   for (int r = h; r < top; ++r) std::memcpy(y + r * row, y + (h - 1) * row, row);                   // under the fill
   for (int r = h / 2; r < top / 2; ++r) std::memcpy(uv + r * row, uv + (h / 2 - 1) * row, row);
-  for (int r = 0; r < h; ++r) {
-    uint8_t* dst = y + (top + r) * row;
-    const uint8_t* src = a + r * rowStride;
-    for (int x = 0; x < w; ++x) dst[x] = src[static_cast<size_t>(x) * step];
-  }
+  inBands(h, [&](int first, int last) {
+    for (int r = first; r < last; ++r) {
+      uint8_t* dst = y + (top + r) * row;
+      const uint8_t* src = a + r * rowStride;
+      if (step == 1) {
+        std::memcpy(dst, src, row);
+      } else {
+        for (int x = 0; x < w; ++x) dst[x] = src[static_cast<size_t>(x) * step];
+      }
+    }
+  });
   for (int r = h; r < top; ++r) std::memcpy(y + (top + r) * row, y + (top + h - 1) * row, row);     // under the alpha
   std::memset(uv + (top / 2) * row, 128, (top / 2) * row);                                           // neutral colour
 }
@@ -229,11 +297,10 @@ void Packer::pack(const VideoFormat& f, std::span<const uint8_t> bgra, bool prem
     uint8_t* dst = scratch_.data();
     // Bands of rows on the thread pool: a fade makes every pixel need the multiply, which one core
     // cannot do for 1080p inside a 60 fps frame.
-    static constexpr int kBands[] = {0, 1, 2, 3, 4, 5, 6, 7};
     const size_t rowBytes = static_cast<size_t>(w) * 4;
-    std::for_each(std::execution::par, std::begin(kBands), std::end(kBands), [=](int band) {
-      const size_t end = rowBytes * (static_cast<size_t>(h) * (band + 1) / std::size(kBands));
-      for (size_t i = rowBytes * (static_cast<size_t>(h) * band / std::size(kBands)); i < end; i += 4) {
+    inBands(h, [=](int first, int last) {
+      const size_t end = rowBytes * last;
+      for (size_t i = rowBytes * first; i < end; i += 4) {
         const unsigned a = in[i + 3];
         if (a == 255) {  // most pixels of a key are opaque or fully transparent: no multiply
           std::memcpy(dst + i, in + i, 4);
@@ -250,11 +317,11 @@ void Packer::pack(const VideoFormat& f, std::span<const uint8_t> bgra, bool prem
     src = dst;
   }
 
-  const uint8_t* srcPlanes[4] = {src, nullptr, nullptr, nullptr};
-  const int srcStride[4] = {w * 4, 0, 0, 0};
-  uint8_t* dstPlanes[4] = {out.y.data(), out.uv.data(), nullptr, nullptr};
-  const int dstStride[4] = {w, w, 0, 0};
-  sws_scale(toNv12_, srcPlanes, srcStride, 0, h, dstPlanes, dstStride);
+  uint8_t* const srcPlanes[2] = {const_cast<uint8_t*>(src), nullptr};
+  const int srcStride[2] = {w * 4, 0};
+  uint8_t* const dstPlanes[2] = {out.y.data(), out.uv.data()};
+  const int dstStride[2] = {w, w};
+  convert(toNv12_, w, h, AV_PIX_FMT_BGRA, srcPlanes, srcStride, AV_PIX_FMT_NV12, dstPlanes, dstStride);
   if (f.alpha) stackAlpha(f, src + 3, static_cast<size_t>(w) * 4, 4, out);
 }
 
@@ -264,17 +331,18 @@ void Packer::unpack(const VideoFormat& f, const Nv12& in, std::vector<uint8_t>& 
   checkPicture(f, in);
   ensure(w, h);
   bgra.resize(static_cast<size_t>(w) * h * 4);
-  const uint8_t* srcPlanes[4] = {in.y.data(), in.uv.data(), nullptr, nullptr};
-  const int srcStride[4] = {w, w, 0, 0};
-  uint8_t* dstPlanes[4] = {bgra.data(), nullptr, nullptr, nullptr};
-  const int dstStride[4] = {w * 4, 0, 0, 0};
-  sws_scale(toBgra_, srcPlanes, srcStride, 0, h, dstPlanes, dstStride);
+  uint8_t* const srcPlanes[2] = {const_cast<uint8_t*>(in.y.data()), const_cast<uint8_t*>(in.uv.data())};
+  const int srcStride[2] = {w, w};
+  uint8_t* const dstPlanes[2] = {bgra.data(), nullptr};
+  const int dstStride[2] = {w * 4, 0};
+  convert(toBgra_, w, h, AV_PIX_FMT_NV12, srcPlanes, srcStride, AV_PIX_FMT_BGRA, dstPlanes, dstStride);
   if (!f.alpha) return;  // the converter wrote alpha 255
   const uint8_t* a = in.y.data() + static_cast<size_t>(alphaTop(h)) * w;
   for (size_t i = 0, n = static_cast<size_t>(w) * h; i < n; ++i) bgra[i * 4 + 3] = a[i];
 }
 
-// ponytail: one core, plain loops, no colour matrix. Measure before banding it like pack's premultiply.
+// No colour matrix: a table per value, and bands of row pairs on the thread pool (straight alpha measured 7.3 ms
+// for 1080p on one core with a divide per sample).
 void packUyvy(const VideoFormat& f, const uint8_t* uyvy, int stride, const uint8_t* alpha, int alphaStride,
               bool premultiplied, Nv12& out) {
   checkSize(f);
@@ -283,33 +351,34 @@ void packUyvy(const VideoFormat& f, const uint8_t* uyvy, int stride, const uint8
     throw std::invalid_argument("uyvy needs a stride of at least width * 2, and alpha a plane of at least width");
   sizeFor(f, out);
   const bool multiply = f.alpha && !premultiplied;
-  for (int r = 0; r < h; ++r) {
-    const uint8_t* s = uyvy + static_cast<size_t>(r) * stride;
-    const uint8_t* a = multiply ? alpha + static_cast<size_t>(r) * alphaStride : nullptr;
-    uint8_t* y = out.y.data() + static_cast<size_t>(r) * w;
-    for (int x = 0; x < w; ++x) {
-      const uint8_t v = kLumaToFull[s[2 * x + 1]];
-      y[x] = a ? scale(v, a[x]) : v;
-    }
-  }
-  // 4:2:2 to 4:2:0: each output chroma row is the mean of two input rows, each premultiplied by the mean
-  // alpha of the two pixels it covers.
-  for (int r = 0; r < h / 2; ++r) {
-    const uint8_t* s0 = uyvy + static_cast<size_t>(2 * r) * stride;
-    const uint8_t* s1 = s0 + stride;
-    const uint8_t* a0 = multiply ? alpha + static_cast<size_t>(2 * r) * alphaStride : nullptr;
-    const uint8_t* a1 = multiply ? a0 + alphaStride : nullptr;
-    uint8_t* uv = out.uv.data() + static_cast<size_t>(r) * w;
-    for (int i = 0; i < w; ++i) {  // i walks U, V, U, V; s holds U Y V Y, so chroma i sits at byte 2 * i
-      int c0 = kChromaToFull[s0[2 * i]], c1 = kChromaToFull[s1[2 * i]];
-      if (multiply) {
-        const int x = i & ~1;  // the first of the two pixels this chroma pair covers
-        c0 = scaleChroma(c0, (a0[x] + a0[x + 1] + 1) / 2);
-        c1 = scaleChroma(c1, (a1[x] + a1[x + 1] + 1) / 2);
+  // Row pair r: luma rows 2r and 2r + 1, and chroma row r, the mean of the two input rows' chroma (4:2:2 to
+  // 4:2:0), each premultiplied by the mean alpha of the two pixels it covers.
+  inBands(h / 2, [&](int first, int last) {
+    for (int r = first; r < last; ++r) {
+      const uint8_t* s0 = uyvy + static_cast<size_t>(2 * r) * stride;
+      const uint8_t* s1 = s0 + stride;
+      const uint8_t* a0 = multiply ? alpha + static_cast<size_t>(2 * r) * alphaStride : nullptr;
+      const uint8_t* a1 = multiply ? a0 + alphaStride : nullptr;
+      uint8_t* y0 = out.y.data() + static_cast<size_t>(2 * r) * w;
+      uint8_t* y1 = y0 + w;
+      uint8_t* uv = out.uv.data() + static_cast<size_t>(r) * w;
+      for (int i = 0; i < w; ++i) {  // i walks the pixels for luma, and U, V, U, V for chroma: both at byte 2 * i
+        const uint8_t l0 = kLumaToFull[s0[2 * i + 1]], l1 = kLumaToFull[s1[2 * i + 1]];
+        int c0 = kChromaToFull[s0[2 * i]], c1 = kChromaToFull[s1[2 * i]];
+        if (multiply) {
+          y0[i] = scale(l0, a0[i]);
+          y1[i] = scale(l1, a1[i]);
+          const int x = i & ~1;  // the first of the two pixels this chroma pair covers
+          c0 = scaleChroma(c0, (a0[x] + a0[x + 1] + 1) / 2);
+          c1 = scaleChroma(c1, (a1[x] + a1[x + 1] + 1) / 2);
+        } else {
+          y0[i] = l0;
+          y1[i] = l1;
+        }
+        uv[i] = static_cast<uint8_t>((c0 + c1 + 1) / 2);
       }
-      uv[i] = static_cast<uint8_t>((c0 + c1 + 1) / 2);
     }
-  }
+  });
   if (f.alpha) stackAlpha(f, alpha, static_cast<size_t>(alphaStride), 1, out);
 }
 
@@ -319,15 +388,17 @@ void unpackUyvy(const VideoFormat& f, const Nv12& in, std::vector<uint8_t>& uyva
   const int w = f.width, h = f.height;
   const size_t plane = static_cast<size_t>(w) * 2 * h;
   uyva.resize(plane + (f.alpha ? static_cast<size_t>(w) * h : 0));
-  for (int r = 0; r < h; ++r) {
-    const uint8_t* y = in.y.data() + static_cast<size_t>(r) * w;
-    const uint8_t* uv = in.uv.data() + static_cast<size_t>(r / 2) * w;  // 4:2:0 to 4:2:2: chroma rows repeat
-    uint8_t* d = uyva.data() + static_cast<size_t>(r) * w * 2;
-    for (int i = 0; i < w; ++i) {
-      d[2 * i] = kChromaToLimited[uv[i]];
-      d[2 * i + 1] = kLumaToLimited[y[i]];
+  inBands(h, [&](int first, int last) {
+    for (int r = first; r < last; ++r) {
+      const uint8_t* y = in.y.data() + static_cast<size_t>(r) * w;
+      const uint8_t* uv = in.uv.data() + static_cast<size_t>(r / 2) * w;  // 4:2:0 to 4:2:2: chroma rows repeat
+      uint8_t* d = uyva.data() + static_cast<size_t>(r) * w * 2;
+      for (int i = 0; i < w; ++i) {
+        d[2 * i] = kChromaToLimited[uv[i]];
+        d[2 * i + 1] = kLumaToLimited[y[i]];
+      }
     }
-  }
+  });
   if (f.alpha) std::memcpy(uyva.data() + plane, in.y.data() + static_cast<size_t>(alphaTop(h)) * w, static_cast<size_t>(w) * h);
 }
 

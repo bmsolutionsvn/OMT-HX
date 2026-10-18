@@ -5,6 +5,50 @@ Measured with `omthx-send` and `omthx-recv`, driven by `scripts\measure.ps1`, on
 library figures, not link figures. It also means sender and receiver share one CPU and one GPU, so
 each runs slower than it would alone. Each row is the median of a 20 s run after a 2 s warm-up.
 
+## 2026-10-19: after the latency and CPU work
+
+Same PC, same tools, `scripts\measure.ps1 -Seconds 15`. What changed since 2026-10-13:
+
+- The encoder hands back each picture's packet in the same call. AMF returns it a few ms after the
+  picture, and taking only what was ready sent every frame one frame late (16.7 ms at 60 fps, 33 ms
+  at 30 fps). The README called this a receiver-held frame; the decoder holds none.
+- BGRA <-> NV12 runs on swscale's slice threads (8): 5.2 to 1.2 ms to pack and 4.1 to 1.0 ms to
+  unpack a 1080p frame, timed alone.
+- The UYVY path (no colour matrix) runs in bands on the thread pool, with a multiply-shift for the
+  alpha multiply instead of a divide: 7.3 to 2.1 ms for a 1080p straight-alpha frame, timed alone.
+- The periodic keyframe is every 10 s instead of 2 s; receivers still get one within 500 ms of asking.
+
+| Case | Sender fps | Recv fps | Mbps | Send ms | Receive ms | Delay avg ms | Delay max ms | Discarded |
+|------|-----------|----------|------|---------|------------|--------------|--------------|-----------|
+| hx 720p60 | 60 | 60 | 13 | 4 | 3.9 | 9.6 | 26 | 26 |
+| hx 1080p60 | 60 | 60 | 29.9 | 6.9 | 6.7 | 15.1 | 23.3 | 27 |
+| hx 1440p60 | 60 | 60 | 52.7 | 11.7 | 8.8 | 22.3 | 40 | 26 |
+| hx 2160p60 | 45 | 45 | 89.6 | 21.3 | 19.2 | 2570.5 | 3952.2 | 18 |
+| hx 1080p30 | 30 | 30 | 14.9 | 7.4 | 6.8 | 15.2 | 43 | 1 |
+| hx 1080p120 | 120 | 120 | 59.9 | 7.3 | 6.9 | 16.5 | 63.4 | 51 |
+| hx 1080p60 low | 60 | 60 | 15 | 7.2 | 6.2 | 14.7 | 30.8 | 27 |
+| hx 1080p60 high | 60 | 60 | 49.9 | 7.2 | 7.8 | 16.7 | 22.9 | 27 |
+| hx 720p60 alpha | 60 | 60 | 14.2 | 6.5 | 4.2 | 11.9 | 27.3 | 27 |
+| hx 1080p60 alpha | 60 | 60 | 31.9 | 13.9 | 11.3 | 27.1 | 61 | 27 |
+| hx 1080p30 alpha | 30 | 30 | 16 | 11.9 | 8.6 | 22 | 37.2 | 1 |
+| h264 1080p60 | 60 | 60 | 41.8 | 7.5 | 6.6 | 15.5 | 19.3 | 26 |
+| h264 1080p60 low | 60 | 60 | 20.9 | 7.3 | 5.8 | 14.7 | 24.8 | 27 |
+| h264 1080p60 high | 60 | 60 | 69.7 | 7.7 | 8.1 | 18 | 33.8 | 24 |
+| h264 720p60 alpha | 60 | 60 | 19.8 | 7.5 | 4.1 | 13.6 | 28.5 | 26 |
+| h264 1080p60 alpha | 60 | 60 | 44.6 | 14.8 | 11.3 | 30.2 | 60 | 25 |
+| h264 720p60 | 60 | 60 | 18.6 | 4.9 | 3.6 | 9.8 | 24.6 | 26 |
+| full 720p60 | 60 | 60 | 71 | n/a | n/a | 4.4 | 30.9 | 0 |
+| full 1080p60 | 60 | 60 | 201.6 | n/a | n/a | 8.4 | 20.3 | 0 |
+
+- **Delay** fell by about one frame plus the CPU time saved: 15 ms at 1080p60 (was 42), 10 ms at
+  720p60 (was 29), 27 ms at 1080p60 alpha (was 70), 15 ms at 1080p30 (was 58).
+- **Ceiling.** 1440p60 and 1080p120 now hold real time on one PC (were 49 and 25 fps received), and
+  1080p60 alpha holds 60 / 60 (was 58). 4K reaches 45 fps (was 28), still short of 60.
+- `Send ms` now includes the wait for the packet (about 3 ms at 1080p), which used to fall into the
+  next frame's delay instead.
+
+## 2026-10-13 run (before the work above)
+
 - Date: 2026-10-13
 - GPU: AMD Radeon RX 6600
 - CPU: AMD Ryzen 7 5700X 8-Core Processor

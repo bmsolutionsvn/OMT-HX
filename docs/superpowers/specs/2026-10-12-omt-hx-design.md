@@ -41,7 +41,7 @@ shared library in its own repository, used by both apps.
 | H5 | Decoder | FFmpeg's HEVC decoder, with D3D11 hardware decoding when the GPU offers it. Software decoding is the fallback; it uses several threads and so adds about three frames of delay. |
 | H6 | Alpha | Alpha is off by default (the format's `Alpha` flag). When on, fill and alpha are packed into one picture: fill on top, alpha below as a grey image (section 7). Fill is premultiplied on the wire. |
 | H7 | Bitrate | Constant bitrate from bits per pixel, by quality level: Low 0.12, Medium 0.24, High 0.40. At 1080p60 that is 15, 30 and 50 Mbps. Alpha adds 25%. These are starting values, tuned by measurement in milestone H2. |
-| H8 | Keyframes | A keyframe is sent at start, when a receiver asks for one, when the library reports a dropped frame, and every 2 seconds (section 8). |
+| H8 | Keyframes | A keyframe is sent at start, when a receiver asks for one, when the library reports a dropped frame, and every 10 seconds (section 8; 2 seconds before 2026-10-19). |
 | H9 | One library for both modes | `omthx` wraps libomt. Its sender sends plain OMT or OMT-HX; its receiver reads both and returns the same frame type. Apps use `omthx` and never call libomt directly. |
 | H10 | Repository | `F:\Coding\BreadMedia\OMT-HX`, its own git repository, beside the apps. BreadCamera and BreadStudio both build against it (section 10). |
 | H11 | Platform | Windows x64 only, like BreadCamera and BreadStudio S0. |
@@ -180,7 +180,8 @@ The sender forces one when:
    receiver's connection is too slow to take a frame;
 4. the app says it skipped a frame (BreadCamera drops the oldest frame when an
    output falls behind);
-5. 2 seconds have passed since the last keyframe.
+5. 10 seconds have passed since the last keyframe (2 seconds before 2026-10-19: receivers ask
+   for one when they join or lose a frame, so the timer is only a backstop).
 
 Forced keyframes are limited to one per 500 ms. Without the limit a saturated
 link would drop a frame, get a larger keyframe, and drop again.
@@ -252,9 +253,12 @@ called working.
 
 ## 13. Known limits of version 1
 
-- Frames are converted between BGRA and NV12 on the CPU on both sides. The
-  later step is to give the encoder and take from the decoder a D3D11 texture.
-- Keyframes are whole frames, so bitrate spikes every 2 seconds. The later
+- Frames are converted between BGRA (or UYVY) and NV12 on the CPU on both sides,
+  on swscale's threads since 2026-10-19. A Gpu receiver feeding a Sender keeps
+  the picture as a D3D11 texture from decoder to encoder (2026-10-19); taking
+  textures from the app, and handing them to it, is the later step.
+- Keyframes are whole frames, so bitrate spikes at each one (every 10 seconds when nothing
+  asks sooner). The later
   step is gradual intra refresh.
 - 8-bit 4:2:0 only. Plain OMT stays the mode for 4:2:2 and 10-bit.
 - One bitrate per source, shared by all its receivers.
@@ -322,4 +326,4 @@ What H.264 does not change:
 
 One difference in behaviour: left alone, AMD's H.264 encoder sends very few
 IDR pictures, so H.264 depends on the sender forcing a keyframe every
-2 seconds (section 8). It already does.
+10 seconds and on request (section 8). It already does.
