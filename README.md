@@ -1,26 +1,14 @@
 # OMT-HX
 
-A second video mode for [Open Media Transport](https://github.com/openmediatransport), in the way
-NDI|HX is a second mode of NDI: a hardware-encoded video codec inside ordinary OMT connections.
+[Open Media Transport](https://github.com/openmediatransport) High Efficiency Protocol, similar to
+NDI|HX: a hardware-encoded video codec inside ordinary OMT connections.
 Version 1 codes HEVC (H.265) or H.264 (AVC) from the GPU's hardware encoder. Discovery, audio and
 tally are OMT's, unchanged.
 
 `omthx` is the library BreadCamera (sender) and BreadStudio (receiver) share. One `Sender` sends
 plain OMT or OMT-HX; one `Receiver` reads both.
 
-- Design: [docs/superpowers/specs/2026-10-12-omt-hx-design.md](docs/superpowers/specs/2026-10-12-omt-hx-design.md)
 - Measured figures: [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md), reproduced with `scripts\measure.ps1`
-
-## Binary release
-
-Each `v*` tag publishes `OMT-HX.Binaries.Release.<tag>.zip` on the
-[releases page](https://github.com/bmsolutionsvn/OMT-HX/releases), laid out like Open Media
-Transport's own release. To use it from C++ (Visual Studio 2022 or newer, `/MD`): add
-`Libraries\Winx64\include` to the include path, `#include "omthx/omthx.h"`, link `omthx.lib`, and put
-every DLL in `Libraries\Winx64` beside your executable. The zip also holds `libomt.h`/`libomt.lib` for
-OMT's C API, the .NET `libomtnet.dll`, the test tools and the licences. Every push is built and tested
-by `.github/workflows/build.yml`. A build from source that compiles omthx into your program defines
-`OMTHX_STATIC`; the CMake target `omthx` does it for you.
 
 ## Build and test
 
@@ -175,5 +163,5 @@ See sections 3 and 17 of the design.
 
 ## Licence
 
-MIT. `libomt.dll` and `libvmx.dll` are MIT, built from forks of the Open Media Transport project;
+MIT. `libomtnet`, `libomt.dll` and `libvmx.dll` are MIT, built from forks of the Open Media Transport project;
 only libomtnet carries changes.
