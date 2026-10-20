@@ -125,6 +125,63 @@ TEST_CASE("a picture with alpha survives pack, encode, decode and unpack") {
   CHECK(colourError < 6.0);
 }
 
+TEST_CASE("a picture with alpha survives as two streams: the fill and alpha, each with its own encoder") {
+  Codec codec = Codec::Hevc;
+  SUBCASE("hevc") { codec = Codec::Hevc; }
+  SUBCASE("h264") { codec = Codec::H264; }
+  const VideoFormat f{1280, 720, 60, 1, true};
+  std::unique_ptr<Encoder> fillEnc, alphaEnc;
+  try {
+    fillEnc = std::make_unique<Encoder>(codec, f.width, f.height, f.fpsN, f.fpsD, fillBitrate(f, Quality::Medium, codec));
+    alphaEnc = std::make_unique<Encoder>(codec, f.width, f.height, f.fpsN, f.fpsD, alphaBitrate(f, Quality::Medium, codec));
+  } catch (const std::runtime_error& e) {
+    MESSAGE("SKIPPED, no two hardware " << codecName(codec) << " encoders on this PC: " << e.what());
+    return;
+  }
+  Decoder fillDec(codec), alphaDec(codec);
+  Packer packer;
+  Nv12 fill, alpha, fillOut, alphaOut;
+  std::vector<uint8_t> src, back;
+  drawPattern(src, f.width, f.height, 0, true);
+  int pictures = 0;
+  size_t fillBytes = 0, alphaBytes = 0;
+  for (int i = 0; i < 30; ++i) {
+    packer.pack(f, src, false, fill, &alpha);
+    REQUIRE(fill.height == 720);
+    const std::vector<Packet> fp = fillEnc->encode(fill, i == 0);
+    const std::vector<Packet> ap = alphaEnc->encode(alpha, i == 0);
+    REQUIRE(fp.size() == ap.size());
+    for (size_t k = 0; k < fp.size(); ++k) {
+      if (i == 0) CHECK(fp[k].keyframe == ap[k].keyframe);
+      fillBytes += fp[k].data.size();
+      alphaBytes += ap[k].data.size();
+      int64_t ts = 0, ats = 0;
+      const Decoded d = fillDec.decode(fp[k].data, i, fillOut, ts);
+      const Decoded da = alphaDec.decode(ap[k].data, i, alphaOut, ats);
+      CHECK(d == da);
+      if (d != Decoded::Picture || da != Decoded::Picture) continue;
+      CHECK(ts == ats);
+      packer.unpack(f, fillOut, back, &alphaOut);
+      ++pictures;
+    }
+  }
+  MESSAGE("fill " << fillBytes / 30 << " bytes a frame, alpha " << alphaBytes / 30);
+  REQUIRE(pictures >= 20);
+  REQUIRE(back.size() == src.size());
+  double alphaError = 0, colourError = 0;
+  const size_t pixels = static_cast<size_t>(f.width) * f.height;
+  for (size_t i = 0; i < pixels; ++i) {
+    const int a = src[i * 4 + 3];
+    alphaError += std::abs(back[i * 4 + 3] - a);
+    for (int k = 0; k < 3; ++k) colourError += std::abs(back[i * 4 + k] - (src[i * 4 + k] * a + 127) / 255);
+  }
+  alphaError /= pixels;
+  colourError /= pixels * 3.0;
+  MESSAGE("mean alpha error " << alphaError << ", mean colour error " << colourError << " (0 to 255)");
+  CHECK(alphaError < 3.0);
+  CHECK(colourError < 6.0);
+}
+
 TEST_CASE("Decoder: garbage is an error, not a crash, and a keyframe decodes afterwards") {
   Codec codec = Codec::Hevc;
   SUBCASE("hevc") { codec = Codec::Hevc; }

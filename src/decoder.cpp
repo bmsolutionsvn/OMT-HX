@@ -134,14 +134,15 @@ bool downloadNv12(const AVFrame* frame, Nv12& out) {
 
 bool download(VideoFrame& frame, PixelFormat pixels) {
   if (!frame.gpu || (pixels != PixelFormat::Bgra && pixels != PixelFormat::Uyvy)) return false;
-  Nv12 picture;
-  if (!downloadNv12(frame.gpu->frame, picture)) return false;
+  Nv12 picture, alpha;
+  const bool separate = frame.gpu->alpha != nullptr;
+  if (!downloadNv12(frame.gpu->frame, picture) || (separate && !downloadNv12(frame.gpu->alpha, alpha))) return false;
   try {
     if (pixels == PixelFormat::Uyvy) {
-      unpackUyvy(frame.format, picture, frame.uyvy);
+      unpackUyvy(frame.format, picture, frame.uyvy, separate ? &alpha : nullptr);
     } else {
       thread_local Packer packer;  // keeps its converter for the next picture of this size
-      packer.unpack(frame.format, picture, frame.bgra);
+      packer.unpack(frame.format, picture, frame.bgra, separate ? &alpha : nullptr);
     }
   } catch (const std::invalid_argument&) {
     return false;  // the picture does not match the frame's format
@@ -150,7 +151,12 @@ bool download(VideoFrame& frame, PixelFormat pixels) {
 }
 
 GpuPicture::GpuPicture() : frame(av_frame_alloc()) {}
-GpuPicture::~GpuPicture() { av_frame_free(&frame); }
-bool GpuPicture::inVideoMemory() const { return frame->format == AV_PIX_FMT_D3D11; }
+GpuPicture::~GpuPicture() {
+  av_frame_free(&frame);
+  av_frame_free(&alpha);
+}
+bool GpuPicture::inVideoMemory() const {
+  return frame->format == AV_PIX_FMT_D3D11 && (!alpha || alpha->format == AV_PIX_FMT_D3D11);
+}
 
 }  // namespace omthx

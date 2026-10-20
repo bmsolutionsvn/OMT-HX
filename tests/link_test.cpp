@@ -89,6 +89,8 @@ TEST_CASE("an HX source delivers pictures with alpha, audio and tally") {
   CHECK(receiver.stats().codec == codec);
   CHECK(receiver.stats().decoder.rfind(codecName(codec), 0) == 0);
   CHECK(sender.stats().encoder.rfind(codecName(codec), 0) == 0);
+  CHECK(sender.stats().encoder.ends_with(" + alpha"));  // alpha is a stream of its own
+  CHECK(receiver.stats().decoder.ends_with(" + alpha"));
   CHECK(receiver.stats().framesReceived >= 30);
   CHECK(sender.stats().keyframes >= 1);
   CHECK(sender.stats().connections >= 1);
@@ -427,6 +429,7 @@ TEST_CASE("an HX source re-coded through a Gpu receiver stays in video memory") 
   CHECK(downstream.stats().codec == to);
   MESSAGE("re-coded by " << recoded.stats().encoder);
   CHECK(recoded.stats().encoder.find("(d3d11)") != std::string::npos);  // no copy through memory
+  CHECK(recoded.stats().encoder.ends_with(" + alpha"));                  // both streams re-coded
   REQUIRE(frame.gpu);
   CHECK(download(frame, PixelFormat::Uyvy));
   CHECK(frame.uyvy.size() == 640u * 360 * 3);
@@ -488,6 +491,31 @@ TEST_CASE("an HX relay passes coded frames on, and keyframe requests back") {
   CHECK(coded.stats().decoder == "none");
   VideoFrame nothing;
   CHECK_FALSE(coded.receiveVideo(nothing, 0));  // a Coded receiver decodes nothing
+}
+
+TEST_CASE("an HX relay passes a source's alpha stream on with its fill") {
+  if (!hardware(Codec::H264)) return;
+  const VideoFormat f{640, 360, 60, 1, true};
+  Sender source("omthx-test-relay-alpha-in", Mode::Hx, Quality::Medium, Codec::H264);
+  Receiver coded(source.address(), PixelFormat::Coded);
+  Sender relay("omthx-test-relay-alpha-out", Mode::Hx, Quality::Medium);
+  Receiver downstream(relay.address());
+  Pump pump(source, f);
+  CodedFrame c;
+  VideoFrame out;
+  const int got = relayed(
+      [&] {
+        if (relay.keyframeRequested()) coded.requestKeyframe();
+        if (!coded.receiveCoded(c, 20)) return;
+        CHECK(c.alphaBytes > 0);
+        CHECK(c.alphaBytes < c.data.size());
+        relay.sendCoded(c);
+      },
+      downstream, out, 10);
+  CHECK(got == 10);
+  CHECK(out.format == f);
+  CHECK(out.premultiplied);
+  CHECK(downstream.stats().decoder.ends_with(" + alpha"));
 }
 
 TEST_CASE("a plain OMT relay passes VMX frames on without decoding them") {

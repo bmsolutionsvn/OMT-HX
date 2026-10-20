@@ -77,12 +77,13 @@ the payload are new.
 | Field | Value |
 |---|---|
 | Codec | `HEVC`, the 32-bit value `0x43564548` |
-| Width, Height | The picture as displayed, for example 1920 x 1080. With alpha the coded picture is taller (section 7); the display size stays here. |
+| Width, Height | The picture as displayed, for example 1920 x 1080. With stacked alpha the coded picture is taller (section 7); the display size stays here. |
 | FrameRateN / FrameRateD | As in OMT |
 | Flags | `Alpha` (2) when alpha is present, together with `PreMultiplied` (4). `Interlaced` is never set. |
 | ColorSpace | 709 |
 | Timestamp | As in OMT: the time the frame was made at the source, 10,000,000 units per second |
-| Data | One HEVC access unit in Annex B form (start codes). Every keyframe carries VPS, SPS and PPS in front of it. |
+| Data | One HEVC access unit in Annex B form (start codes). Every keyframe carries VPS, SPS and PPS in front of it. With alpha, the alpha stream's access unit follows it (section 7). |
+| FrameMetadata | `<OMTHX Seq="n" />`, the frame's number; with a separate alpha stream `<OMTHX Seq="n" Alpha="bytes" />`, the length of the alpha's access unit at the end of Data. |
 
 There is no separate version field. A later format, such as 10-bit or AV1,
 gets its own codec tag.
@@ -151,18 +152,46 @@ the link, and nothing else does.
 
 ## 7. Alpha packing
 
-Hardware HEVC encoders have no dependable alpha support across vendors, so
-alpha rides as part of the picture.
+Hardware HEVC and H.264 encoders have no dependable alpha support across vendors,
+so alpha is coded as a second, ordinary picture.
+
+**Separate alpha stream (since 2026-10-20).** The sender runs two encoders of the
+same codec, side by side:
+
+- The fill encoder codes the display picture, `Width` x `Height`, multiplied by
+  alpha. Transparent areas become black, which compresses well and avoids
+  coloured fringes at edges.
+- The alpha encoder codes a picture of the same size that holds alpha as
+  brightness, with neutral colour.
+- The fill gets the bitrate of the same source without alpha, and the alpha
+  stream a quarter of it. Together they cost what the stacked picture did.
+- Both are forced to a keyframe together. A frame counts as a keyframe only
+  when both of its parts are.
+
+Each OMT frame carries the fill's access unit, then the alpha's, end to end. The
+per-frame metadata gives the alpha's length:
+`<OMTHX Seq="n" Alpha="bytes" />`. A receiver decodes the two with two decoders
+and joins them; a pair whose pictures do not come back together counts as a
+decode error.
+
+Compared with stacking, neither picture is taller than the display, so a 4K alpha
+source stays within every encoder's size limit. The two encodes run at once, and
+alpha has its own bitrate instead of taking bits from the fill. The cost is a
+second encoder session and a second decoder at each end.
+
+**Stacked (sources before 2026-10-20).** A frame without `Alpha` in its metadata
+holds one picture with alpha stacked under the fill:
 
 - Let `A` be the display height rounded up to a multiple of 16 (1088 for 1080).
 - The coded picture is `Width` x `2A`.
 - Rows `0` to `Height-1` hold the fill. Rows `A` to `A+Height-1` hold alpha
   as brightness, with neutral colour. Rows between repeat the row above.
-- The fill is multiplied by alpha before encoding. Transparent areas become
-  black, which compresses well and avoids coloured fringes at edges.
 
 Rounding to 16 keeps the seam between fill and alpha on a coding-block
-boundary, so the two halves do not smear into each other.
+boundary, so the two halves do not smear into each other. Receivers still read
+this layout, and a Gpu receiver's stacked picture is re-coded stacked. A
+receiver from before 2026-10-20 cannot read a separate alpha stream: it
+discards those frames, while sources without alpha reach it as before.
 
 Without the `Alpha` flag the coded picture is just the display picture.
 

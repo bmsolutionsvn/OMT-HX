@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -20,6 +21,17 @@ TEST_CASE("targetBitrate follows bits per pixel, quality, alpha and codec") {
   CHECK(targetBitrate(f, Quality::Medium, Codec::Hevc) == 37'324'800);
   CHECK(targetBitrate(f, Quality::Medium, Codec::H264) == 52'254'720);
   CHECK(targetBitrate(VideoFormat{1280, 720, 30000, 1001, false}, Quality::Medium, Codec::Hevc) == 6'628'891);
+}
+
+TEST_CASE("a separate alpha stream costs a quarter of the fill, which gets the opaque bitrate") {
+  const VideoFormat opaque{1920, 1080, 60, 1, false};
+  const VideoFormat keyed{1920, 1080, 60, 1, true};
+  for (Codec codec : {Codec::Hevc, Codec::H264}) {
+    CHECK(fillBitrate(keyed, Quality::Medium, codec) == targetBitrate(opaque, Quality::Medium, codec));
+    CHECK(alphaBitrate(keyed, Quality::Medium, codec) == targetBitrate(opaque, Quality::Medium, codec) / 4);
+  }
+  CHECK(fillBitrate(keyed, Quality::Medium, Codec::Hevc) + alphaBitrate(keyed, Quality::Medium, Codec::Hevc) ==
+        targetBitrate(keyed, Quality::Medium, Codec::Hevc));  // the same total as the stacked picture
 }
 
 TEST_CASE("codec tags are the FourCCs HEVC and H264 and nothing else is a codec") {
@@ -106,6 +118,21 @@ TEST_CASE("frame numbers round-trip through the per-frame metadata") {
   CHECK_FALSE(parseSeq("<OMTHX Keyframe=\"true\" />", n));
   CHECK_FALSE(parseSeq("<OMTHX Seq=\"\" />", n));
   CHECK_FALSE(parseSeq("<OMTHX Seq=\"12", n));  // cut short
+}
+
+TEST_CASE("the length of a separate alpha stream rides in the same metadata") {
+  CHECK(seqMetadata(7) == "<OMTHX Seq=\"7\" />");  // what sources before the alpha stream send
+  CHECK(seqMetadata(7, 0) == seqMetadata(7));
+  CHECK(seqMetadata(7, 1234) == "<OMTHX Seq=\"7\" Alpha=\"1234\" />");
+  uint64_t n = 0;
+  CHECK(parseSeq(seqMetadata(7, 1234), n));
+  CHECK(n == 7);
+  CHECK(parseAlphaBytes(seqMetadata(7, 1234)) == 1234);
+  CHECK(parseAlphaBytes(seqMetadata(7)) == 0);
+  CHECK(parseAlphaBytes("") == 0);
+  CHECK(parseAlphaBytes("<OMTHX Seq=\"7\" Alpha=\"\" />") == 0);
+  CHECK(parseAlphaBytes("<OMTHX Seq=\"7\" Alpha=\"12") == 0);                  // cut short
+  CHECK(parseAlphaBytes("<OMTHX Seq=\"7\" /><Other Alpha=\"5\" />") == 0);   // not the OMTHX element's
 }
 
 TEST_CASE("copyNv12 drops row padding and stretches limited range to full") {
@@ -313,6 +340,79 @@ TEST_CASE("packUyvy stacks the alpha plane and premultiplies straight colour in 
   CHECK(back[20 * 128 + 2 * 40 + 1] == 235);                       // opaque luma
   CHECK(near(back[20 * 128 + 2 * 8 + 1], 16 + 219 * 128 / 255));  // see-through luma stays premultiplied
   CHECK_THROWS_AS(packUyvy(f, uyvy.data(), stride, nullptr, 0, false, straight), std::invalid_argument);
+}
+
+TEST_CASE("pack with a separate alpha picture keeps the fill at display size") {
+  const VideoFormat f{64, 40, 60, 1, true};
+  std::vector<uint8_t> src = flat(64, 40, 200, 100, 50, 255);
+  for (int y = 0; y < 40; ++y)
+    for (int x = 0; x < 32; ++x) src[(static_cast<size_t>(y) * 64 + x) * 4 + 3] = 128;  // left half see-through
+
+  Packer packer;
+  Nv12 fill, alpha, stacked;
+  packer.pack(f, src, false, fill, &alpha);
+  packer.pack(f, src, false, stacked);
+  REQUIRE(fill.height == 40);
+  REQUIRE(fill.y.size() == 64u * 40);
+  REQUIRE(fill.uv.size() == 64u * 20);
+  REQUIRE(alpha.width == 64);
+  REQUIRE(alpha.height == 40);
+  REQUIRE(alpha.y.size() == 64u * 40);
+  REQUIRE(alpha.uv.size() == 64u * 20);
+  // the fill is the top of the stacked picture, and the alpha picture is its alpha half
+  CHECK(std::equal(fill.y.begin(), fill.y.end(), stacked.y.begin()));
+  CHECK(std::equal(fill.uv.begin(), fill.uv.end(), stacked.uv.begin()));
+  CHECK(std::equal(alpha.y.begin(), alpha.y.end(), stacked.y.begin() + 48 * 64));
+  CHECK(alpha.y[20 * 64 + 8] == 128);
+  CHECK(alpha.y[20 * 64 + 40] == 255);
+  CHECK(std::all_of(alpha.uv.begin(), alpha.uv.end(), [](uint8_t c) { return c == 128; }));
+
+  std::vector<uint8_t> back, backStacked;
+  packer.unpack(f, fill, back, &alpha);
+  packer.unpack(f, stacked, backStacked);
+  CHECK(back == backStacked);
+  CHECK(back[(20 * 64 + 8) * 4 + 3] == 128);
+
+  Nv12 small = alpha;
+  small.height = 20;
+  CHECK_THROWS_AS(packer.unpack(f, fill, back, &small), std::invalid_argument);
+  CHECK_THROWS_AS(packer.unpack(f, fill, back), std::invalid_argument);  // too short to hold stacked alpha
+
+  // Without alpha in the format, the alpha picture is left alone.
+  Nv12 untouched;
+  packer.pack(VideoFormat{64, 40, 60, 1, false}, src, false, fill, &untouched);
+  CHECK(fill.height == 40);
+  CHECK(untouched.y.empty());
+}
+
+TEST_CASE("packUyvy with a separate alpha picture, and unpackUyvy back to UYVA") {
+  const VideoFormat f{64, 40, 60, 1, true};
+  const int stride = 140, alphaStride = 70;  // both padded
+  std::vector<uint8_t> uyvy(static_cast<size_t>(stride) * 40), alpha(static_cast<size_t>(alphaStride) * 40);
+  for (int r = 0; r < 40; ++r) {
+    for (int x = 0; x < 64; ++x) {
+      uint8_t* p = &uyvy[static_cast<size_t>(r) * stride + 2 * x];
+      p[0] = x % 2 ? 200 : 60;
+      p[1] = 235;
+      alpha[static_cast<size_t>(r) * alphaStride + x] = x < 32 ? 128 : 255;
+    }
+  }
+  Nv12 fill, alphaPic, stacked;
+  packUyvy(f, uyvy.data(), stride, alpha.data(), alphaStride, false, fill, &alphaPic);
+  packUyvy(f, uyvy.data(), stride, alpha.data(), alphaStride, false, stacked);
+  REQUIRE(fill.height == 40);
+  REQUIRE(alphaPic.height == 40);
+  CHECK(std::equal(fill.y.begin(), fill.y.end(), stacked.y.begin()));
+  CHECK(std::equal(fill.uv.begin(), fill.uv.end(), stacked.uv.begin()));
+  CHECK(alphaPic.y[20 * 64 + 8] == 128);
+  CHECK(alphaPic.y[39 * 64 + 63] == 255);
+  CHECK(alphaPic.uv[10 * 64 + 9] == 128);
+
+  std::vector<uint8_t> back, backStacked;
+  unpackUyvy(f, fill, back, &alphaPic);
+  unpackUyvy(f, stacked, backStacked);
+  CHECK(back == backStacked);
+  REQUIRE(back.size() == 64u * 2 * 40 + 64u * 40);
 }
 
 TEST_CASE("mulDiv255 equals the rounded divide it replaces, for every value and alpha") {

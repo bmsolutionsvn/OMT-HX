@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstring>
 #include <deque>
+#include <future>
 #include <mutex>
 #include <stdexcept>
 #include <string_view>
@@ -49,6 +50,22 @@ OMTVideoFlags alphaFlags(const VideoFormat& fmt, bool premultiplied) {
 VideoFormat formatOf(const OMTMediaFrame* f) {
   return VideoFormat{f->Width, f->Height, f->FrameRateN, f->FrameRateD, (f->Flags & OMTVideoFlags_Alpha) != 0};
 }
+
+std::string_view metadataOf(const OMTMediaFrame* f) {
+  if (!f->FrameMetadata || f->FrameMetadataLength <= 0) return {};
+  return std::string_view(static_cast<const char*>(f->FrameMetadata), static_cast<size_t>(f->FrameMetadataLength));
+}
+
+// An HX frame's fill access unit and, from a source that sends alpha as a stream of its own, the alpha's, which
+// ends the frame. False for an alpha length that leaves no room for the fill.
+bool splitFrame(const OMTMediaFrame* f, std::span<const uint8_t> data, std::span<const uint8_t>& fill,
+                std::span<const uint8_t>& alpha) {
+  const size_t n = parseAlphaBytes(metadataOf(f));
+  if (n >= data.size()) return false;
+  fill = data.first(data.size() - n);
+  alpha = data.last(n);
+  return true;
+}
 }  // namespace
 
 // ---------------------------------------------------------------- Sender
@@ -58,12 +75,17 @@ struct Sender::Impl {
   Quality quality = Quality::Medium;
   Codec codec = Codec::Hevc;
   omt_send_t* tx = nullptr;
-  VideoFormat format;          // what the encoder was opened for
-  const void* gpuKey = nullptr;  // and the D3D11 frames context it takes pictures from, or null
+  VideoFormat format;          // what the encoders were opened for
+  bool separate = false;       // with alpha: a second encoder codes it as a stream of its own
+  const void* gpuKey = nullptr;  // and the D3D11 frames contexts they take pictures from, or null
+  const void* alphaGpuKey = nullptr;
   bool gpuRefused = false;     // no GPU encoder took D3D11 pictures: they go through memory
-  std::unique_ptr<Encoder> encoder;
+  std::unique_ptr<Encoder> encoder;       // the fill, or the stacked picture
+  std::unique_ptr<Encoder> alphaEncoder;  // the separate alpha stream, or null
   Packer packer;
   Nv12 picture;
+  Nv12 alphaPicture;
+  std::deque<Packet> fills, alphas;  // packets of one encoder waiting for the other's
   std::vector<uint8_t> uyva;  // Full: a UYVA picture whose alpha plane did not follow its UYVY plane
   std::vector<uint8_t> gpuUyva;  // Full: a Gpu picture copied to memory
   KeyframePolicy policy;
@@ -77,10 +99,15 @@ struct Sender::Impl {
   std::mutex statsMutex;
   SenderStats stats;
 
-  void openEncoder(const VideoFormat& fmt, AVBufferRef* gpuFrames = nullptr);
+  // separateAlpha: code alpha, when the format has it, as a stream of its own rather than stacked under the fill.
+  void openEncoder(const VideoFormat& fmt, bool separateAlpha, AVBufferRef* gpuFrames = nullptr,
+                   AVBufferRef* alphaGpuFrames = nullptr);
   bool askedForKeyframe();
+  std::vector<Packet> encode(Encoder& enc, const Nv12& pic, const AVFrame* gpu, bool key) {
+    return gpu ? enc.encodeGpu(gpu, key) : enc.encode(pic, key);
+  }
   void sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock::time_point t0, OMTMediaFrame& f,
-                   const AVFrame* gpu = nullptr);
+                   const AVFrame* gpu = nullptr, const AVFrame* gpuAlpha = nullptr);
   void sendFull(OMTMediaFrame& f) {  // libomt encodes VMX itself
     omt_send(tx, &f);
     std::lock_guard lock(statsMutex);
@@ -88,16 +115,31 @@ struct Sender::Impl {
   }
 };
 
-// Opens the encoder for this format and source of pictures, or keeps the one already open for them.
-void Sender::Impl::openEncoder(const VideoFormat& fmt, AVBufferRef* gpuFrames) {
+// Opens the encoders for this format and source of pictures, or keeps the ones already open for them.
+void Sender::Impl::openEncoder(const VideoFormat& fmt, bool separateAlpha, AVBufferRef* gpuFrames,
+                               AVBufferRef* alphaGpuFrames) {
+  const bool sep = fmt.alpha && separateAlpha;
   const void* key = gpuFrames ? gpuFrames->data : nullptr;
-  if (encoder && fmt == format && key == gpuKey) return;
-  encoder = std::make_unique<Encoder>(codec, fmt.width, codedHeight(fmt), fmt.fpsN, fmt.fpsD,
-                                      targetBitrate(fmt, quality, codec), gpuFrames);
+  const void* alphaKey = sep && alphaGpuFrames ? alphaGpuFrames->data : nullptr;
+  if (encoder && fmt == format && sep == separate && key == gpuKey && alphaKey == alphaGpuKey) return;
+  encoder.reset();  // the old sessions close first: a GPU runs only a few at a time
+  alphaEncoder.reset();
+  stamps.clear();  // the new encoders owe nothing the old ones held
+  fills.clear();
+  alphas.clear();
+  auto fill = std::make_unique<Encoder>(codec, fmt.width, sep ? fmt.height : codedHeight(fmt), fmt.fpsN, fmt.fpsD,
+                                        sep ? fillBitrate(fmt, quality, codec) : targetBitrate(fmt, quality, codec),
+                                        gpuFrames);
+  if (sep) {
+    alphaEncoder = std::make_unique<Encoder>(codec, fmt.width, fmt.height, fmt.fpsN, fmt.fpsD,
+                                             alphaBitrate(fmt, quality, codec), alphaGpuFrames);
+  }
+  encoder = std::move(fill);
   format = fmt;
+  separate = sep;
   gpuKey = key;
+  alphaGpuKey = alphaKey;
   policy = KeyframePolicy();  // a new encoder starts with a keyframe
-  stamps.clear();             // and owes nothing the old one held
 }
 
 // True when a receiver of this source sent a keyframe request since the last call.
@@ -112,38 +154,72 @@ bool Sender::Impl::askedForKeyframe() {
   return asked;
 }
 
-// Codes `picture`, or `gpu` when set, and sends what the encoder gives back. t0 is when the work on this frame began.
+// Codes `picture`, or `gpu` when set, with its alpha picture when alpha is separate, and sends what the encoders
+// give back. t0 is when the work on this frame began.
 void Sender::Impl::sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock::time_point t0, OMTMediaFrame& f,
-                               const AVFrame* gpu) {
+                               const AVFrame* gpu, const AVFrame* gpuAlpha) {
   const bool requested = appKeyframe.exchange(false) | askedForKeyframe();
   OMTStatistics omt = {};
   omt_send_getvideostatistics(tx, &omt);
   const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
   const bool key = policy.next(nowMs, static_cast<uint64_t>(omt.FramesDropped), requested);
 
-  std::vector<Packet> packets = gpu ? encoder->encodeGpu(gpu, key) : encoder->encode(picture, key);
+  std::vector<Packet> packets, alphaPackets;
+  if (alphaEncoder) {
+    // The two encoders work side by side, the alpha one on a thread of its own, so alpha adds little delay.
+    try {
+      auto alphaJob = std::async(std::launch::async, [&] { return encode(*alphaEncoder, alphaPicture, gpuAlpha, key); });
+      try {
+        packets = encode(*encoder, picture, gpu, key);
+      } catch (...) {
+        alphaJob.wait();
+        throw;
+      }
+      alphaPackets = alphaJob.get();
+    } catch (...) {
+      encoder.reset();  // one encoder may have taken the picture and the other not: start both again
+      alphaEncoder.reset();
+      throw;
+    }
+  } else {
+    packets = encode(*encoder, picture, gpu, key);
+  }
   stamps.push_back(timestamp);  // after encode, so a throw leaves the deque unchanged
+  for (Packet& p : packets) fills.push_back(std::move(p));
+  for (Packet& p : alphaPackets) alphas.push_back(std::move(p));
   const double encodeMs = msSince(t0);
 
   f.Codec = static_cast<OMTCodec>(codecTag(codec));
   f.Flags = static_cast<OMTVideoFlags>(fmt.alpha ? (OMTVideoFlags_Alpha | OMTVideoFlags_PreMultiplied) : 0);
-  uint64_t keyframes = 0;
-  for (Packet& p : packets) {
+  uint64_t sent = 0, keyframes = 0;
+  // One OMT frame per picture: the fill's packet, followed with separate alpha by the alpha's packet.
+  while (!fills.empty() && (!alphaEncoder || !alphas.empty())) {
+    Packet p = std::move(fills.front());
+    fills.pop_front();
+    size_t alphaBytes = 0;
+    if (alphaEncoder) {
+      const Packet& a = alphas.front();
+      alphaBytes = a.data.size();
+      p.data.insert(p.data.end(), a.data.begin(), a.data.end());
+      p.keyframe = p.keyframe && a.keyframe;
+      alphas.pop_front();
+    }
     const uint64_t n = seq++;  // numbered even when not sent, so the receiver sees the loss
     if (stamps.empty()) continue;
     f.Timestamp = stamps.front();
     stamps.pop_front();
     f.Data = p.data.data();
     f.DataLength = static_cast<int>(p.data.size());
-    seqMeta = seqMetadata(n);
+    seqMeta = seqMetadata(n, alphaBytes);
     f.FrameMetadata = seqMeta.data();
     f.FrameMetadataLength = static_cast<int>(seqMeta.size() + 1);  // with the terminating null
     omt_send(tx, &f);
+    ++sent;
     keyframes += p.keyframe ? 1 : 0;
   }
   std::lock_guard lock(statsMutex);
-  stats.encoder = encoder->name() + (gpu ? " (d3d11)" : "");
-  stats.framesSent += packets.size();
+  stats.encoder = encoder->name() + (gpu ? " (d3d11)" : "") + (alphaEncoder ? " + alpha" : "");
+  stats.framesSent += sent;
   stats.keyframes += keyframes;
   stats.lastEncodeMs = encodeMs;
 }
@@ -174,9 +250,9 @@ void Sender::sendVideo(const VideoFormat& fmt, std::span<const uint8_t> bgra, bo
     return;
   }
 
-  d_->openEncoder(fmt);
+  d_->openEncoder(fmt, true);
   const auto t0 = Clock::now();
-  d_->packer.pack(fmt, bgra, premultiplied, d_->picture);
+  d_->packer.pack(fmt, bgra, premultiplied, d_->picture, &d_->alphaPicture);
   d_->sendPicture(fmt, timestamp, t0, f);
 }
 
@@ -209,7 +285,7 @@ void Sender::sendVideoNv12(const VideoFormat& fmt, const uint8_t* y, int yStride
     d_->sendFull(f);
     return;
   }
-  d_->openEncoder(fmt);
+  d_->openEncoder(fmt, true);
   const auto t0 = Clock::now();
   copyNv12(fmt, y, yStride, uv, uvStride, fullRange, d_->picture);
   d_->sendPicture(fmt, timestamp, t0, f);
@@ -248,9 +324,9 @@ void Sender::sendVideoUyvy(const VideoFormat& fmt, const uint8_t* uyvy, int stri
     return;
   }
 
-  d_->openEncoder(fmt);
+  d_->openEncoder(fmt, true);
   const auto t0 = Clock::now();
-  packUyvy(fmt, uyvy, stride, alpha, alphaStride, premultiplied, d_->picture);
+  packUyvy(fmt, uyvy, stride, alpha, alphaStride, premultiplied, d_->picture, &d_->alphaPicture);
   d_->sendPicture(fmt, timestamp, t0, f);
 }
 
@@ -259,30 +335,38 @@ void Sender::sendVideo(const VideoFrame& frame) {
   const size_t w = static_cast<size_t>(fmt.width), h = static_cast<size_t>(fmt.height);
   if (frame.gpu) {
     const AVFrame* pic = frame.gpu->frame;
-    if (pic->width != fmt.width || pic->height != codedHeight(fmt))
+    const AVFrame* alphaPic = fmt.alpha ? frame.gpu->alpha : nullptr;
+    const bool separate = alphaPic != nullptr;  // otherwise alpha, if any, is stacked under the fill
+    if (pic->width != fmt.width || pic->height != (separate ? fmt.height : codedHeight(fmt)) ||
+        (separate && (alphaPic->width != fmt.width || alphaPic->height != fmt.height)))
       throw std::invalid_argument("the Gpu picture does not match its format");
+    auto toMemory = [&] {
+      if (!downloadNv12(pic, d_->picture) || (separate && !downloadNv12(alphaPic, d_->alphaPicture)))
+        throw std::runtime_error("cannot copy the picture from video memory");
+    };
     if (d_->mode == Mode::Hx) {
+      // Alpha is coded the way the picture holds it, separate or stacked, so nothing is re-packed.
       OMTMediaFrame f = videoHeader(fmt, frame.timestamp);
       const auto t0 = Clock::now();
       if (frame.gpu->inVideoMemory() && !d_->gpuRefused) {
         try {
-          d_->openEncoder(fmt, pic->hw_frames_ctx);
+          d_->openEncoder(fmt, separate, pic->hw_frames_ctx, separate ? alphaPic->hw_frames_ctx : nullptr);
         } catch (const std::runtime_error&) {
           d_->gpuRefused = true;  // no GPU encoder takes D3D11 pictures: from now on, through memory
         }
         if (!d_->gpuRefused) {
-          d_->sendPicture(fmt, frame.timestamp, t0, f, pic);
+          d_->sendPicture(fmt, frame.timestamp, t0, f, pic, alphaPic);
           return;
         }
       }
-      // Through memory. The picture is already packed as the encoder wants it: alpha stacked, premultiplied.
-      if (!downloadNv12(pic, d_->picture)) throw std::runtime_error("cannot copy the picture from video memory");
-      d_->openEncoder(fmt);
+      // Through memory. The picture is already packed as the encoder wants it, premultiplied.
+      toMemory();
+      d_->openEncoder(fmt, separate);
       d_->sendPicture(fmt, frame.timestamp, t0, f);
       return;
     }
-    if (!downloadNv12(pic, d_->picture)) throw std::runtime_error("cannot copy the picture from video memory");
-    unpackUyvy(fmt, d_->picture, d_->gpuUyva);
+    toMemory();
+    unpackUyvy(fmt, d_->picture, d_->gpuUyva, separate ? &d_->alphaPicture : nullptr);
     const uint8_t* p = d_->gpuUyva.data();
     sendVideoUyvy(fmt, p, fmt.width * 2, fmt.alpha ? p + w * 2 * h : nullptr, fmt.width, frame.premultiplied,
                   frame.timestamp);
@@ -301,6 +385,8 @@ void Sender::sendVideo(const VideoFrame& frame) {
 void Sender::sendCoded(const CodedFrame& c) {
   if (c.data.empty() || c.format.width <= 0 || c.format.height <= 0)
     throw std::invalid_argument("a coded frame needs its data and its size");
+  if (c.mode == Mode::Hx && c.alphaBytes >= c.data.size())
+    throw std::invalid_argument("alphaBytes must leave room for the fill");
   OMTMediaFrame f = videoHeader(c.format, c.timestamp);
   f.Flags = static_cast<OMTVideoFlags>(c.flags);
   f.ColorSpace = static_cast<OMTColorSpace>(c.colorSpace);
@@ -308,7 +394,7 @@ void Sender::sendCoded(const CodedFrame& c) {
   f.Data = const_cast<uint8_t*>(c.data.data());
   f.DataLength = static_cast<int>(c.data.size());
   if (c.mode == Mode::Hx) {  // the source's own number, so a frame lost before this sender shows downstream too
-    d_->seqMeta = seqMetadata(c.seq);
+    d_->seqMeta = seqMetadata(c.seq, c.alphaBytes);
     f.FrameMetadata = d_->seqMeta.data();
     f.FrameMetadataLength = static_cast<int>(d_->seqMeta.size() + 1);
   }
@@ -373,11 +459,14 @@ struct Receiver::Impl {
   omt_receive_t* rx = nullptr;
   PixelFormat pixels = PixelFormat::Bgra;
   std::unique_ptr<Decoder> decoder;
+  std::unique_ptr<Decoder> alphaDecoder;  // a source that sends alpha as a stream of its own
   Packer packer;
   Nv12 picture;
+  Nv12 alphaPicture;
   bool waiting = true;  // Hx: discard until a keyframe
   bool haveCodec = false;
   Codec lastCodec = Codec::Hevc;
+  bool lastSeparate = false;
   bool haveLast = false;
   int64_t lastTimestamp = 0;
   bool haveSeq = false;  // the source numbers its frames (this version on); older ones are judged by timestamp
@@ -411,15 +500,17 @@ struct Receiver::Impl {
 
   // Hx: true when this access unit can be used. A lost coded frame breaks the picture until the next keyframe;
   // a frame the app skipped does not, as the encoder never saw it. Only the frame number tells them apart.
-  bool admit(const OMTMediaFrame* f, Codec codec, std::span<const uint8_t> au, uint64_t& seqOut) {
-    if (haveCodec && codec != lastCodec) waiting = true;  // the source came back with the other codec
+  // `alpha` is the separate alpha stream's access unit, or empty.
+  bool admit(const OMTMediaFrame* f, Codec codec, std::span<const uint8_t> au, std::span<const uint8_t> alpha,
+             uint64_t& seqOut) {
+    const bool separate = !alpha.empty();
+    // The source came back with the other codec, or started or stopped sending alpha as a stream of its own.
+    if (haveCodec && (codec != lastCodec || separate != lastSeparate)) waiting = true;
     haveCodec = true;
     lastCodec = codec;
+    lastSeparate = separate;
     uint64_t seq = 0;
-    const bool numbered = f->FrameMetadata && f->FrameMetadataLength > 0 &&
-                          parseSeq(std::string_view(static_cast<const char*>(f->FrameMetadata),
-                                                    static_cast<size_t>(f->FrameMetadataLength)),
-                                   seq);
+    const bool numbered = parseSeq(metadataOf(f), seq);
     if (numbered) {
       if (haveSeq && seq != lastSeq + 1) waiting = true;
       lastSeq = seq;
@@ -431,7 +522,7 @@ struct Receiver::Impl {
     haveLast = true;
     seqOut = numbered ? seq : count;
     ++count;
-    if (waiting && !isKeyframe(codec, au)) {
+    if (waiting && !(isKeyframe(codec, au) && (!separate || isKeyframe(codec, alpha)))) {
       discard();
       return false;
     }
@@ -497,32 +588,57 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
 
   // OMT-HX: the patched libomt hands the HEVC or H.264 access unit over untouched.
   if (!f->CompressedData || f->CompressedLength <= 0) return false;
-  const std::span<const uint8_t> au(static_cast<const uint8_t*>(f->CompressedData),
-                                    static_cast<size_t>(f->CompressedLength));
-  if (d_->decoder && d_->decoder->codec() != codec) d_->decoder.reset();  // the source came back with the other codec
-  uint64_t seq = 0;
-  if (!d_->admit(f, codec, au, seq)) return false;
-  if (!d_->decoder) d_->decoder = std::make_unique<Decoder>(codec);
-
-  const auto t0 = Clock::now();
-  int64_t timestamp = 0;
-  const bool gpu = d_->pixels == PixelFormat::Gpu;
-  std::shared_ptr<GpuPicture> picture = gpu ? std::make_shared<GpuPicture>() : nullptr;
-  const Decoded result = gpu ? d_->decoder->decodeFrame(au, f->Timestamp, picture->frame, timestamp)
-                             : d_->decoder->decode(au, f->Timestamp, d_->picture, timestamp);
-  if (result == Decoded::NeedMore) {  // the decoder took the keyframe and is filling its pipeline
-    d_->waiting = false;
+  const std::span<const uint8_t> data(static_cast<const uint8_t*>(f->CompressedData),
+                                      static_cast<size_t>(f->CompressedLength));
+  std::span<const uint8_t> au, alphaAu;
+  if (!splitFrame(f, data, au, alphaAu)) {
+    d_->waiting = true;
+    d_->discard();
     return false;
   }
-  bool ok = result == Decoded::Picture;
+  if (!fmt.alpha) alphaAu = {};
+  const bool separate = !alphaAu.empty();  // otherwise alpha, if any, is stacked under the fill
+  if (d_->decoder && d_->decoder->codec() != codec) {  // the source came back with the other codec
+    d_->decoder.reset();
+    d_->alphaDecoder.reset();
+  }
+  uint64_t seq = 0;
+  if (!d_->admit(f, codec, au, alphaAu, seq)) return false;
+  if (!d_->decoder) d_->decoder = std::make_unique<Decoder>(codec);
+  if (!separate) {
+    d_->alphaDecoder.reset();
+  } else if (!d_->alphaDecoder) {
+    d_->alphaDecoder = std::make_unique<Decoder>(codec);
+  }
+
+  const auto t0 = Clock::now();
+  int64_t timestamp = 0, alphaTimestamp = 0;
+  const bool gpu = d_->pixels == PixelFormat::Gpu;
+  std::shared_ptr<GpuPicture> picture = gpu ? std::make_shared<GpuPicture>() : nullptr;
+  if (picture && separate) picture->alpha = av_frame_alloc();
+  const Decoded result = gpu ? d_->decoder->decodeFrame(au, f->Timestamp, picture->frame, timestamp)
+                             : d_->decoder->decode(au, f->Timestamp, d_->picture, timestamp);
+  Decoded alphaResult = Decoded::Picture;
+  if (separate) {
+    alphaResult = gpu ? d_->alphaDecoder->decodeFrame(alphaAu, f->Timestamp, picture->alpha, alphaTimestamp)
+                      : d_->alphaDecoder->decode(alphaAu, f->Timestamp, d_->alphaPicture, alphaTimestamp);
+  }
+  if (result == Decoded::NeedMore && (!separate || alphaResult == Decoded::NeedMore)) {
+    d_->waiting = false;  // the decoders took the keyframe and are filling their pipelines
+    return false;
+  }
+  // The two decoders hand back pictures of the same frame, or the pair is broken until the next keyframe.
+  bool ok = result == Decoded::Picture && alphaResult == Decoded::Picture && (!separate || alphaTimestamp == timestamp);
   if (ok && gpu) {
-    ok = picture->frame->width == fmt.width && picture->frame->height == codedHeight(fmt);
+    ok = picture->frame->width == fmt.width && picture->frame->height == (separate ? fmt.height : codedHeight(fmt)) &&
+         (!separate || (picture->alpha->width == fmt.width && picture->alpha->height == fmt.height));
   } else if (ok) {
+    const Nv12* alpha = separate ? &d_->alphaPicture : nullptr;
     try {
       if (d_->pixels == PixelFormat::Uyvy) {
-        unpackUyvy(fmt, d_->picture, out.uyvy);
+        unpackUyvy(fmt, d_->picture, out.uyvy, alpha);
       } else {
-        d_->packer.unpack(fmt, d_->picture, out.bgra);
+        d_->packer.unpack(fmt, d_->picture, out.bgra, alpha);
       }
     } catch (const std::invalid_argument&) {
       ok = false;  // the picture does not match its header: treat it like a decode error
@@ -541,7 +657,7 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
   std::lock_guard lock(d_->statsMutex);
   d_->stats.mode = Mode::Hx;
   d_->stats.codec = codec;
-  d_->stats.decoder = d_->decoder->name();
+  d_->stats.decoder = d_->decoder->name() + (separate ? " + alpha" : "");
   d_->stats.lastDecodeMs = msSince(t0);
   ++d_->stats.framesReceived;
   return true;
@@ -556,17 +672,21 @@ bool Receiver::receiveCoded(CodedFrame& out, int timeoutMs) {
                                       static_cast<size_t>(f->CompressedLength));
   Codec codec = Codec::Hevc;
   if (codecFromTag(static_cast<int>(f->Codec), codec)) {
+    std::span<const uint8_t> fill, alpha;
+    if (!splitFrame(f, data, fill, alpha)) return false;
     uint64_t seq = 0;
-    if (!d_->admit(f, codec, data, seq)) return false;
+    if (!d_->admit(f, codec, fill, alpha, seq)) return false;
     d_->waiting = false;
     out.mode = Mode::Hx;
     out.codec = codec;
-    out.keyframe = isKeyframe(codec, data);
+    out.keyframe = isKeyframe(codec, fill) && (alpha.empty() || isKeyframe(codec, alpha));
     out.seq = seq;
+    out.alphaBytes = alpha.size();
   } else if (f->Codec == OMTCodec_VMX1) {
     out.mode = Mode::Full;
     out.keyframe = true;
     out.seq = 0;
+    out.alphaBytes = 0;
   } else {
     return false;
   }

@@ -95,8 +95,8 @@ modes spend bandwidth to save latency.
 | Mode | Codec | 1080p60 bandwidth | Latency | Alpha | Codec cost |
 |------|-------|-------------------|---------|-------|------------|
 | OMT (full) | VMX, intra, visually lossless | ~200 Mbps | ~9 ms | yes, in the BGRA frame | libomt owns it, no GPU codec |
-| OMT-HX, HEVC | HEVC (H.265), GPU hardware | 15 / 30 / 50 Mbps | 10-15 ms | optional, stacked plane | ~4-7 ms to send, ~4-7 ms to receive, CPU colour conversion included |
-| OMT-HX, H.264 | H.264, GPU hardware | 21 / 42 / 70 Mbps | 10-16 ms | optional, stacked plane | ~5-8 ms to send, ~4-7 ms to receive, CPU colour conversion included |
+| OMT-HX, HEVC | HEVC (H.265), GPU hardware | 15 / 30 / 50 Mbps | 10-15 ms | optional, second stream | ~4-7 ms to send, ~4-7 ms to receive, CPU colour conversion included |
+| OMT-HX, H.264 | H.264, GPU hardware | 21 / 42 / 70 Mbps | 10-16 ms | optional, second stream | ~5-8 ms to send, ~4-7 ms to receive, CPU colour conversion included |
 | NDI (High Bandwidth) | SpeedHQ, intra | ~150 Mbps | ~16 ms | yes, RGBA 4:4:4:4 | CPU |
 | NDI\|HX | H.264 / HEVC | 1-50 Mbps | 80-200 ms | limited, 4:2:0 | CPU or GPU |
 
@@ -115,7 +115,8 @@ modes spend bandwidth to save latency.
 - Resolution and frame rate are bounded by the time each end needs per frame, not by the
   transport: on the test PC, with sender and receiver sharing one CPU and GPU, HX holds 60 fps up to
   1440p (13 Mbps at 720p, 30 at 1080p, 53 at 1440p) and 1080p at 120 fps; 4K reaches about 43 fps. The
-  optional alpha mode doubles the coded picture; 720p60, 1080p30 and 1080p60 alpha hold real time.
+  alpha figures were measured with stacked alpha (before 2026-10-20), where 720p60, 1080p30 and 1080p60
+  alpha held real time; the separate alpha stream is not measured yet.
   The full sweeps are in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md).
 
 ## Technical detail
@@ -141,16 +142,19 @@ the mode. Full OMT keeps the whole BGRA picture, so it is visually lossless.
 
 **Alpha (optional).** Alpha is off by default: it is a flag on the frame format
 (`VideoFormat::alpha`), and a run without it codes only the display picture at no extra cost. Turned
-on, the alpha plane is stacked under the colour in the same coded picture (a 1080p alpha source codes
-as 1920x2176), so it rides in the one stream with no second connection. Alpha is lossy and doubles
-the coded size. With sender and receiver on one PC, 1080p60 alpha holds 60 fps at 27 ms delay. NDI|HX
-packs alpha the same way: NDI documents HX alpha as YUVA 4:2:0:4 "vertically stacking the video and
-alpha frames into a single frame", and its runtime has a `codec_h264_hevc_alpha` codec for it.
-Full-bandwidth NDI carries alpha as 4:2:2:4 instead.
+on, alpha is a second stream: a second hardware encoder of the same codec codes it as a picture of
+the display size, at a quarter of the fill's bitrate, alongside the fill encoder. Both access units
+ride in the same OMT frame, so there is still no second connection
+([spec section 7](docs/superpowers/specs/2026-10-12-omt-hx-design.md)). Alpha is lossy.
+Before 2026-10-20 alpha was stacked under the colour in one coded picture (1920x2176 for 1080p), as
+NDI|HX does ("vertically stacking the video and alpha frames into a single frame"). Receivers still
+read that layout, but older receivers cannot read the new one. Splitting the stream keeps 4K alpha
+within the encoders' size limits and runs the two encodes at once. It also gives alpha its own
+bitrate. Full-bandwidth NDI carries alpha as 4:2:2:4 instead.
 
 **Measured ceiling.** On the test PC (Radeon RX 6600, Ryzen 7 5700X), HX holds 60 fps up to 1440p
 (about 53 Mbps at medium) and 1080p120, and reaches about 43 fps at 4K. Alone, the hardware codec encodes
-the 1080p alpha picture at 195 fps and decodes it at 305 fps. See
+the stacked 1080p alpha picture at 195 fps and decodes it at 305 fps. See
 [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md) for the resolution, frame-rate, quality and alpha
 sweeps.
 
