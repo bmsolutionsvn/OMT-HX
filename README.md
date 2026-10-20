@@ -114,10 +114,10 @@ modes spend bandwidth to save latency.
   visually lossless. OMT-HX keeps OMT discovery, audio and tally; NDI|HX keeps NDI's.
 - Resolution and frame rate are bounded by the time each end needs per frame, not by the
   transport: on the test PC, with sender and receiver sharing one CPU and GPU, HX holds 60 fps up to
-  1440p (13 Mbps at 720p, 30 at 1080p, 53 at 1440p) and 1080p at 120 fps; 4K reaches about 43 fps. The
-  alpha figures were measured with stacked alpha (before 2026-10-21), where 720p60, 1080p30 and 1080p60
-  alpha held real time; VMX alpha is not measured on Windows yet.
-  The full sweeps are in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md).
+  1440p (13 Mbps at 720p, 30 at 1080p, 53 at 1440p) and 1080p at 120 fps; 4K reaches about 43 fps. With
+  VMX alpha on the CPU, 720p60, 1080p30 and 1080p60 alpha hold real time too: 1080p60 alpha runs at 21
+  to 22 ms delay and 37 Mbps (HEVC) or 48 Mbps (H.264), about 5 ms less delay than the stacked layout
+  it replaced. The full sweeps are in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md).
 
 ## Technical detail
 
@@ -147,14 +147,14 @@ on, the GPU codes the fill alone and the CPU codes alpha with VMX, OMT's own cod
 in the same OMT frame, so there is no second connection and no second GPU session. A 1080p matte is
 14 to 25 KB a frame and about 1 ms of CPU at each end, and an alpha plane that did not change is not
 sent again ([spec section 7](docs/superpowers/specs/2026-10-12-omt-hx-design.md)). Alpha is lossy.
-Before 2026-10-21 alpha was stacked under the colour in one coded picture (1920x2176 for 1080p), as
+Before 2026-10-20 alpha was stacked under the colour in one coded picture (1920x2176 for 1080p), as
 NDI|HX does ("vertically stacking the video and alpha frames into a single frame"). Receivers still
 read that layout, but older receivers cannot read VMX alpha. Full-bandwidth NDI carries alpha as
 4:2:2:4 instead.
 
 **Measured ceiling.** On the test PC (Radeon RX 6600, Ryzen 7 5700X), HX holds 60 fps up to 1440p
-(about 53 Mbps at medium) and 1080p120, and reaches about 43 fps at 4K. Alone, the hardware codec encodes
-the stacked 1080p alpha picture at 195 fps and decodes it at 305 fps. See
+(about 53 Mbps at medium) and 1080p120, and reaches about 43 fps at 4K. With VMX alpha, 1080p60
+alpha holds 60 fps on one PC at 21 to 22 ms delay, and 1080p30 alpha at 19.8 ms. See
 [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md) for the resolution, frame-rate, quality and alpha
 sweeps.
 

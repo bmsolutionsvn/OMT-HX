@@ -5,9 +5,34 @@ Measured with `omthx-send` and `omthx-recv`, driven by `scripts\measure.ps1`, on
 library figures, not link figures. It also means sender and receiver share one CPU and one GPU, so
 each runs slower than it would alone. Each row is the median of a 20 s run after a 2 s warm-up.
 
-Since 2026-10-21 the GPU codes the fill alone and alpha goes by VMX on the CPU, not stacked under the
-fill. The alpha rows below were measured with stacked alpha; run `scripts\measure.ps1` again for VMX
-alpha.
+Since 2026-10-20 the GPU codes the fill alone and alpha goes by VMX on the CPU, not stacked under the
+fill. The current alpha figures are the first table below; the tables after it keep the stacked-alpha
+numbers they were measured with.
+
+## 2026-10-20: alpha by VMX
+
+Same PC, final build of the VMX-alpha change, `scripts\measure.ps1 -Seconds 20`, with the two 1080p60
+alpha rows repeated at 60 s. The rows without alpha were close to their 2026-10-19 figures.
+
+| Case | Sender fps | Recv fps | Mbps | Send ms | Receive ms | Delay avg ms | Delay max ms | Discarded |
+|------|-----------|----------|------|---------|------------|--------------|--------------|-----------|
+| hx 720p60 alpha | 60 | 60 | 16.9 | 5.8 | 4.8 | 11.8 | 16.5 | 27 |
+| hx 1080p60 alpha | 60 | 60 | 36.9 | 10.5 | 9.4 | 21.5 | 31.9 | 26 |
+| hx 1080p30 alpha | 30 | 30 | 18.4 | 9.7 | 8.6 | 19.8 | 32 | 1 |
+| h264 720p60 alpha | 60 | 60 | 22.3 | 6.2 | 4.1 | 11.6 | 25.4 | 26 |
+| h264 1080p60 alpha | 60 | 60 | 48.3 | 11.4 | 9.4 | 22.1 | 25.2 | 26 |
+
+- The 60 s repeat held 60 / 60 sent and received on both 1080p60 rows: HEVC 21.5 ms delay (send 10.3,
+  receive 9.6), H.264 20.4 ms (send 10.5, receive 8.8). The stacked run's ten-minute fall to 57 fps
+  did not appear in this short repeat, but ten minutes were not rerun.
+- **Delay** at 1080p60 fell from 26.8 to 21.5 ms (HEVC) and 25.5 to 22.1 ms (H.264) against the stacked
+  rows below. Send fell by 3.5 and 2.1 ms, receive by 1.5 and 0.6 ms: the GPU codes 1080p instead of
+  2176p, and VMX alpha costs about 1 ms at each end.
+- **Bandwidth** rose by 8 to 19%: 31.9 to 36.9 Mbps at 1080p60 HEVC, 44.6 to 48.3 at H.264. VMX is
+  intra, so alpha costs 14 to 25 KB every frame; stacked alpha rode inter prediction once the plane
+  stopped changing.
+- **Matte quality** is lower than stacked. The test suite reads mean alpha error 0.128 end to end, and
+  0.086 for the plane alone at medium (VMX quality 70), against 0.030 for stacked alpha.
 
 ## 2026-10-19: after the latency and CPU work
 
@@ -99,8 +124,8 @@ Notes:
 Each end timed alone, in one process, paced at the frame rate (a one-off timing program, not in the
 repository). Median per frame; the budget at 60 fps is 16.67 ms.
 
-| Stage | 1080p60 | 1080p60 alpha |
-|-------|---------|---------------|
+| Stage | 1080p60 | 1080p60 alpha (stacked) |
+|-------|---------|--------------------------|
 | Sender: pack on the CPU | 6.0 ms | 7.7 ms |
 | of which BGRA to NV12 | 4.9 ms | 5.0 ms |
 | Sender: hardware encode call | 3.2 ms | 4.9 ms |
@@ -118,8 +143,9 @@ repository). Median per frame; the budget at 60 fps is 16.67 ms.
   alpha. When every pixel is partly see-through, as during a fade, the sender total is 13.0 ms.
   Before that multiply was made cheaper (opaque and fully transparent pixels now skip it, and it
   runs on the thread pool), the sender needed 17.5 ms and missed 60 fps by itself.
-- In the table at the top the same stages read higher (15.7 and 16.8 ms for 1080p60 alpha) because
-  sender and receiver run at once on one PC.
+- In the stacked-alpha table the same stages read higher (15.7 and 16.8 ms for 1080p60 alpha) because
+  sender and receiver run at once on one PC. The VMX build codes the fill alone, so only its fill
+  column applies; alpha adds about 1 ms at each end (2026-10-20).
 
 ## Findings
 
@@ -132,8 +158,9 @@ repository). Median per frame; the budget at 60 fps is 16.67 ms.
 - **Frame rate.** 1080p30 works, at 14.8 Mbps and about 58 ms delay: one frame is 33 ms at 30 fps,
   so the delay is higher than at 60 fps. 1080p120 does not: the sender reaches about 101 fps, the
   receiver only 25 fps, and 1248 frames are discarded.
-- **Alpha (optional).** Alpha is off by default, so the rows without "alpha" run without it. Turned
-  on, it codes a picture of double height. 720p60 alpha holds 60 fps (14.3 Mbps, 34 ms) and 1080p30
+- **Alpha (optional), stacked (2026-10-19).** See 2026-10-20 for the current VMX figures. Alpha is
+  off by default, so the rows without "alpha" run without it. Turned on, it coded a picture of double
+  height. 720p60 alpha holds 60 fps (14.3 Mbps, 34 ms) and 1080p30
   alpha holds 30 fps (16.1 Mbps). 1080p60 alpha falls just short on one PC: over three 20 s runs it
   read 60 sent / 58 received, 60 / 60 (48 ms delay) and 58 / 55, and over ten minutes the receiver's
   median was 57 fps. The receiver is the slower end, at 17 to 18 ms. Each end alone needs about
@@ -143,12 +170,16 @@ repository). Median per frame; the budget at 60 fps is 16.67 ms.
 
 ## From the test suite
 
-- Round trip at 1280x720 with alpha: mean alpha error 0.030, mean colour error 0.303 (0 to 255).
-- A receiver joining a running HX source got its first picture after 93 to 128 ms (two runs).
+- Round trip at 1280x720 with stacked alpha: mean alpha error 0.030, mean colour error 0.303 (0 to 255).
+- VMX alpha at 1280x720: mean alpha error 0.128 end to end; the plane alone reads 0.103, 0.086 and
+  0.037 at qualities 52, 70 and 90, at 14.3, 14.8 and 17.5 KB a frame.
+- A receiver joining a running HX source got its first picture after 59 to 63 ms (VMX-alpha build; two
+  runs, 2026-10-20).
 
-## Ten-minute run (1080p60 alpha)
+## Ten-minute run (1080p60 alpha, stacked)
 
-Sender and receiver on one PC, as in the table at the top.
+Measured 2026-10-19, before alpha moved to VMX. Sender and receiver on one PC, as in the table above
+it.
 
 - It does not hold 60 fps on one PC. The sender's median was 60 fps (68 of 600 seconds below 58);
   the receiver's median was 57 fps (311 of 599 seconds below 58, low 20).
@@ -197,7 +228,7 @@ Notes:
 - Read past one outlier: `h264 1080p60` shows `Delay max 233.9 ms` and 59 discarded against the
   usual ~28, a single stall in that run, not the steady state the rest of the table shows.
 - The alpha stream decoded as `h264 (d3d11va)`. The taller 1920x2176 picture still takes D3D11
-  hardware.
+  hardware. These alpha rows are stacked; see 2026-10-20 for VMX alpha.
 
 Not measured here: `h264_nvenc` (this PC has no NVIDIA GPU), and picture quality by eye, so the
 1.4 bitrate factor for H.264 is still a starting value.
