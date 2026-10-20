@@ -16,12 +16,12 @@ function(omthx_warnings target)
 endfunction()
 
 # ---- library ----
-set(OMTHX_SOURCES src/pure.cpp src/encoder.cpp src/decoder.cpp src/link.cpp)
+set(OMTHX_SOURCES src/pure.cpp src/alpha.cpp src/encoder.cpp src/decoder.cpp src/link.cpp)
 function(omthx_library target type)
   add_library(${target} ${type} ${OMTHX_SOURCES})
   target_include_directories(${target} PUBLIC include PRIVATE src ${FFMPEG_INCLUDE_DIRS})
   target_link_directories(${target} PUBLIC ${FFMPEG_LIBRARY_DIRS})
-  target_link_libraries(${target} PUBLIC ${FFMPEG_LIBRARIES} libomt)
+  target_link_libraries(${target} PUBLIC ${FFMPEG_LIBRARIES} libomt PRIVATE libvmx)
   omthx_warnings(${target})
 endfunction()
 

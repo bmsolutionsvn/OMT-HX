@@ -1,6 +1,7 @@
 #pragma once
 // Internal to omthx. Apps include omthx/omthx.h only.
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -13,6 +14,7 @@ struct AVCodecContext;
 struct AVFrame;
 struct AVPacket;
 struct SwsContext;
+struct VMX_INSTANCE;
 
 namespace omthx {
 
@@ -26,24 +28,29 @@ int codecTag(Codec codec);                 // the tag an Hx frame of this codec 
 bool codecFromTag(int tag, Codec& out);    // false for a tag that is not an Hx codec
 const char* codecName(Codec codec);        // "hevc" or "h264"
 int64_t targetBitrate(const VideoFormat& format, Quality quality, Codec codec);  // one stream, alpha stacked
-// A separate alpha stream: the fill gets the bitrate of the opaque picture and the alpha stream a quarter of it, so
-// the two together cost what the stacked picture did.
+// With VMX alpha the GPU codes the fill alone, at the bitrate of the same source without alpha.
 int64_t fillBitrate(const VideoFormat& format, Quality quality, Codec codec);
-int64_t alphaBitrate(const VideoFormat& format, Quality quality, Codec codec);
 bool hasNalType(Codec codec, std::span<const uint8_t> annexB, int type);
 bool isKeyframe(Codec codec, std::span<const uint8_t> annexB);
-// Alpha travels one of two ways. Stacked (sources before 2026-10-20): one picture, the alpha picture under the fill.
-// Separate: the fill is the display picture, and alpha is a second stream of its own, coded by a second encoder;
-// each OMT frame carries the fill's access unit, then the alpha's, and its metadata says how long the alpha's is.
+// Alpha travels one of two ways. Stacked (sources before 2026-10-21): one picture, the alpha picture under the fill.
+// VMX: the GPU codes the fill alone, at the display size, and the CPU codes the alpha plane as one grey VMX plane;
+// each OMT frame carries the fill's access unit, then the VMX alpha, and its metadata says how long the VMX alpha is,
+// or that the frame repeats the previous frame's alpha and carries none.
 int alphaTop(int height);                       // stacked: row where the alpha picture starts
 int codedHeight(const VideoFormat& format);     // stacked: height of the picture the encoder sees
+bool vmxAlphaFits(const VideoFormat& format);   // VMX takes 16x16 to 7680x4320; smaller or larger alpha is stacked
 bool isGap(int64_t previous, int64_t current, int fpsN, int fpsD);
 // Per-frame metadata that numbers each coded frame, so a receiver can tell a frame lost on the way
 // (the number jumps) from a frame the app never sent (only the timestamp jumps).
-// alphaBytes, when not 0, says the frame ends with that many bytes of the separate alpha stream.
-std::string seqMetadata(uint64_t seq, size_t alphaBytes = 0);
+// What an HX frame's metadata says about VMX alpha.
+struct AlphaPart {
+  size_t bytes = 0;      // the frame ends with this many bytes of VMX alpha
+  bool repeats = false;  // the frame carries no alpha: the previous frame's alpha holds
+  bool any() const { return bytes > 0 || repeats; }
+};
+std::string seqMetadata(uint64_t seq, AlphaPart alpha = {});
 bool parseSeq(std::string_view metadata, uint64_t& out);  // false when the metadata carries no number
-size_t parseAlphaBytes(std::string_view metadata);         // 0 when the frame has no separate alpha stream
+AlphaPart parseAlpha(std::string_view metadata);           // nothing set for a frame without VMX alpha
 
 // Decides when the sender must force a keyframe (spec section 8). Time is passed in, so it is testable.
 class KeyframePolicy {
@@ -72,16 +79,17 @@ struct Nv12 {
 void copyNv12(const VideoFormat& format, const uint8_t* y, int yStride, const uint8_t* uv, int uvStride, bool fullRange,
               Nv12& out);
 // The pack functions stack alpha under the fill when `alphaOut` is null, and otherwise put the fill alone in `out`
-// and the alpha picture in `alphaOut`: the display size, alpha as brightness, neutral colour. The unpack functions
-// read alpha from `alpha` when set, and from under the fill otherwise.
+// and the width * height alpha plane in `alphaOut`. The unpack functions read alpha from the width * height plane
+// `alpha` when set, and from under the fill otherwise.
 
 // UYVY (limited range) and, with alpha, its alpha plane to the packed NV12 picture, with no colour matrix:
 // values are re-ranged by table and chroma rows averaged 4:2:2 to 4:2:0. Straight colour is premultiplied in YUV.
 void packUyvy(const VideoFormat& format, const uint8_t* uyvy, int stride, const uint8_t* alpha, int alphaStride,
-              bool premultiplied, Nv12& out, Nv12* alphaOut = nullptr);
+              bool premultiplied, Nv12& out, std::vector<uint8_t>* alphaOut = nullptr);
 // Back to UYVY rows of width * 2 bytes, followed with alpha by the width * height alpha plane: the UYVA layout
 // OMT and NDI share. Chroma rows repeat; colour stays premultiplied when there is alpha.
-void unpackUyvy(const VideoFormat& format, const Nv12& in, std::vector<uint8_t>& uyva, const Nv12* alpha = nullptr);
+void unpackUyvy(const VideoFormat& format, const Nv12& in, std::vector<uint8_t>& uyva,
+                const uint8_t* alpha = nullptr);
 
 class Packer {
  public:
@@ -90,9 +98,9 @@ class Packer {
   Packer(const Packer&) = delete;
   Packer& operator=(const Packer&) = delete;
   void pack(const VideoFormat& format, std::span<const uint8_t> bgra, bool premultiplied, Nv12& out,
-            Nv12* alphaOut = nullptr);
+            std::vector<uint8_t>* alphaOut = nullptr);
   void unpack(const VideoFormat& format, const Nv12& in, std::vector<uint8_t>& bgra,
-              const Nv12* alpha = nullptr);  // premultiplied when alpha
+              const uint8_t* alpha = nullptr);  // premultiplied when alpha
 
  private:
   void ensure(int width, int height);
@@ -140,6 +148,37 @@ class Encoder {
   void* timer_ = nullptr;     // a high-resolution waitable timer for the short waits
 };
 
+// The alpha plane as one grey VMX plane, on the CPU (src/alpha.cpp). VMX is intra only: each frame stands alone.
+class AlphaEncoder {
+ public:
+  AlphaEncoder(int width, int height, Quality quality);  // throws std::runtime_error when VMX refuses the size
+  ~AlphaEncoder();
+  AlphaEncoder(const AlphaEncoder&) = delete;
+  AlphaEncoder& operator=(const AlphaEncoder&) = delete;
+  static int vmxQuality(Quality quality);  // a fixed VMX quality per Quality, no bitrate targeting
+  void encode(const uint8_t* plane, int stride, std::vector<uint8_t>& out);
+
+ private:
+  ::VMX_INSTANCE* vmx_ = nullptr;
+  int width_ = 0;
+  int height_ = 0;
+};
+
+class AlphaDecoder {
+ public:
+  AlphaDecoder() = default;
+  ~AlphaDecoder();
+  AlphaDecoder(const AlphaDecoder&) = delete;
+  AlphaDecoder& operator=(const AlphaDecoder&) = delete;
+  // False for data VMX cannot read at this size. `out` becomes the width * height plane.
+  bool decode(std::span<const uint8_t> data, int width, int height, std::vector<uint8_t>& out);
+
+ private:
+  ::VMX_INSTANCE* vmx_ = nullptr;
+  int width_ = 0;
+  int height_ = 0;
+};
+
 enum class Decoded { Picture, NeedMore, Error };
 
 // HEVC or H.264 through FFmpeg, D3D11 when the GPU offers it (src/decoder.cpp).
@@ -173,12 +212,12 @@ bool downloadNv12(const AVFrame* frame, Nv12& out);
 // What a Gpu receiver hands out: a reference to one decoded frame, freed with the last copy of the pointer.
 struct GpuPicture {
   AVFrame* frame = nullptr;  // the fill, or with a stacked source the whole picture
-  AVFrame* alpha = nullptr;  // the separate alpha stream's picture, or null
+  std::shared_ptr<const std::vector<uint8_t>> alpha;  // VMX alpha, decoded: the width * height plane; or null
   GpuPicture();
   ~GpuPicture();
   GpuPicture(const GpuPicture&) = delete;
   GpuPicture& operator=(const GpuPicture&) = delete;
-  bool inVideoMemory() const;  // D3D11 frames, rather than a software decoder's frames in memory
+  bool inVideoMemory() const;  // a D3D11 frame, rather than a software decoder's frame in memory
 };
 
 }  // namespace omthx

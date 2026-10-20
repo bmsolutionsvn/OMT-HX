@@ -125,47 +125,60 @@ TEST_CASE("a picture with alpha survives pack, encode, decode and unpack") {
   CHECK(colourError < 6.0);
 }
 
-TEST_CASE("a picture with alpha survives as two streams: the fill and alpha, each with its own encoder") {
+TEST_CASE("VMX alpha: one grey plane, coded on the CPU, comes back close and small") {
+  const int w = 1920, h = 1080;
+  std::vector<uint8_t> bgra, plane(static_cast<size_t>(w) * h), back, coded;
+  drawPattern(bgra, w, h, 0, true);
+  for (size_t i = 0; i < plane.size(); ++i) plane[i] = bgra[i * 4 + 3];
+  AlphaDecoder dec;
+  for (Quality q : {Quality::Low, Quality::Medium, Quality::High}) {
+    AlphaEncoder enc(w, h, q);
+    enc.encode(plane.data(), w, coded);
+    REQUIRE(dec.decode(coded, w, h, back));
+    REQUIRE(back.size() == plane.size());
+    double err = 0;
+    for (size_t i = 0; i < plane.size(); ++i) err += std::abs(back[i] - plane[i]);
+    MESSAGE("VMX quality " << AlphaEncoder::vmxQuality(q) << ": " << coded.size() << " bytes, mean error "
+                           << err / plane.size());
+    CHECK(err / plane.size() < 1.5);
+    CHECK(coded.size() < 64u * 1024);  // a few Mbps at 60 fps
+  }
+  CHECK_FALSE(dec.decode(std::vector<uint8_t>(100, 0x5A), w, h, back));  // garbage is refused, not a crash
+  CHECK_THROWS_AS(AlphaEncoder(8, 8, Quality::Medium), std::runtime_error);  // smaller than VMX takes
+}
+
+TEST_CASE("a picture with alpha survives as the fill on the GPU and alpha by VMX") {
   Codec codec = Codec::Hevc;
   SUBCASE("hevc") { codec = Codec::Hevc; }
   SUBCASE("h264") { codec = Codec::H264; }
   const VideoFormat f{1280, 720, 60, 1, true};
-  std::unique_ptr<Encoder> fillEnc, alphaEnc;
+  std::unique_ptr<Encoder> enc;
   try {
-    fillEnc = std::make_unique<Encoder>(codec, f.width, f.height, f.fpsN, f.fpsD, fillBitrate(f, Quality::Medium, codec));
-    alphaEnc = std::make_unique<Encoder>(codec, f.width, f.height, f.fpsN, f.fpsD, alphaBitrate(f, Quality::Medium, codec));
+    enc = std::make_unique<Encoder>(codec, f.width, f.height, f.fpsN, f.fpsD, fillBitrate(f, Quality::Medium, codec));
   } catch (const std::runtime_error& e) {
-    MESSAGE("SKIPPED, no two hardware " << codecName(codec) << " encoders on this PC: " << e.what());
+    MESSAGE("SKIPPED, no hardware " << codecName(codec) << " encoder on this PC: " << e.what());
     return;
   }
-  Decoder fillDec(codec), alphaDec(codec);
+  AlphaEncoder alphaEnc(f.width, f.height, Quality::Medium);
+  AlphaDecoder alphaDec;
+  Decoder dec(codec);
   Packer packer;
-  Nv12 fill, alpha, fillOut, alphaOut;
-  std::vector<uint8_t> src, back;
+  Nv12 fill, decoded;
+  std::vector<uint8_t> src, alpha, coded, alphaBack, back;
   drawPattern(src, f.width, f.height, 0, true);
   int pictures = 0;
-  size_t fillBytes = 0, alphaBytes = 0;
   for (int i = 0; i < 30; ++i) {
     packer.pack(f, src, false, fill, &alpha);
     REQUIRE(fill.height == 720);
-    const std::vector<Packet> fp = fillEnc->encode(fill, i == 0);
-    const std::vector<Packet> ap = alphaEnc->encode(alpha, i == 0);
-    REQUIRE(fp.size() == ap.size());
-    for (size_t k = 0; k < fp.size(); ++k) {
-      if (i == 0) CHECK(fp[k].keyframe == ap[k].keyframe);
-      fillBytes += fp[k].data.size();
-      alphaBytes += ap[k].data.size();
-      int64_t ts = 0, ats = 0;
-      const Decoded d = fillDec.decode(fp[k].data, i, fillOut, ts);
-      const Decoded da = alphaDec.decode(ap[k].data, i, alphaOut, ats);
-      CHECK(d == da);
-      if (d != Decoded::Picture || da != Decoded::Picture) continue;
-      CHECK(ts == ats);
-      packer.unpack(f, fillOut, back, &alphaOut);
+    alphaEnc.encode(alpha.data(), f.width, coded);
+    REQUIRE(alphaDec.decode(coded, f.width, f.height, alphaBack));
+    for (const Packet& p : enc->encode(fill, i == 0)) {
+      int64_t ts = 0;
+      if (dec.decode(p.data, i, decoded, ts) != Decoded::Picture) continue;
+      packer.unpack(f, decoded, back, alphaBack.data());  // a still picture: any frame's alpha is this one's
       ++pictures;
     }
   }
-  MESSAGE("fill " << fillBytes / 30 << " bytes a frame, alpha " << alphaBytes / 30);
   REQUIRE(pictures >= 20);
   REQUIRE(back.size() == src.size());
   double alphaError = 0, colourError = 0;

@@ -32,8 +32,6 @@ int64_t fillBitrate(const VideoFormat& f, Quality q, Codec codec) {
   return targetBitrate(opaque, q, codec);
 }
 
-int64_t alphaBitrate(const VideoFormat& f, Quality q, Codec codec) { return fillBitrate(f, q, codec) / 4; }
-
 int codecTag(Codec codec) { return codec == Codec::H264 ? kCodecH264 : kCodecHevc; }
 
 bool codecFromTag(int tag, Codec& out) {
@@ -79,6 +77,10 @@ int alphaTop(int height) { return (height + 15) / 16 * 16; }
 
 int codedHeight(const VideoFormat& f) { return f.alpha ? 2 * alphaTop(f.height) : f.height; }
 
+bool vmxAlphaFits(const VideoFormat& f) {
+  return f.width >= 16 && f.height >= 16 && f.width <= 7680 && f.height <= 4320 && f.width % 2 == 0;
+}
+
 bool isGap(int64_t previous, int64_t current, int fpsN, int fpsD) {
   if (fpsN <= 0 || fpsD <= 0) return false;
   const int64_t frame = 10'000'000LL * fpsD / fpsN;
@@ -86,9 +88,13 @@ bool isGap(int64_t previous, int64_t current, int fpsN, int fpsD) {
   return step <= 0 || step > frame + frame / 2;
 }
 
-std::string seqMetadata(uint64_t seq, size_t alphaBytes) {
+std::string seqMetadata(uint64_t seq, AlphaPart alpha) {
   std::string m = "<OMTHX Seq=\"" + std::to_string(seq) + "\"";
-  if (alphaBytes) m += " Alpha=\"" + std::to_string(alphaBytes) + "\"";
+  if (alpha.bytes) {
+    m += " Alpha=\"" + std::to_string(alpha.bytes) + "\"";
+  } else if (alpha.repeats) {
+    m += " Alpha=\"same\"";
+  }
   return m + " />";
 }
 
@@ -101,16 +107,22 @@ bool parseSeq(std::string_view m, uint64_t& out) {
   return ec == std::errc() && end != first && end < m.data() + m.size() && *end == '"';
 }
 
-size_t parseAlphaBytes(std::string_view m) {
+AlphaPart parseAlpha(std::string_view m) {
   static constexpr std::string_view kKey = " Alpha=\"";
+  AlphaPart out;
   const size_t element = m.find("<OMTHX ");
-  if (element == std::string_view::npos) return 0;
+  if (element == std::string_view::npos) return out;
   const size_t at = m.find(kKey, element);
-  if (at == std::string_view::npos || at > m.find("/>", element)) return 0;  // only inside the OMTHX element
-  const char* first = m.data() + at + kKey.size();
-  size_t out = 0;
-  const auto [end, ec] = std::from_chars(first, m.data() + m.size(), out);
-  return ec == std::errc() && end != first && end < m.data() + m.size() && *end == '"' ? out : 0;
+  if (at == std::string_view::npos || at > m.find("/>", element)) return out;  // only inside the OMTHX element
+  const std::string_view value = m.substr(at + kKey.size());
+  if (value.starts_with("same\"")) {
+    out.repeats = true;
+    return out;
+  }
+  size_t bytes = 0;
+  const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), bytes);
+  if (ec == std::errc() && end != value.data() && end < value.data() + value.size() && *end == '"') out.bytes = bytes;
+  return out;
 }
 
 bool KeyframePolicy::next(int64_t nowMs, uint64_t dropped, bool requested) {
@@ -246,15 +258,12 @@ void stackAlpha(const VideoFormat& f, const uint8_t* a, size_t rowStride, size_t
   std::memset(uv + (top / 2) * row, 128, (top / 2) * row);                                           // neutral colour
 }
 
-// The separate alpha picture: `a` as brightness, at the display size, with neutral colour.
-void separateAlpha(const VideoFormat& f, const uint8_t* a, size_t rowStride, size_t step, Nv12& out) {
+// The alpha plane alone, width * height, from values `step` bytes apart in rows `rowStride` bytes apart.
+void separateAlpha(const VideoFormat& f, const uint8_t* a, size_t rowStride, size_t step, std::vector<uint8_t>& out) {
   const int w = f.width, h = f.height;
   const size_t row = static_cast<size_t>(w);
-  out.width = w;
-  out.height = h;
-  out.y.resize(row * h);
-  out.uv.assign(row * h / 2, 128);
-  uint8_t* y = out.y.data();
+  out.resize(row * h);
+  uint8_t* y = out.data();
   inBands(h, [&](int first, int last) {
     for (int r = first; r < last; ++r) {
       uint8_t* dst = y + r * row;
@@ -283,12 +292,11 @@ void checkPicture(const VideoFormat& f, const Nv12& in, int rows) {
     throw std::invalid_argument("the picture does not match the frame header");
 }
 
-// The fill, and the alpha picture when it is separate. Returns where the alpha values start.
-const uint8_t* checkPictures(const VideoFormat& f, const Nv12& in, const Nv12* alpha) {
+// The fill, and where the alpha values start: the separate plane when set, else under the fill.
+const uint8_t* checkPictures(const VideoFormat& f, const Nv12& in, const uint8_t* alpha) {
   if (f.alpha && alpha) {
     checkPicture(f, in, f.height);
-    checkPicture(f, *alpha, f.height);
-    return alpha->y.data();
+    return alpha;
   }
   checkPicture(f, in, codedHeight(f));
   return f.alpha ? in.y.data() + static_cast<size_t>(alphaTop(f.height)) * f.width : nullptr;
@@ -340,7 +348,7 @@ void Packer::ensure(int w, int h) {
 // ponytail: colour conversion and premultiplying run on the CPU, a few ms per 1080p frame.
 // Upgrade path: hand the encoder a D3D11 texture and do both in a shader.
 void Packer::pack(const VideoFormat& f, std::span<const uint8_t> bgra, bool premultiplied, Nv12& out,
-                  Nv12* alphaOut) {
+                  std::vector<uint8_t>* alphaOut) {
   checkSize(f);
   const int w = f.width, h = f.height;
   if (bgra.size() != static_cast<size_t>(w) * h * 4)
@@ -387,7 +395,7 @@ void Packer::pack(const VideoFormat& f, std::span<const uint8_t> bgra, bool prem
   }
 }
 
-void Packer::unpack(const VideoFormat& f, const Nv12& in, std::vector<uint8_t>& bgra, const Nv12* alpha) {
+void Packer::unpack(const VideoFormat& f, const Nv12& in, std::vector<uint8_t>& bgra, const uint8_t* alpha) {
   checkSize(f);
   const int w = f.width, h = f.height;
   const uint8_t* a = checkPictures(f, in, alpha);
@@ -405,7 +413,7 @@ void Packer::unpack(const VideoFormat& f, const Nv12& in, std::vector<uint8_t>& 
 // No colour matrix: a table per value, and bands of row pairs on the thread pool (straight alpha measured 7.3 ms
 // for 1080p on one core with a divide per sample).
 void packUyvy(const VideoFormat& f, const uint8_t* uyvy, int stride, const uint8_t* alpha, int alphaStride,
-              bool premultiplied, Nv12& out, Nv12* alphaOut) {
+              bool premultiplied, Nv12& out, std::vector<uint8_t>* alphaOut) {
   checkSize(f);
   const int w = f.width, h = f.height;
   if (!uyvy || stride < w * 2 || (f.alpha && (!alpha || alphaStride < w)))
@@ -447,7 +455,7 @@ void packUyvy(const VideoFormat& f, const uint8_t* uyvy, int stride, const uint8
   }
 }
 
-void unpackUyvy(const VideoFormat& f, const Nv12& in, std::vector<uint8_t>& uyva, const Nv12* alpha) {
+void unpackUyvy(const VideoFormat& f, const Nv12& in, std::vector<uint8_t>& uyva, const uint8_t* alpha) {
   checkSize(f);
   const uint8_t* a = checkPictures(f, in, alpha);
   const int w = f.width, h = f.height;

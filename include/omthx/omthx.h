@@ -80,9 +80,11 @@ struct CodedFrame {
   VideoFormat format;
   bool keyframe = true;       // VMX frames are all keyframes
   uint64_t seq = 0;           // Hx: the frame's number; the next Sender passes it on, so a gap stays visible
-  // Hx with alpha: the last alphaBytes bytes of data are the alpha stream's access unit, the rest the fill's.
-  // 0 when alpha, if any, is stacked under the fill (sources before 2026-10-20). Passed on by sendCoded.
+  // Hx with alpha: the last alphaBytes bytes of data are the frame's VMX alpha, the rest the fill's access unit.
+  // alphaRepeats: the frame carries no alpha and the previous frame's holds. Both unset when alpha, if any, is
+  // stacked under the fill (sources before 2026-10-21). sendCoded passes both on.
   size_t alphaBytes = 0;
+  bool alphaRepeats = false;
   int64_t timestamp = 0;
   int flags = 0;              // OMT's video flags and colour space, as they came: pass them on untouched
   int colorSpace = 0;

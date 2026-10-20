@@ -5,9 +5,9 @@ Measured with `omthx-send` and `omthx-recv`, driven by `scripts\measure.ps1`, on
 library figures, not link figures. It also means sender and receiver share one CPU and one GPU, so
 each runs slower than it would alone. Each row is the median of a 20 s run after a 2 s warm-up.
 
-Since 2026-10-20 alpha is a second stream with its own encoder and decoder, not stacked under the
-fill. The alpha rows below were measured with stacked alpha; run `scripts\measure.ps1` again for the
-separate stream.
+Since 2026-10-21 the GPU codes the fill alone and alpha goes by VMX on the CPU, not stacked under the
+fill. The alpha rows below were measured with stacked alpha; run `scripts\measure.ps1` again for VMX
+alpha.
 
 ## 2026-10-19: after the latency and CPU work
 

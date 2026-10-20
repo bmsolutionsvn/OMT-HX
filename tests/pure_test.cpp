@@ -23,15 +23,17 @@ TEST_CASE("targetBitrate follows bits per pixel, quality, alpha and codec") {
   CHECK(targetBitrate(VideoFormat{1280, 720, 30000, 1001, false}, Quality::Medium, Codec::Hevc) == 6'628'891);
 }
 
-TEST_CASE("a separate alpha stream costs a quarter of the fill, which gets the opaque bitrate") {
+TEST_CASE("with VMX alpha the fill gets the opaque bitrate, and VMX takes 16x16 to 8K") {
   const VideoFormat opaque{1920, 1080, 60, 1, false};
   const VideoFormat keyed{1920, 1080, 60, 1, true};
-  for (Codec codec : {Codec::Hevc, Codec::H264}) {
+  for (Codec codec : {Codec::Hevc, Codec::H264})
     CHECK(fillBitrate(keyed, Quality::Medium, codec) == targetBitrate(opaque, Quality::Medium, codec));
-    CHECK(alphaBitrate(keyed, Quality::Medium, codec) == targetBitrate(opaque, Quality::Medium, codec) / 4);
-  }
-  CHECK(fillBitrate(keyed, Quality::Medium, Codec::Hevc) + alphaBitrate(keyed, Quality::Medium, Codec::Hevc) ==
-        targetBitrate(keyed, Quality::Medium, Codec::Hevc));  // the same total as the stacked picture
+  CHECK(vmxAlphaFits(keyed));
+  CHECK(vmxAlphaFits(VideoFormat{7680, 4320, 60, 1, true}));
+  CHECK(vmxAlphaFits(VideoFormat{16, 16, 60, 1, true}));
+  CHECK_FALSE(vmxAlphaFits(VideoFormat{14, 16, 60, 1, true}));
+  CHECK_FALSE(vmxAlphaFits(VideoFormat{16, 8, 60, 1, true}));
+  CHECK_FALSE(vmxAlphaFits(VideoFormat{8192, 4320, 60, 1, true}));
 }
 
 TEST_CASE("codec tags are the FourCCs HEVC and H264 and nothing else is a codec") {
@@ -120,19 +122,28 @@ TEST_CASE("frame numbers round-trip through the per-frame metadata") {
   CHECK_FALSE(parseSeq("<OMTHX Seq=\"12", n));  // cut short
 }
 
-TEST_CASE("the length of a separate alpha stream rides in the same metadata") {
-  CHECK(seqMetadata(7) == "<OMTHX Seq=\"7\" />");  // what sources before the alpha stream send
-  CHECK(seqMetadata(7, 0) == seqMetadata(7));
-  CHECK(seqMetadata(7, 1234) == "<OMTHX Seq=\"7\" Alpha=\"1234\" />");
+TEST_CASE("VMX alpha, or that the frame repeats the last one, rides in the same metadata") {
+  CHECK(seqMetadata(7) == "<OMTHX Seq=\"7\" />");  // what a source without VMX alpha sends
+  CHECK(seqMetadata(7, AlphaPart{1234, false}) == "<OMTHX Seq=\"7\" Alpha=\"1234\" />");
+  CHECK(seqMetadata(7, AlphaPart{0, true}) == "<OMTHX Seq=\"7\" Alpha=\"same\" />");
   uint64_t n = 0;
-  CHECK(parseSeq(seqMetadata(7, 1234), n));
+  CHECK(parseSeq(seqMetadata(7, AlphaPart{1234, false}), n));
   CHECK(n == 7);
-  CHECK(parseAlphaBytes(seqMetadata(7, 1234)) == 1234);
-  CHECK(parseAlphaBytes(seqMetadata(7)) == 0);
-  CHECK(parseAlphaBytes("") == 0);
-  CHECK(parseAlphaBytes("<OMTHX Seq=\"7\" Alpha=\"\" />") == 0);
-  CHECK(parseAlphaBytes("<OMTHX Seq=\"7\" Alpha=\"12") == 0);                  // cut short
-  CHECK(parseAlphaBytes("<OMTHX Seq=\"7\" /><Other Alpha=\"5\" />") == 0);   // not the OMTHX element's
+  CHECK(parseSeq(seqMetadata(8, AlphaPart{0, true}), n));
+  CHECK(n == 8);
+  AlphaPart a = parseAlpha(seqMetadata(7, AlphaPart{1234, false}));
+  CHECK(a.bytes == 1234);
+  CHECK_FALSE(a.repeats);
+  a = parseAlpha(seqMetadata(7, AlphaPart{0, true}));
+  CHECK(a.bytes == 0);
+  CHECK(a.repeats);
+  CHECK(a.any());
+  CHECK_FALSE(parseAlpha(seqMetadata(7)).any());
+  CHECK_FALSE(parseAlpha("").any());
+  CHECK_FALSE(parseAlpha("<OMTHX Seq=\"7\" Alpha=\"\" />").any());
+  CHECK_FALSE(parseAlpha("<OMTHX Seq=\"7\" Alpha=\"12").any());                 // cut short
+  CHECK_FALSE(parseAlpha("<OMTHX Seq=\"7\" Alpha=\"sam").any());
+  CHECK_FALSE(parseAlpha("<OMTHX Seq=\"7\" /><Other Alpha=\"5\" />").any());  // not the OMTHX element's
 }
 
 TEST_CASE("copyNv12 drops row padding and stretches limited range to full") {
@@ -342,50 +353,43 @@ TEST_CASE("packUyvy stacks the alpha plane and premultiplies straight colour in 
   CHECK_THROWS_AS(packUyvy(f, uyvy.data(), stride, nullptr, 0, false, straight), std::invalid_argument);
 }
 
-TEST_CASE("pack with a separate alpha picture keeps the fill at display size") {
+TEST_CASE("pack with a separate alpha plane keeps the fill at display size") {
   const VideoFormat f{64, 40, 60, 1, true};
   std::vector<uint8_t> src = flat(64, 40, 200, 100, 50, 255);
   for (int y = 0; y < 40; ++y)
     for (int x = 0; x < 32; ++x) src[(static_cast<size_t>(y) * 64 + x) * 4 + 3] = 128;  // left half see-through
 
   Packer packer;
-  Nv12 fill, alpha, stacked;
+  Nv12 fill, stacked;
+  std::vector<uint8_t> alpha;
   packer.pack(f, src, false, fill, &alpha);
   packer.pack(f, src, false, stacked);
   REQUIRE(fill.height == 40);
   REQUIRE(fill.y.size() == 64u * 40);
   REQUIRE(fill.uv.size() == 64u * 20);
-  REQUIRE(alpha.width == 64);
-  REQUIRE(alpha.height == 40);
-  REQUIRE(alpha.y.size() == 64u * 40);
-  REQUIRE(alpha.uv.size() == 64u * 20);
-  // the fill is the top of the stacked picture, and the alpha picture is its alpha half
+  REQUIRE(alpha.size() == 64u * 40);
+  // the fill is the top of the stacked picture, and the alpha plane is its alpha half
   CHECK(std::equal(fill.y.begin(), fill.y.end(), stacked.y.begin()));
   CHECK(std::equal(fill.uv.begin(), fill.uv.end(), stacked.uv.begin()));
-  CHECK(std::equal(alpha.y.begin(), alpha.y.end(), stacked.y.begin() + 48 * 64));
-  CHECK(alpha.y[20 * 64 + 8] == 128);
-  CHECK(alpha.y[20 * 64 + 40] == 255);
-  CHECK(std::all_of(alpha.uv.begin(), alpha.uv.end(), [](uint8_t c) { return c == 128; }));
+  CHECK(std::equal(alpha.begin(), alpha.end(), stacked.y.begin() + 48 * 64));
+  CHECK(alpha[20 * 64 + 8] == 128);
+  CHECK(alpha[20 * 64 + 40] == 255);
 
   std::vector<uint8_t> back, backStacked;
-  packer.unpack(f, fill, back, &alpha);
+  packer.unpack(f, fill, back, alpha.data());
   packer.unpack(f, stacked, backStacked);
   CHECK(back == backStacked);
   CHECK(back[(20 * 64 + 8) * 4 + 3] == 128);
-
-  Nv12 small = alpha;
-  small.height = 20;
-  CHECK_THROWS_AS(packer.unpack(f, fill, back, &small), std::invalid_argument);
   CHECK_THROWS_AS(packer.unpack(f, fill, back), std::invalid_argument);  // too short to hold stacked alpha
 
-  // Without alpha in the format, the alpha picture is left alone.
-  Nv12 untouched;
+  // Without alpha in the format, the alpha plane is left alone.
+  std::vector<uint8_t> untouched;
   packer.pack(VideoFormat{64, 40, 60, 1, false}, src, false, fill, &untouched);
   CHECK(fill.height == 40);
-  CHECK(untouched.y.empty());
+  CHECK(untouched.empty());
 }
 
-TEST_CASE("packUyvy with a separate alpha picture, and unpackUyvy back to UYVA") {
+TEST_CASE("packUyvy with a separate alpha plane, and unpackUyvy back to UYVA") {
   const VideoFormat f{64, 40, 60, 1, true};
   const int stride = 140, alphaStride = 70;  // both padded
   std::vector<uint8_t> uyvy(static_cast<size_t>(stride) * 40), alpha(static_cast<size_t>(alphaStride) * 40);
@@ -397,19 +401,19 @@ TEST_CASE("packUyvy with a separate alpha picture, and unpackUyvy back to UYVA")
       alpha[static_cast<size_t>(r) * alphaStride + x] = x < 32 ? 128 : 255;
     }
   }
-  Nv12 fill, alphaPic, stacked;
-  packUyvy(f, uyvy.data(), stride, alpha.data(), alphaStride, false, fill, &alphaPic);
+  Nv12 fill, stacked;
+  std::vector<uint8_t> plane;
+  packUyvy(f, uyvy.data(), stride, alpha.data(), alphaStride, false, fill, &plane);
   packUyvy(f, uyvy.data(), stride, alpha.data(), alphaStride, false, stacked);
   REQUIRE(fill.height == 40);
-  REQUIRE(alphaPic.height == 40);
+  REQUIRE(plane.size() == 64u * 40);  // the padding is gone
   CHECK(std::equal(fill.y.begin(), fill.y.end(), stacked.y.begin()));
   CHECK(std::equal(fill.uv.begin(), fill.uv.end(), stacked.uv.begin()));
-  CHECK(alphaPic.y[20 * 64 + 8] == 128);
-  CHECK(alphaPic.y[39 * 64 + 63] == 255);
-  CHECK(alphaPic.uv[10 * 64 + 9] == 128);
+  CHECK(plane[20 * 64 + 8] == 128);
+  CHECK(plane[39 * 64 + 63] == 255);
 
   std::vector<uint8_t> back, backStacked;
-  unpackUyvy(f, fill, back, &alphaPic);
+  unpackUyvy(f, fill, back, plane.data());
   unpackUyvy(f, stacked, backStacked);
   CHECK(back == backStacked);
   REQUIRE(back.size() == 64u * 2 * 40 + 64u * 40);

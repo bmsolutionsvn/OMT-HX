@@ -23,6 +23,9 @@ set_target_properties(libvmx PROPERTIES PREFIX "" OUTPUT_NAME libvmx CXX_STANDAR
 target_compile_definitions(libvmx PRIVATE VMXCODEC_EXPORTS _WINDOWS _USRDLL NDEBUG)
 target_compile_options(libvmx PRIVATE /O2 /W0 /WX-)  # upstream code: its warnings are not ours to fail on
 set_source_files_properties("${OMT_DIR}/libvmx/src/vmxcodec_avx2.cpp" PROPERTIES COMPILE_OPTIONS /arch:AVX2)
+# omthx calls libvmx itself, for VMX alpha: vmxcodec.h, with the functions imported from libvmx.dll.
+target_include_directories(libvmx INTERFACE "${OMT_DIR}/libvmx/src")
+target_compile_definitions(libvmx INTERFACE "VMX_API=__declspec(dllimport)")
 
 # ---- libomt: libomtnet (C#) compiled by .NET Native AOT into a native DLL with a C API.
 # dotnet writes into each submodule's bin/ and obj/, which the submodules ignore.
