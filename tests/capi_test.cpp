@@ -1,6 +1,7 @@
 // The C API the OBS plugin calls: a sender and a receiver in each mode, with video, audio and tally.
 #include <doctest/doctest.h>
 
+#include <atomic>
 #include <chrono>
 #include <thread>
 #include <vector>
@@ -38,6 +39,24 @@ struct Pump {
 TEST_CASE("the C API sends and receives an Hx picture") {
   Pump pump("capi-hx", OMTHX_C_MODE_HX, OMTHX_C_CODEC_H264);
   REQUIRE_MESSAGE(pump.sender != nullptr, omthx_c_error());
+  REQUIRE(pump.sendVideo());
+  // probe reads a frame that arrives after it connects, so keep the source sending meanwhile.
+  std::atomic<bool> sending{true};
+  std::thread pumpThread([&] {
+    while (sending) {
+      pump.sendVideo();
+      std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+  });
+  omthx_c_video_format probed{};
+  int probeMode = -1, probeCodec = -1;
+  const int probeOk = omthx_c_probe(omthx_c_sender_address(pump.sender), 3000, &probed, &probeMode, &probeCodec);
+  sending = false;
+  pumpThread.join();
+  CHECK(probeOk == 1);
+  CHECK(probeMode == OMTHX_C_MODE_HX);
+  CHECK(probeCodec == OMTHX_C_CODEC_H264);
+  CHECK(probed.width == pump.format.width);
   omthx_c_receiver* receiver = omthx_c_receiver_open(omthx_c_sender_address(pump.sender));
   REQUIRE_MESSAGE(receiver != nullptr, omthx_c_error());
   omthx_c_receiver_keyframe(receiver);

@@ -60,6 +60,10 @@ OMTHX_C_API void omthx_c_sender_keyframe(omthx_c_sender* sender);
 // "HOSTNAME (name)", the string a receiver connects to.
 OMTHX_C_API const char* omthx_c_sender_address(omthx_c_sender* sender);
 
+// What a source sends, read from the header of one of its video frames, without decoding.
+// 1 when a picture arrived, 0 on timeout; format/mode/codec are written only on 1.
+OMTHX_C_API int omthx_c_probe(const char* address, int timeout_ms, omthx_c_video_format* format, int* mode, int* codec);
+
 // Reads one source in either mode. Pictures come back BGRA, premultiplied when the format has alpha.
 OMTHX_C_API omthx_c_receiver* omthx_c_receiver_open(const char* address);
 OMTHX_C_API void omthx_c_receiver_close(omthx_c_receiver* receiver);

@@ -139,6 +139,26 @@ void omthx_c_sender_keyframe(omthx_c_sender* sender) {
 
 const char* omthx_c_sender_address(omthx_c_sender* sender) { return sender ? sender->address.c_str() : ""; }
 
+int omthx_c_probe(const char* address, int timeout_ms, omthx_c_video_format* format, int* mode, int* codec) {
+  if (!address || !*address) return fail("probe: an empty address");
+  try {
+    omthx::SourceInfo info;
+    if (!omthx::probe(address, timeout_ms, info)) return 0;
+    if (format) {
+      format->width = info.format.width;
+      format->height = info.format.height;
+      format->fps_n = info.format.fpsN;
+      format->fps_d = info.format.fpsD;
+      format->alpha = info.format.alpha ? 1 : 0;
+    }
+    if (mode) *mode = info.mode == omthx::Mode::Hx ? OMTHX_C_MODE_HX : OMTHX_C_MODE_FULL;
+    if (codec) *codec = info.codec == omthx::Codec::H264 ? OMTHX_C_CODEC_H264 : OMTHX_C_CODEC_HEVC;
+    return 1;
+  } catch (const std::exception& e) {
+    return fail(e);
+  }
+}
+
 omthx_c_receiver* omthx_c_receiver_open(const char* address) {
   if (!address || !*address) {
     fail("receiver_open: an empty address");
