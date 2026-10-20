@@ -145,6 +145,8 @@ class Encoder {
   int64_t index_ = 0;
   int64_t owed_ = 0;         // pictures sent whose packet has not come out yet
   int64_t frameUs_ = 16'667;  // how long encode waits for its packet
+  bool planar_ = false;      // libx265 takes YUV420P: NV12's chroma is split before encode
+  std::vector<uint8_t> u_, v_;
   void* timer_ = nullptr;     // a high-resolution waitable timer for the short waits
 };
 

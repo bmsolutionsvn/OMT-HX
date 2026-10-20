@@ -34,6 +34,24 @@ alpha rows repeated at 60 s. The rows without alpha were close to their 2026-10-
 - **Matte quality** is lower than stacked. The test suite reads mean alpha error 0.128 end to end, and
   0.086 for the plane alone at medium (VMX quality 70), against 0.030 for stacked alpha.
 
+### Alpha quality: Low, Medium, High
+
+Alpha is not a setting: it always codes at High (VMX quality 90), because the plane is small. The three
+qualities were measured before fixing that. Same PC and tools, `-Seconds 20`, 1080p60 alpha, the fill at
+medium; only the alpha plane's quality changed. Plane figures are from the test suite's 1080p matte.
+
+| Alpha | VMX quality | Plane bytes/frame | Plane error | HEVC Mbps | H.264 Mbps | HEVC send ms |
+|-------|-------------|-------------------|-------------|-----------|------------|--------------|
+| Low | 52 | 14,261 | 0.103 | 36.6 | 48.1 | 10.1 |
+| Medium | 70 | 14,755 | 0.086 | 36.9 | 48.3 | 10.5 |
+| High | 90 | 17,508 | 0.037 | 38.2 | 49.7 | 10.6 |
+
+- High costs 1.6 Mbps more than Low at 1080p60 HEVC (1.6 at H.264) and holds the same 60 / 60, at
+  21 to 23 ms delay. Low and Medium are within 0.3 Mbps of each other because VMX's flat-block floor
+  dominates a matte; High's larger plane is the one that visibly improves the edge.
+- Encode time is unchanged to within 0.5 ms: the fill's GPU code dominates, and alpha runs beside it.
+  The cost is bandwidth, not time, so High is the default.
+
 ## 2026-10-19: after the latency and CPU work
 
 Same PC, same tools, `scripts\measure.ps1 -Seconds 15`, on the final build of the change. What changed

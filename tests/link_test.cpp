@@ -428,7 +428,9 @@ TEST_CASE("an HX source re-coded through a Gpu receiver stays in video memory") 
   CHECK(out.uyvy.size() == 640u * 360 * 3);
   CHECK(downstream.stats().codec == to);
   MESSAGE("re-coded by " << recoded.stats().encoder);
+#ifdef _WIN32
   CHECK(recoded.stats().encoder.find("(d3d11)") != std::string::npos);  // no copy through memory
+#endif
   CHECK(recoded.stats().encoder.ends_with(" + vmx alpha"));              // alpha re-coded by VMX
   REQUIRE(frame.gpu);
   CHECK(download(frame, PixelFormat::Uyvy));

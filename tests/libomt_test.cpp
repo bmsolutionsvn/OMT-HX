@@ -8,6 +8,8 @@
 
 #include <libomt.h>
 
+#include "omthx/omthx.h"
+
 namespace {
 constexpr int kHevc = 0x43564548;
 constexpr int kH264 = 0x34363248;
@@ -91,3 +93,11 @@ TEST_CASE("libomt: HEVC and H264 frames pass through and plain OMT still works")
   CHECK(asked);  // a receiver's message reaches the sender
   CHECK(tally);
 }
+TEST_CASE("discover returns promptly") {
+  const auto start = std::chrono::steady_clock::now();
+  const auto names = omthx::discover();
+  const auto took = std::chrono::steady_clock::now() - start;
+  CHECK(took < std::chrono::seconds(5));
+  (void)names;  // empty without a discovery daemon; that is fine
+}
+

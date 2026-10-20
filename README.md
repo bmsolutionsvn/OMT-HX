@@ -12,18 +12,35 @@ plain OMT or OMT-HX; one `Receiver` reads both.
 
 ## Build and test
 
-Needs Windows x64, Visual Studio 2022 or newer with the C++ desktop workload, the .NET 8 SDK and git.
+Needs the .NET 8 SDK and git, plus either Visual Studio 2022 (C++ desktop workload, vcpkg) on Windows or a
+C++ toolchain and FFmpeg on Linux.
+
+Windows x64:
 
 ```powershell
 git clone --recurse-submodules https://github.com/bmsolutionsvn/OMT-HX
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test.ps1
 ```
 
+Linux x64 and arm64 (Ubuntu 24.04, GCC 13 or Clang 17):
+
+```bash
+sudo apt install build-essential cmake ninja-build pkg-config clang zlib1g-dev \
+  libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev \
+  doctest-dev avahi-daemon libavahi-client3
+git clone --recurse-submodules https://github.com/bmsolutionsvn/OMT-HX
+bash scripts/test.sh
+```
+
+Discovery needs `avahi-daemon` running; senders still accept connections by address without it. FFmpeg is
+linked from the distribution (LGPL), so the build uses the same libavcodec the system has. On a PC without a
+hardware encoder, Hx falls back to `libx265`/`libx264` on the CPU; the Hx tests then run on software.
+
 Open Media Transport is built from source, from three submodules in `omt/`: forks of
 [libomtnet](https://github.com/bmsolutionsvn/libomtnet), [libomt](https://github.com/bmsolutionsvn/libomt)
 and [libvmx](https://github.com/bmsolutionsvn/libvmx). OMT-HX's changes to OMT are commits in the
 libomtnet fork, on top of upstream. One CMake run builds everything: `libvmx.dll` from C++,
-`libomt.dll` from C# with .NET Native AOT, then omthx. The first run also installs FFmpeg through vcpkg.
+`libomt.dll` from C# with .NET Native AOT, then omthx. The first Windows run also installs FFmpeg through vcpkg.
 
 ## Try it
 
@@ -61,6 +78,10 @@ omthx::VideoFrame frame;
 if (receiver.receiveVideo(frame, 100)) { /* frame.bgra, premultiplied when it has alpha */ }
 receiver.setTally({.preview = false, .program = true});
 ```
+
+A program that cannot call C++ uses the flat C API instead: `include/omthx/omthx_c.h`, built into
+`omthx.dll`/`libomthx.so` with `-DOMTHX_SHARED=ON` and used by the OBS plugin. It opens one sender or
+receiver in either mode, and takes or returns BGRA, UYVY or NV12 pictures and planar audio.
 
 An app that passes video on (a bridge, a router) can stay in 4:2:2 YUV, the format VMX and NDI carry:
 `Sender::sendVideoUyvy` takes UYVY or UYVA (alpha plane after the UYVY plane, as OMT and NDI lay it out),
@@ -130,9 +151,10 @@ connected to exactly like a plain OMT one.
 **Codec.** Version 1 codes HEVC (H.265) or H.264 (AVC), 8-bit, 4:2:0, progressive, no B-frames,
 full-range BT.709. HEVC stays the default and is Main profile; the H.264 profile is the encoder's
 choice. Encoding runs on the GPU's hardware encoder through FFmpeg (`hevc_amf` and `h264_amf` on
-AMD, `hevc_nvenc` and `h264_nvenc` on NVIDIA); decoding uses D3D11 hardware (`hevc (d3d11va)` or
-`h264 (d3d11va)`). Plain OMT instead uses libomt's VMX codec, which is intra and has no GPU codec
-step.
+AMD, `hevc_nvenc` and `h264_nvenc` on NVIDIA, Quick Sync and Media Foundation on Windows); decoding
+uses D3D11 hardware on Windows (`hevc (d3d11va)` or `h264 (d3d11va)`) and the software decoder
+elsewhere. With no hardware encoder, `libx265`/`libx264` code on the CPU. Plain OMT instead uses
+libomt's VMX codec, which is intra and has no GPU codec step.
 
 **Colour.** Buffers cross the API as BGRA or UYVY and are converted to NV12 (BT.709, full range) on
 the CPU before the encoder. NV12 is not a choice: it is the input of every hardware encoder and the
@@ -143,7 +165,9 @@ the mode. Full OMT keeps the whole BGRA picture, so it is visually lossless.
 **Alpha (optional).** Alpha is off by default: it is a flag on the frame format
 (`VideoFormat::alpha`), and a run without it codes only the display picture at no extra cost. Turned
 on, the GPU codes the fill alone and the CPU codes alpha with VMX, OMT's own codec, as one grey plane
-(`VMX_EncodeY8`, added to the libvmx fork: no chroma, about half a normal VMX frame's work). Both ride
+(`VMX_EncodeY8`, added to the libvmx fork: no chroma, about half a normal VMX frame's work). Alpha always
+codes at High quality, since the plane is small and its cost is bandwidth; see the alpha-quality table in
+[docs/MEASUREMENTS.md](docs/MEASUREMENTS.md). Both ride
 in the same OMT frame, so there is no second connection and no second GPU session. A 1080p matte is
 14 to 25 KB a frame and about 1 ms of CPU at each end, and an alpha plane that did not change is not
 sent again ([spec section 7](docs/superpowers/specs/2026-10-12-omt-hx-design.md)). Alpha is lossy.

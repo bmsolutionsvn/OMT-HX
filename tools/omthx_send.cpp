@@ -1,7 +1,9 @@
 // Sends a moving test picture as an OMT or OMT-HX source and prints what the sender measures.
+#ifdef _WIN32
 #include <windows.h>
 
 #include <timeapi.h>
+#endif
 
 #include <chrono>
 #include <cmath>
@@ -75,7 +77,9 @@ int main(int argc, char** argv) {
 
     Sender sender(name, mode, quality, codec);
     std::printf("source: %s\n", sender.address().c_str());
+#ifdef _WIN32
     timeBeginPeriod(1);  // 1 ms sleeps instead of 15 ms
+#endif
     using Clock = std::chrono::steady_clock;
     const int64_t epoch =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count() /
@@ -109,7 +113,9 @@ int main(int argc, char** argv) {
         last = s;
       }
     }
+    #ifdef _WIN32
     timeEndPeriod(1);
+#endif
   } catch (const std::exception& e) {
     std::fprintf(stderr, "omthx-send: %s\n", e.what());
     return 1;

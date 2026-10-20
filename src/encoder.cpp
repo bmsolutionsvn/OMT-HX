@@ -8,8 +8,11 @@ extern "C" {
 
 #include <chrono>
 #include <stdexcept>
+#include <thread>
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 namespace omthx {
 namespace {
@@ -42,13 +45,23 @@ void lowDelayOptions(const std::string& name, AVDictionary** o) {
     av_dict_set(o, "rate_control", "cbr", 0);
     av_dict_set(o, "scenario", "display_remoting", 0);
     av_dict_set(o, "hw_encoding", "1", 0);
+  } else if (name == "libx265") {
+    av_dict_set(o, "preset", "ultrafast", 0);
+    av_dict_set(o, "tune", "zerolatency", 0);
+    av_dict_set(o, "x265-params", "bframes=0:repeat-headers=1", 0);
+    av_dict_set(o, "forced-idr", "1", 0);  // a requested keyframe must be an IRAP, not just an I picture
+  } else if (name == "libx264") {
+    av_dict_set(o, "preset", "ultrafast", 0);
+    av_dict_set(o, "tune", "zerolatency", 0);
   }
 }
 }  // namespace
 
 const std::vector<std::string>& Encoder::order(Codec codec) {
-  static const std::vector<std::string> hevc{"hevc_nvenc", "hevc_amf", "hevc_qsv", "hevc_mf"};
-  static const std::vector<std::string> h264{"h264_nvenc", "h264_amf", "h264_qsv", "h264_mf"};
+  // The software encoders come last: a machine without a hardware one still sends Hx (Linux, or a PC the
+  // GPU encoder refuses). libx265/libx264 are absent from some FFmpeg builds and then simply are not tried.
+  static const std::vector<std::string> hevc{"hevc_nvenc", "hevc_amf", "hevc_qsv", "hevc_mf", "libx265"};
+  static const std::vector<std::string> h264{"h264_nvenc", "h264_amf", "h264_qsv", "h264_mf", "libx264"};
   return codec == Codec::H264 ? h264 : hevc;
 }
 
@@ -67,6 +80,10 @@ Encoder::Encoder(Codec codec, int w, int h, int fpsN, int fpsD, int64_t bitrate,
     c->time_base = {fpsD, fpsN};
     c->framerate = {fpsN, fpsD};
     c->pix_fmt = AV_PIX_FMT_NV12;
+    if (name == "libx265") {  // it does not take NV12; encode() splits the chroma instead
+      c->pix_fmt = AV_PIX_FMT_YUV420P;
+      planar_ = true;
+    }
     if (gpuFrames) {  // pictures in video memory, on the decoder's own D3D11 device: nothing is copied
       c->pix_fmt = AV_PIX_FMT_D3D11;
       c->hw_frames_ctx = av_buffer_ref(gpuFrames);
@@ -92,7 +109,8 @@ Encoder::Encoder(Codec codec, int w, int h, int fpsN, int fpsD, int64_t bitrate,
       continue;
     }
     ctx_ = c;
-    name_ = name;
+    // Keep the codec first in the name the stats print: "h264 (libx264)", "hevc (libx265)".
+    name_ = name == "libx264" ? "h264 (libx264)" : name == "libx265" ? "hevc (libx265)" : name;
     break;
   }
   if (!ctx_) {
@@ -102,12 +120,16 @@ Encoder::Encoder(Codec codec, int w, int h, int fpsN, int fpsD, int64_t bitrate,
   frame_ = av_frame_alloc();
   packet_ = av_packet_alloc();
   frameUs_ = 1'000'000LL * fpsD / fpsN;
+#ifdef _WIN32
   // Sleep() waits whole timer ticks (up to 15.6 ms); this timer wakes within about half a millisecond.
   timer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+#endif
 }
 
 Encoder::~Encoder() {
+#ifdef _WIN32
   if (timer_) CloseHandle(timer_);
+#endif
   av_packet_free(&packet_);
   av_frame_free(&frame_);
   avcodec_free_context(&ctx_);
@@ -118,13 +140,32 @@ std::vector<Packet> Encoder::encode(const Nv12& pic, bool forceKeyframe) {
     throw std::invalid_argument("the picture has the wrong size for this encoder");
   // The frame borrows the picture's memory; FFmpeg copies it inside avcodec_send_frame.
   av_frame_unref(frame_);
-  frame_->format = AV_PIX_FMT_NV12;
+  frame_->format = planar_ ? AV_PIX_FMT_YUV420P : AV_PIX_FMT_NV12;
   frame_->width = pic.width;
   frame_->height = pic.height;
-  frame_->data[0] = const_cast<uint8_t*>(pic.y.data());
-  frame_->linesize[0] = pic.width;
-  frame_->data[1] = const_cast<uint8_t*>(pic.uv.data());
-  frame_->linesize[1] = pic.width;
+  if (planar_) {
+    const int cw = pic.width / 2, ch = pic.height / 2;
+    u_.resize(static_cast<size_t>(cw) * ch);
+    v_.resize(static_cast<size_t>(cw) * ch);
+    for (int r = 0; r < ch; ++r) {
+      const uint8_t* src = pic.uv.data() + static_cast<size_t>(r) * pic.width;
+      for (int x = 0; x < cw; ++x) {
+        u_[static_cast<size_t>(r) * cw + x] = src[2 * x];
+        v_[static_cast<size_t>(r) * cw + x] = src[2 * x + 1];
+      }
+    }
+    frame_->data[0] = const_cast<uint8_t*>(pic.y.data());
+    frame_->linesize[0] = pic.width;
+    frame_->data[1] = u_.data();
+    frame_->linesize[1] = cw;
+    frame_->data[2] = v_.data();
+    frame_->linesize[2] = cw;
+  } else {
+    frame_->data[0] = const_cast<uint8_t*>(pic.y.data());
+    frame_->linesize[0] = pic.width;
+    frame_->data[1] = const_cast<uint8_t*>(pic.uv.data());
+    frame_->linesize[1] = pic.width;
+  }
   return send(forceKeyframe);
 }
 
@@ -172,6 +213,7 @@ std::vector<Packet> Encoder::drain() {
       continue;
     }
     if (rc != AVERROR(EAGAIN) || owed_ == 0 || std::chrono::steady_clock::now() >= deadline) break;
+#ifdef _WIN32
     if (timer_) {
       LARGE_INTEGER due{};
       due.QuadPart = -2'000;  // 200 us, in 100 ns units; negative is relative
@@ -179,6 +221,9 @@ std::vector<Packet> Encoder::drain() {
     } else {
       SwitchToThread();
     }
+#else
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
+#endif
   }
   return out;
 }

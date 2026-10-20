@@ -10,10 +10,16 @@
 // OMTHX_STATIC (OMT-HX's CMake target omthx does it for you).
 #if defined(OMTHX_STATIC)
 #define OMTHX_API
-#elif defined(OMTHX_BUILD_DLL)
+#elif defined(_WIN32)
+#if defined(OMTHX_BUILD_DLL)
 #define OMTHX_API __declspec(dllexport)
 #else
 #define OMTHX_API __declspec(dllimport)
+#endif
+#elif defined(OMTHX_BUILD_DLL)
+#define OMTHX_API __attribute__((visibility("default")))
+#else
+#define OMTHX_API
 #endif
 #ifdef _MSC_VER
 #pragma warning(push)

@@ -73,6 +73,7 @@ jobs:
 
           # omthx: header, import library, DLL; libomt's C API beside it; every DLL they load at run time
           Copy-Item include\omthx\omthx.h (Join-Path $lib 'include\omthx')
+          Copy-Item include\omthx\omthx_c.h (Join-Path $lib 'include\omthx')
           Copy-Item omt\libomt\libomt.h, omt\libomt\bin\Release\net8.0\win-x64\native\libomt.lib $lib
           Copy-Item "$build\omthx.lib", "$build\omthx-send.exe", "$build\omthx-recv.exe" $lib
           Copy-Item "$build\*.dll" $lib
@@ -111,6 +112,44 @@ jobs:
         with:
           name: ${{ steps.package.outputs.name }}
           path: ${{ steps.package.outputs.zip }}
+
+  # Linux x64 and arm64: no GPU on the runners, so the Hx tests that want a hardware encoder skip. The
+  # C API and codec tests still run through the libx264/libx265 fallback.
+  linux-x64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config clang zlib1g-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev \
+            doctest-dev avahi-daemon libavahi-client3
+      - name: Build and test
+        run: bash scripts/test.sh
+
+  linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config clang zlib1g-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev \
+            doctest-dev avahi-daemon libavahi-client3
+      - name: Build and test
+        run: bash scripts/test.sh
 
   # Separate, so the build above never holds write access. GitHub's own actions and the gh CLI only.
   release:

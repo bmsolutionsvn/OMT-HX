@@ -44,9 +44,11 @@ std::vector<int> parameterSets(Codec codec) {
 bool startsWith(const std::string& text, const char* prefix) { return text.rfind(prefix, 0) == 0; }
 }  // namespace
 
-TEST_CASE("Encoder::order lists four hardware encoders of the chosen codec, NVIDIA first") {
-  CHECK(Encoder::order(Codec::Hevc) == std::vector<std::string>{"hevc_nvenc", "hevc_amf", "hevc_qsv", "hevc_mf"});
-  CHECK(Encoder::order(Codec::H264) == std::vector<std::string>{"h264_nvenc", "h264_amf", "h264_qsv", "h264_mf"});
+TEST_CASE("Encoder::order lists the encoders of the chosen codec, NVIDIA first and software last") {
+  CHECK(Encoder::order(Codec::Hevc) ==
+        std::vector<std::string>{"hevc_nvenc", "hevc_amf", "hevc_qsv", "hevc_mf", "libx265"});
+  CHECK(Encoder::order(Codec::H264) ==
+        std::vector<std::string>{"h264_nvenc", "h264_amf", "h264_qsv", "h264_mf", "libx264"});
 }
 
 TEST_CASE("Encoder: a picture no hardware takes throws and names every encoder of that codec") {

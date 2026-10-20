@@ -134,7 +134,8 @@ void Sender::Impl::openEncoder(const VideoFormat& fmt, bool vmx, AVBufferRef* gp
   auto fill = std::make_unique<Encoder>(codec, fmt.width, sep ? fmt.height : codedHeight(fmt), fmt.fpsN, fmt.fpsD,
                                         sep ? fillBitrate(fmt, quality, codec) : targetBitrate(fmt, quality, codec),
                                         gpuFrames);
-  if (sep) alphaEncoder = std::make_unique<AlphaEncoder>(fmt.width, fmt.height, quality);
+  // Alpha quality is not a setting: the plane is small, so it always codes at High.
+  if (sep) alphaEncoder = std::make_unique<AlphaEncoder>(fmt.width, fmt.height, Quality::High);
   encoder = std::move(fill);
   format = fmt;
   vmxAlpha = sep;
