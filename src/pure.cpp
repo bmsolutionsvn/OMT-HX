@@ -88,14 +88,19 @@ bool isGap(int64_t previous, int64_t current, int fpsN, int fpsD) {
   return step <= 0 || step > frame + frame / 2;
 }
 
-std::string seqMetadata(uint64_t seq, AlphaPart alpha) {
+std::string seqMetadata(uint64_t seq, AlphaPart alpha, bool preview) {
   std::string m = "<OMTHX Seq=\"" + std::to_string(seq) + "\"";
   if (alpha.bytes) {
     m += " Alpha=\"" + std::to_string(alpha.bytes) + "\"";
   } else if (alpha.repeats) {
     m += " Alpha=\"same\"";
   }
+  if (preview) m += " Preview=\"true\"";
   return m + " />";
+}
+
+bool isPreviewStream(std::string_view m) {
+  return m.find("<OMTHX ") != std::string_view::npos && m.find(" Preview=\"true\"") != std::string_view::npos;
 }
 
 bool parseSeq(std::string_view m, uint64_t& out) {
@@ -327,6 +332,42 @@ void copyNv12(const VideoFormat& f, const uint8_t* y, int yStride, const uint8_t
   };
   copy(out.y.data(), y, yStride, h, kLuma);
   copy(out.uv.data(), uv, uvStride, h / 2, kChroma);
+}
+
+VideoFormat previewFormat(const VideoFormat& f) {
+  VideoFormat p = f;
+  p.alpha = false;
+  p.width = std::min(f.width, 640) & ~1;
+  p.height = std::max(2, static_cast<int>(std::lround(static_cast<double>(f.height) * p.width / f.width)) & ~1);
+  return p;
+}
+
+Shrinker::~Shrinker() { sws_freeContext(sws_); }
+
+void Shrinker::shrink(const Nv12& in, int w, int h, int ow, int oh, Nv12& out) {
+  out.width = ow;
+  out.height = oh;
+  if (w == ow && h == oh) {  // a source no wider than a preview: its fill rows as they are
+    out.y.assign(in.y.begin(), in.y.begin() + static_cast<ptrdiff_t>(ow) * oh);
+    out.uv.assign(in.uv.begin(), in.uv.begin() + static_cast<ptrdiff_t>(ow) * oh / 2);
+    return;
+  }
+  const int size[4] = {w, h, ow, oh};
+  if (!sws_ || !std::equal(size, size + 4, size_)) {
+    sws_freeContext(sws_);
+    sws_ = sws_getContext(w, h, AV_PIX_FMT_NV12, ow, oh, AV_PIX_FMT_NV12, SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!sws_) throw std::runtime_error("cannot create the preview scaler");
+    const int* bt709 = sws_getCoefficients(SWS_CS_ITU709);
+    sws_setColorspaceDetails(sws_, bt709, 1, bt709, 1, 0, 1 << 16, 1 << 16);  // full range in and out: no change
+    std::copy(size, size + 4, size_);
+  }
+  out.y.resize(static_cast<size_t>(ow) * oh);
+  out.uv.resize(static_cast<size_t>(ow) * oh / 2);
+  const uint8_t* src[2] = {in.y.data(), in.uv.data()};
+  const int srcStride[2] = {in.width, in.width};
+  uint8_t* dst[2] = {out.y.data(), out.uv.data()};
+  const int dstStride[2] = {ow, ow};
+  sws_scale(sws_, src, srcStride, 0, h, dst, dstStride);
 }
 
 Packer::~Packer() {

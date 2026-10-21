@@ -98,6 +98,41 @@ TEST_CASE("alphaTop rounds up to 16 and codedHeight doubles it only with alpha")
   CHECK(codedHeight(VideoFormat{1920, 1080, 60, 1, false}) == 1080);
 }
 
+TEST_CASE("previewFormat is 640 wide at most, keeps the shape and rate, has even sizes and no alpha") {
+  CHECK(previewFormat(VideoFormat{1920, 1080, 50, 1, true}) == VideoFormat{640, 360, 50, 1, false});
+  CHECK(previewFormat(VideoFormat{3840, 2160, 60, 1, false}) == VideoFormat{640, 360, 60, 1, false});
+  CHECK(previewFormat(VideoFormat{1080, 1920, 30, 1, false}) == VideoFormat{640, 1138, 30, 1, false});
+  CHECK(previewFormat(VideoFormat{321, 241, 60, 1, false}) == VideoFormat{320, 240, 60, 1, false});
+}
+
+TEST_CASE("a preview stream's frames say so in their metadata, and keep their number") {
+  const std::string m = seqMetadata(7, {}, true);
+  uint64_t seq = 0;
+  CHECK(isPreviewStream(m));
+  CHECK(parseSeq(m, seq));
+  CHECK(seq == 7);
+  CHECK_FALSE(isPreviewStream(seqMetadata(7)));
+  CHECK_FALSE(isPreviewStream(seqMetadata(7, AlphaPart{100, false})));
+  CHECK_FALSE(isPreviewStream(""));
+}
+
+TEST_CASE("Shrinker scales the fill rows of a picture down") {
+  Nv12 in{64, 64, std::vector<uint8_t>(64 * 64, 200), std::vector<uint8_t>(64 * 32, 90)};
+  std::fill(in.y.begin() + 32 * 64, in.y.end(), 10);  // rows below the fill, as in a stacked picture
+  Nv12 out;
+  Shrinker s;
+  s.shrink(in, 64, 32, 16, 8, out);
+  CHECK(out.width == 16);
+  CHECK(out.height == 8);
+  CHECK(out.y.size() == 16u * 8);
+  CHECK(out.uv.size() == 16u * 4);
+  CHECK(std::all_of(out.y.begin(), out.y.end(), [](uint8_t v) { return v > 195 && v < 205; }));
+  CHECK(std::all_of(out.uv.begin(), out.uv.end(), [](uint8_t v) { return v > 85 && v < 95; }));
+  s.shrink(in, 64, 32, 64, 32, out);  // the same size: the fill rows copied
+  CHECK(out.y == std::vector<uint8_t>(64 * 32, 200));
+  CHECK(out.uv == std::vector<uint8_t>(64 * 16, 90));
+}
+
 TEST_CASE("isGap flags a timestamp step of more than one and a half frames, or backwards") {
   CHECK_FALSE(isGap(0, 166'667, 60, 1));
   CHECK_FALSE(isGap(1'000'000, 1'166'666, 60, 1));

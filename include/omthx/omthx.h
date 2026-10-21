@@ -98,6 +98,7 @@ struct CodedFrame {
 };
 
 // One OMT source. sendVideo and sendAudio may run on two threads, but each must stay on its own.
+// In Mode::Hx, while a receiver asks for preview, the sendVideo calls also code a small preview stream for it.
 // requestKeyframe, keyframeRequested, tally and stats are safe from any thread.
 class OMTHX_API Sender {
  public:
@@ -169,7 +170,11 @@ struct ReceiverStats {
 // but each must stay on its own. requestKeyframe is safe from any thread.
 class OMTHX_API Receiver {
  public:
-  explicit Receiver(const std::string& address, PixelFormat pixels = PixelFormat::Bgra);
+  // preview: a small picture for multiviews, as NDI's lowest bandwidth: a plain OMT source sends its VMX preview,
+  // an Hx source a second stream about 640 wide (the fill only, without alpha), or its full stream when it is
+  // older than this version or relays coded frames. VideoFrame::format is the size of the picture handed back.
+  // Coded receivers ignore it.
+  explicit Receiver(const std::string& address, PixelFormat pixels = PixelFormat::Bgra, bool preview = false);
   ~Receiver();
   Receiver(const Receiver&) = delete;
   Receiver& operator=(const Receiver&) = delete;

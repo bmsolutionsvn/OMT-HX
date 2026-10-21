@@ -60,12 +60,36 @@ OMTHX_C_API void omthx_c_sender_keyframe(omthx_c_sender* sender);
 // "HOSTNAME (name)", the string a receiver connects to.
 OMTHX_C_API const char* omthx_c_sender_address(omthx_c_sender* sender);
 
+// Counters for the stats panel. Port and subscriber counts are not in omthx's sender stats.
+typedef struct omthx_c_sender_counters {
+  uint64_t frames_sent;
+  uint64_t keyframes;
+  uint64_t bytes_sent;
+  uint64_t frames_dropped;
+  double encode_ms;  // Hx only: pack and encode of the last frame
+  int connections;
+} omthx_c_sender_counters;
+
+typedef struct omthx_c_receiver_counters {
+  int mode;  // OMTHX_C_MODE_*
+  int codec;
+  uint64_t frames_received;
+  uint64_t frames_discarded;
+  uint64_t bytes_received;
+  double decode_ms;  // Hx only: decode and unpack of the last frame
+} omthx_c_receiver_counters;
+
+OMTHX_C_API int omthx_c_sender_get_counters(omthx_c_sender* sender, omthx_c_sender_counters* out);
+OMTHX_C_API int omthx_c_receiver_get_counters(omthx_c_receiver* receiver, omthx_c_receiver_counters* out);
+
 // What a source sends, read from the header of one of its video frames, without decoding.
 // 1 when a picture arrived, 0 on timeout; format/mode/codec are written only on 1.
 OMTHX_C_API int omthx_c_probe(const char* address, int timeout_ms, omthx_c_video_format* format, int* mode, int* codec);
 
 // Reads one source in either mode. Pictures come back BGRA, premultiplied when the format has alpha.
-OMTHX_C_API omthx_c_receiver* omthx_c_receiver_open(const char* address);
+// `preview` asks for the small multiview stream (NDI's lowest bandwidth): plain OMT's VMX preview,
+// or an Hx source's second ~640-wide stream.
+OMTHX_C_API omthx_c_receiver* omthx_c_receiver_open(const char* address, int preview);
 OMTHX_C_API void omthx_c_receiver_close(omthx_c_receiver* receiver);
 // 1 with a picture, 0 on timeout or a frame still waiting for a keyframe. `bgra` is valid until the next call.
 OMTHX_C_API int omthx_c_receiver_video(omthx_c_receiver* receiver, int timeout_ms, omthx_c_video_format* format,

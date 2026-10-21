@@ -48,7 +48,10 @@ struct AlphaPart {
   bool repeats = false;  // the frame carries no alpha: the previous frame's alpha holds
   bool any() const { return bytes > 0 || repeats; }
 };
-std::string seqMetadata(uint64_t seq, AlphaPart alpha = {});
+// preview: the frame belongs to the preview stream. libomt flags every frame it sends a preview receiver as
+// Preview, so only this tells a preview stream from a full stream sent to a preview receiver.
+std::string seqMetadata(uint64_t seq, AlphaPart alpha = {}, bool preview = false);
+bool isPreviewStream(std::string_view metadata);
 bool parseSeq(std::string_view metadata, uint64_t& out);  // false when the metadata carries no number
 AlphaPart parseAlpha(std::string_view metadata);           // nothing set for a frame without VMX alpha
 
@@ -109,6 +112,24 @@ class Packer {
   int width_ = 0;
   int height_ = 0;
   std::vector<uint8_t> scratch_;
+};
+
+// Preview, NDI's proxy stream: an Hx sender codes a second, smaller stream for receivers that asked for preview.
+// 640 wide as NDI's (the source's width when narrower), the source's shape, even sizes; the fill only, no alpha.
+VideoFormat previewFormat(const VideoFormat& source);
+
+// Scales the top `height` rows of an NV12 picture (a stacked picture's fill) to out's size, bilinear.
+class Shrinker {
+ public:
+  Shrinker() = default;
+  ~Shrinker();
+  Shrinker(const Shrinker&) = delete;
+  Shrinker& operator=(const Shrinker&) = delete;
+  void shrink(const Nv12& in, int width, int height, int outWidth, int outHeight, Nv12& out);
+
+ private:
+  SwsContext* sws_ = nullptr;
+  int size_[4] = {};
 };
 
 struct Packet {

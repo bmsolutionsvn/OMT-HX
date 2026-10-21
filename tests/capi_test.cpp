@@ -57,7 +57,7 @@ TEST_CASE("the C API sends and receives an Hx picture") {
   CHECK(probeMode == OMTHX_C_MODE_HX);
   CHECK(probeCodec == OMTHX_C_CODEC_H264);
   CHECK(probed.width == pump.format.width);
-  omthx_c_receiver* receiver = omthx_c_receiver_open(omthx_c_sender_address(pump.sender));
+  omthx_c_receiver* receiver = omthx_c_receiver_open(omthx_c_sender_address(pump.sender), 0);
   REQUIRE_MESSAGE(receiver != nullptr, omthx_c_error());
   omthx_c_receiver_keyframe(receiver);
 
@@ -84,7 +84,7 @@ TEST_CASE("the C API sends and receives an Hx picture") {
 TEST_CASE("the C API carries audio and tally") {
   Pump pump("capi-audio", OMTHX_C_MODE_FULL, OMTHX_C_CODEC_HEVC);
   REQUIRE_MESSAGE(pump.sender != nullptr, omthx_c_error());
-  omthx_c_receiver* receiver = omthx_c_receiver_open(omthx_c_sender_address(pump.sender));
+  omthx_c_receiver* receiver = omthx_c_receiver_open(omthx_c_sender_address(pump.sender), 0);
   REQUIRE_MESSAGE(receiver != nullptr, omthx_c_error());
   omthx_c_receiver_tally(receiver, 1, 0);
 
@@ -110,7 +110,7 @@ TEST_CASE("the C API carries audio and tally") {
 TEST_CASE("the C API sends plain OMT too") {
   Pump pump("capi-full", OMTHX_C_MODE_FULL, OMTHX_C_CODEC_HEVC);
   REQUIRE_MESSAGE(pump.sender != nullptr, omthx_c_error());
-  omthx_c_receiver* receiver = omthx_c_receiver_open(omthx_c_sender_address(pump.sender));
+  omthx_c_receiver* receiver = omthx_c_receiver_open(omthx_c_sender_address(pump.sender), 0);
   REQUIRE_MESSAGE(receiver != nullptr, omthx_c_error());
 
   bool got = false;

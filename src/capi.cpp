@@ -139,6 +139,38 @@ void omthx_c_sender_keyframe(omthx_c_sender* sender) {
 
 const char* omthx_c_sender_address(omthx_c_sender* sender) { return sender ? sender->address.c_str() : ""; }
 
+int omthx_c_sender_get_counters(omthx_c_sender* sender, omthx_c_sender_counters* out) {
+  if (!sender || !out) return fail("sender_counters: a null argument");
+  try {
+    const omthx::SenderStats s = sender->sender->stats();
+    out->frames_sent = s.framesSent;
+    out->keyframes = s.keyframes;
+    out->bytes_sent = s.bytesSent;
+    out->frames_dropped = s.framesDropped;
+    out->encode_ms = s.lastEncodeMs;
+    out->connections = s.connections;
+    return 1;
+  } catch (const std::exception& e) {
+    return fail(e);
+  }
+}
+
+int omthx_c_receiver_get_counters(omthx_c_receiver* receiver, omthx_c_receiver_counters* out) {
+  if (!receiver || !out) return fail("receiver_counters: a null argument");
+  try {
+    const omthx::ReceiverStats s = receiver->receiver->stats();
+    out->mode = s.mode == omthx::Mode::Hx ? OMTHX_C_MODE_HX : OMTHX_C_MODE_FULL;
+    out->codec = s.codec == omthx::Codec::H264 ? OMTHX_C_CODEC_H264 : OMTHX_C_CODEC_HEVC;
+    out->frames_received = s.framesReceived;
+    out->frames_discarded = s.framesDiscarded;
+    out->bytes_received = s.bytesReceived;
+    out->decode_ms = s.lastDecodeMs;
+    return 1;
+  } catch (const std::exception& e) {
+    return fail(e);
+  }
+}
+
 int omthx_c_probe(const char* address, int timeout_ms, omthx_c_video_format* format, int* mode, int* codec) {
   if (!address || !*address) return fail("probe: an empty address");
   try {
@@ -159,14 +191,15 @@ int omthx_c_probe(const char* address, int timeout_ms, omthx_c_video_format* for
   }
 }
 
-omthx_c_receiver* omthx_c_receiver_open(const char* address) {
+omthx_c_receiver* omthx_c_receiver_open(const char* address, int preview) {
   if (!address || !*address) {
     fail("receiver_open: an empty address");
     return nullptr;
   }
   try {
     auto r = std::make_unique<omthx_c_receiver>();
-    r->receiver = std::make_unique<omthx::Receiver>(address);
+    r->receiver =
+        std::make_unique<omthx::Receiver>(address, omthx::PixelFormat::Bgra, preview != 0);
     r->decoder = r->receiver->stats().decoder;
     return r.release();
   } catch (const std::exception& e) {

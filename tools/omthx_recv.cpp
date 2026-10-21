@@ -16,7 +16,7 @@ using namespace omthx;
 namespace {
 [[noreturn]] void usage() {
   std::puts("omthx-recv --list\n"
-            "omthx-recv --source \"HOST (Name)\" [--seconds N] [--dump FILE.bmp] [--tally program|preview]\n"
+            "omthx-recv --source \"HOST (Name)\" [--seconds N] [--dump FILE.bmp] [--tally program|preview] [--preview]\n"
             "Delay is only meaningful when omthx-send runs on this PC, or both PCs share a synchronised clock.");
   std::exit(2);
 }
@@ -43,7 +43,7 @@ bool writeBmp(const std::string& path, const VideoFrame& v) {
 
 int main(int argc, char** argv) {
   std::string source, dump, tally;
-  bool list = false;
+  bool list = false, preview = false;
   int seconds = 0;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -56,6 +56,7 @@ int main(int argc, char** argv) {
     else if (a == "--seconds") seconds = std::atoi(value().c_str());
     else if (a == "--dump") dump = value();
     else if (a == "--tally") tally = value();
+    else if (a == "--preview") preview = true;  // the small picture, as NDI's lowest bandwidth
     else usage();
   }
 
@@ -68,7 +69,7 @@ int main(int argc, char** argv) {
     }
     if (source.empty()) usage();
 
-    Receiver receiver(source);
+    Receiver receiver(source, PixelFormat::Bgra, preview);
     if (!tally.empty()) receiver.setTally(Tally{tally == "preview", tally == "program"});
     using Clock = std::chrono::steady_clock;
     const auto end = Clock::now() + std::chrono::seconds(seconds);

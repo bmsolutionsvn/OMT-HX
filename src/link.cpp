@@ -106,6 +106,16 @@ struct Sender::Impl {
   Clock::time_point start = Clock::now();
   std::mutex statsMutex;
   SenderStats stats;
+  // Preview: a second, smaller stream, coded only while a receiver asks for it (libomt routes the frames).
+  std::unique_ptr<Encoder> previewEncoder;
+  VideoFormat previewSource;  // the format it was opened for
+  bool previewRefused = false;  // ponytail: no retry; preview receivers get the full stream instead
+  KeyframePolicy previewPolicy;
+  Shrinker shrinker;
+  Nv12 small, gpuCopy;
+  std::deque<int64_t> previewStamps;
+  uint64_t previewSeq = 0;
+  std::string previewMeta;
 
   // vmx: code alpha, when the format has it and VMX takes its size, with VMX rather than stacked under the fill.
   void openEncoder(const VideoFormat& fmt, bool vmx, AVBufferRef* gpuFrames = nullptr);
@@ -113,6 +123,9 @@ struct Sender::Impl {
   // Codes `picture`, or `gpu` when set, with `alphaPlane` when alpha goes by VMX, and sends what comes back.
   void sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock::time_point t0, OMTMediaFrame& f,
                    const AVFrame* gpu = nullptr);
+  // The same picture to the preview stream, when a receiver wants it. Its failure never stops the full stream.
+  void sendPreview(const VideoFormat& fmt, int64_t timestamp, int64_t nowMs, uint64_t dropped, bool requested,
+                   const AVFrame* gpu);
   void sendFull(OMTMediaFrame& f) {  // libomt encodes VMX itself
     omt_send(tx, &f);
     std::lock_guard lock(statsMutex);
@@ -231,11 +244,60 @@ void Sender::Impl::sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock:
     ++sent;
     keyframes += p.keyframe ? 1 : 0;
   }
-  std::lock_guard lock(statsMutex);
-  stats.encoder = encoder->name() + (gpu ? " (d3d11)" : "") + (alphaEncoder ? " + vmx alpha" : "");
-  stats.framesSent += sent;
-  stats.keyframes += keyframes;
-  stats.lastEncodeMs = encodeMs;
+  {
+    std::lock_guard lock(statsMutex);
+    stats.encoder = encoder->name() + (gpu ? " (d3d11)" : "") + (alphaEncoder ? " + vmx alpha" : "");
+    stats.framesSent += sent;
+    stats.keyframes += keyframes;
+    stats.lastEncodeMs = encodeMs;
+  }
+  sendPreview(fmt, timestamp, nowMs, static_cast<uint64_t>(omt.FramesDropped), requested, gpu);
+}
+
+void Sender::Impl::sendPreview(const VideoFormat& fmt, int64_t timestamp, int64_t nowMs, uint64_t dropped,
+                               bool requested, const AVFrame* gpu) {
+  if (previewRefused || omt_send_previewconnections(tx) <= 0) {
+    previewEncoder.reset();  // frees its GPU session; the next preview receiver starts a new one, with a keyframe
+    previewStamps.clear();
+    return;
+  }
+  const VideoFormat pf = previewFormat(fmt);
+  try {
+    if (!previewEncoder || !(fmt == previewSource)) {
+      previewEncoder.reset();
+      previewStamps.clear();
+      previewEncoder = std::make_unique<Encoder>(codec, pf.width, pf.height, pf.fpsN, pf.fpsD,
+                                                 targetBitrate(pf, quality, codec));
+      previewSource = fmt;
+      previewPolicy = KeyframePolicy();
+    }
+    if (gpu && !downloadNv12(gpu, gpuCopy)) throw std::runtime_error("cannot copy the picture from video memory");
+    shrinker.shrink(gpu ? gpuCopy : picture, fmt.width, fmt.height, pf.width, pf.height, small);
+    std::vector<Packet> packets = previewEncoder->encode(small, previewPolicy.next(nowMs, dropped, requested));
+    previewStamps.push_back(timestamp);
+    // Like a VMX preview, the frame carries the source's size and flags with Preview set (libomt routes by it):
+    // a probe reads the source from it. The receiver takes the picture's size from the decoder, without alpha.
+    OMTMediaFrame f = videoHeader(fmt, 0);
+    f.Codec = static_cast<OMTCodec>(codecTag(codec));
+    f.Flags = static_cast<OMTVideoFlags>(OMTVideoFlags_Preview |
+                                         (fmt.alpha ? (OMTVideoFlags_Alpha | OMTVideoFlags_PreMultiplied) : 0));
+    for (Packet& p : packets) {
+      const uint64_t n = previewSeq++;
+      if (previewStamps.empty()) continue;
+      f.Timestamp = previewStamps.front();
+      previewStamps.pop_front();
+      f.Data = p.data.data();
+      f.DataLength = static_cast<int>(p.data.size());
+      previewMeta = seqMetadata(n, {}, true);
+      f.FrameMetadata = previewMeta.data();
+      f.FrameMetadataLength = static_cast<int>(previewMeta.size() + 1);
+      omt_send(tx, &f);
+    }
+  } catch (const std::exception&) {
+    previewEncoder.reset();
+    previewStamps.clear();
+    previewRefused = true;
+  }
 }
 
 Sender::Sender(const std::string& name, Mode mode, Quality quality, Codec codec) : d_(std::make_unique<Impl>()) {
@@ -488,6 +550,7 @@ struct Receiver::Impl {
   bool lastVmx = false;
   bool haveLast = false;
   int64_t lastTimestamp = 0;
+  bool lastPreview = false;  // the last frame came from a preview stream
   bool haveSeq = false;  // the source numbers its frames (this version on); older ones are judged by timestamp
   uint64_t lastSeq = 0;
   uint64_t count = 0;    // Hx frames seen, the number given to frames of a source that does not number them
@@ -556,13 +619,14 @@ struct Receiver::Impl {
   }
 };
 
-Receiver::Receiver(const std::string& address, PixelFormat pixels) : d_(std::make_unique<Impl>()) {
+Receiver::Receiver(const std::string& address, PixelFormat pixels, bool preview) : d_(std::make_unique<Impl>()) {
   d_->pixels = pixels;
   const bool uyvy = pixels == PixelFormat::Uyvy || pixels == PixelFormat::Gpu;
   d_->rx = omt_receive_create(
       address.c_str(), static_cast<OMTFrameType>(OMTFrameType_Video | OMTFrameType_Audio | OMTFrameType_Metadata),
       uyvy ? OMTPreferredVideoFormat_UYVYorUYVA : OMTPreferredVideoFormat_BGRA,
-      pixels == PixelFormat::Coded ? OMTReceiveFlags_CompressedOnly : OMTReceiveFlags_None);
+      pixels == PixelFormat::Coded ? OMTReceiveFlags_CompressedOnly
+                                   : (preview ? OMTReceiveFlags_Preview : OMTReceiveFlags_None));
   if (!d_->rx) throw std::runtime_error("cannot connect to the OMT source \"" + address + "\"");
   if (pixels == PixelFormat::Coded) d_->stats.decoder = "none";
 }
@@ -614,6 +678,15 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
 
   // OMT-HX: the patched libomt hands the HEVC or H.264 access unit over untouched.
   if (!f->CompressedData || f->CompressedLength <= 0) return false;
+  // A preview stream's frame carries the source's size and flags, but holds a smaller fill without alpha.
+  const bool small = isPreviewStream(metadataOf(f));
+  if (small) fmt.alpha = false;
+  if (small != d_->lastPreview) {  // the source started or stopped its preview stream: a new stream, a new size
+    d_->decoder.reset();
+    d_->waiting = true;
+    d_->pendingAlpha.clear();
+    d_->lastPreview = small;
+  }
   const std::span<const uint8_t> data(static_cast<const uint8_t*>(f->CompressedData),
                                       static_cast<size_t>(f->CompressedLength));
   std::span<const uint8_t> au, vmx;
@@ -659,6 +732,10 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
       d_->pendingAlpha.pop_front();
     }
     if (!alpha) return fail();
+  }
+  if (small) {
+    fmt.width = gpu ? picture->frame->width : d_->picture.width;
+    fmt.height = gpu ? picture->frame->height : d_->picture.height;
   }
   bool ok = true;
   if (gpu) {

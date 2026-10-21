@@ -97,6 +97,12 @@ copies one out when the app needs it).
 source sent them and `Sender::sendCoded` sends them on, with keyframe requests passed back through
 `Sender::keyframeRequested` and `Receiver::requestKeyframe`.
 
+For a multiview, `Receiver(address, pixels, true)` asks for preview, as NDI's lowest bandwidth: a plain
+OMT source sends its VMX preview, and an HX source a second stream 640 wide (the fill, without alpha),
+which it codes only while a preview receiver is connected. Full receivers of the same source are not
+affected. A source older than this, or a relay of coded frames, sends preview receivers its full stream.
+The C API asks for the same with `omthx_c_receiver_open(address, 1)`.
+
 A fourth `Sender` argument picks the HX codec: `omthx::Codec::Hevc` (the default) or
 `omthx::Codec::H264`. The receiver needs no setting; it reads whichever arrives, and follows a
 source that comes back with the other codec.

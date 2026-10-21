@@ -292,6 +292,37 @@ TEST_CASE("probe names an HX source's codec") {
   CHECK(info.format == f);
 }
 
+TEST_CASE("a preview receiver of an HX source gets the small stream, beside a full receiver") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{1280, 720, 60, 1, true};
+  Sender sender("omthx-test-preview-hx", Mode::Hx, Quality::Medium);
+  Receiver full(sender.address());
+  Receiver small(sender.address(), PixelFormat::Bgra, true);
+  Pump pump(sender, f);
+
+  VideoFrame a, b;
+  REQUIRE(receiveSome(small, b, 30, 10) == 30);
+  REQUIRE(receiveSome(full, a, 30, 10) == 30);
+  CHECK(a.format == f);
+  CHECK(b.format == VideoFormat{640, 360, 60, 1, false});
+  CHECK(b.bgra.size() == 640u * 360 * 4);
+  CHECK(full.stats().bytesReceived > 2 * small.stats().bytesReceived);
+  SourceInfo info;
+  REQUIRE(probe(sender.address(), 3000, info));  // a probe asks for preview, and still reads the full size
+  CHECK(info.format == f);
+}
+
+TEST_CASE("a preview receiver of a plain OMT source gets the VMX preview") {
+  const VideoFormat f{1280, 720, 60, 1, false};
+  Sender sender("omthx-test-preview-full", Mode::Full, Quality::Medium);
+  Receiver small(sender.address(), PixelFormat::Bgra, true);
+  Pump pump(sender, f);
+  VideoFrame b;
+  REQUIRE(receiveSome(small, b, 10, 10) == 10);
+  CHECK(b.format.width < f.width);
+  CHECK(b.bgra.size() == static_cast<size_t>(b.format.width) * b.format.height * 4);
+}
+
 TEST_CASE("probe gives up on an address with nothing there") {
   SourceInfo info;
   const auto t0 = Clock::now();
