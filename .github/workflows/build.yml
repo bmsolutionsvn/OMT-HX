@@ -38,7 +38,12 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
-          git -C $env:VCPKG_INSTALLATION_ROOT fetch -q # vcpkg.json's builtin-baseline must be in its history
+          # vcpkg reads port versions from its checked-out tree, so the runner's checkout must be at least as new
+          # as vcpkg.json's builtin-baseline: check that commit out, and bootstrap the tool that goes with it.
+          $baseline = (Get-Content vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          git -C $env:VCPKG_INSTALLATION_ROOT fetch -q
+          git -C $env:VCPKG_INSTALLATION_ROOT checkout -q $baseline
+          & "$env:VCPKG_INSTALLATION_ROOT\bootstrap-vcpkg.bat" -disableMetrics
           "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
 
       # FFmpeg from source takes most of an hour; its built packages are kept between runs.
