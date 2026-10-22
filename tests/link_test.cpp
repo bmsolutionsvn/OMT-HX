@@ -526,6 +526,58 @@ TEST_CASE("an HX relay passes coded frames on, and keyframe requests back") {
   CHECK_FALSE(coded.receiveVideo(nothing, 0));  // a Coded receiver decodes nothing
 }
 
+TEST_CASE("a coded stream that starts mid-GOP shows nothing until its next keyframe") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{640, 360, 60, 1, false};
+  // Record about 1.5 s of a source, with a second keyframe asked for part way through.
+  std::vector<CodedFrame> rec;
+  {
+    Sender source("omthx-test-midgop-in", Mode::Hx, Quality::Medium, Codec::Hevc);
+    Receiver coded(source.address(), PixelFormat::Coded);
+    Pump pump(source, f);
+    const auto start = Clock::now();
+    bool asked = false;
+    for (CodedFrame c; Clock::now() - start < std::chrono::milliseconds(1500);) {
+      if (!asked && Clock::now() - start > std::chrono::milliseconds(800)) {
+        source.requestKeyframe();
+        asked = true;
+      }
+      if (coded.receiveCoded(c, 20)) rec.push_back(c);
+    }
+  }
+  size_t key = 0;  // the second keyframe
+  for (size_t i = 1; i < rec.size() && !key; ++i)
+    if (rec[i].keyframe) key = i;
+  REQUIRE(key >= 20);
+
+  // Replay from 20 frames before it, to a receiver that is already watching.
+  Sender relay("omthx-test-midgop-out", Mode::Hx, Quality::Medium);
+  Receiver downstream(relay.address());
+  for (const auto until = Clock::now() + std::chrono::seconds(5);
+       relay.stats().connections == 0 && Clock::now() < until;)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  std::thread replay([&] {
+    auto next = Clock::now();
+    for (size_t i = key - 20; i < rec.size(); ++i) {
+      relay.sendCoded(rec[i]);
+      next += std::chrono::microseconds(16'667);
+      std::this_thread::sleep_until(next);
+    }
+  });
+  VideoFrame out;
+  int64_t first = -1;
+  for (const auto until = Clock::now() + std::chrono::seconds(5); first < 0 && Clock::now() < until;) {
+    if (downstream.receiveVideo(out, 50)) first = out.timestamp;
+  }
+  replay.join();
+  // The first picture is the keyframe itself: the 20 frames before it were discarded, not decoded. Later
+  // frames are not counted: a frame lost while the decoder opens makes the receiver ask for a keyframe,
+  // which a live source answers and this replay cannot.
+  CHECK(first == rec[key].timestamp);
+  CHECK(downstream.stats().framesDiscarded >= 20);
+  CHECK(out.format == f);
+}
+
 TEST_CASE("an HX relay passes a source's VMX alpha on with its fill") {
   if (!hardware(Codec::H264)) return;
   const VideoFormat f{640, 360, 60, 1, true};
