@@ -3,9 +3,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
+#include "codec.h"
 #include "omthx/omthx_c.h"
 
 namespace {
@@ -37,6 +39,12 @@ struct Pump {
 }  // namespace
 
 TEST_CASE("the C API sends and receives an Hx picture") {
+  try {  // like link_test's hardware(): a machine with no H.264 encoder at all (a CI runner) skips this
+    omthx::Encoder probe(omthx::Codec::H264, 640, 360, 60, 1, 1'000'000);
+  } catch (const std::runtime_error& e) {
+    MESSAGE("SKIPPED, no H.264 encoder on this machine: " << e.what());
+    return;
+  }
   Pump pump("capi-hx", OMTHX_C_MODE_HX, OMTHX_C_CODEC_H264);
   REQUIRE_MESSAGE(pump.sender != nullptr, omthx_c_error());
   REQUIRE(pump.sendVideo());
