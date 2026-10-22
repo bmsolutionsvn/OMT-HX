@@ -226,16 +226,22 @@ uint8_t scaleChroma(int chroma, int alpha) {
 }
 
 using Table = std::array<uint8_t, 256>;
-Table makeTable(double offsetIn, double gain, double offsetOut) {
+// (i - offsetIn) * num / den + offsetOut, rounded half up, in integers: values such as chroma 16 land exactly
+// on .5, where floating point rounds either way depending on whether the compiler fuses the multiply-add (ARM).
+Table makeTable(int offsetIn, int num, int den, int offsetOut) {
   Table t{};
-  for (int i = 0; i < 256; ++i) t[i] = static_cast<uint8_t>(std::clamp((i - offsetIn) * gain + offsetOut + 0.5, 0.0, 255.0));
+  for (int i = 0; i < 256; ++i) {
+    const int v = 2 * (i - offsetIn) * num + (2 * offsetOut + 1) * den;  // twice the value plus a half, over 2 * den
+    const int q = v >= 0 ? v / (2 * den) : -((-v + 2 * den - 1) / (2 * den));  // floor division
+    t[i] = static_cast<uint8_t>(std::clamp(q, 0, 255));
+  }
   return t;
 }
 // Limited range (luma 16-235, chroma 16-240) to the full range the stream carries, and back.
-const Table kLumaToFull = makeTable(16, 255 / 219.0, 0);
-const Table kChromaToFull = makeTable(128, 255 / 224.0, 128);
-const Table kLumaToLimited = makeTable(0, 219 / 255.0, 16);
-const Table kChromaToLimited = makeTable(128, 224 / 255.0, 128);
+const Table kLumaToFull = makeTable(16, 255, 219, 0);
+const Table kChromaToFull = makeTable(128, 255, 224, 128);
+const Table kLumaToLimited = makeTable(0, 219, 255, 16);
+const Table kChromaToLimited = makeTable(128, 224, 255, 128);
 
 // The rows under the fill of an alpha picture repeat its last row, the alpha picture below holds `a` as
 // brightness with neutral colour, and the rows under it repeat its last row (spec section 7).
