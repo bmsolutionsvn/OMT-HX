@@ -107,6 +107,8 @@ OMTHX_C_API int omthx_c_receiver_mode(omthx_c_receiver* receiver);
 OMTHX_C_API int omthx_c_receiver_codec(omthx_c_receiver* receiver);
 // "hevc (d3d11va)", "vmx", ... for a log line.
 OMTHX_C_API const char* omthx_c_receiver_decoder(omthx_c_receiver* receiver);
+// The source's encoder, e.g. "hevc_amf (d3d11)"; empty when the source is too old to report it.
+OMTHX_C_API const char* omthx_c_receiver_encoder(omthx_c_receiver* receiver);
 
 #ifdef __cplusplus
 }

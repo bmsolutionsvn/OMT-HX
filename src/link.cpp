@@ -215,6 +215,9 @@ void Sender::Impl::sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock:
 
   f.Codec = static_cast<OMTCodec>(codecTag(codec));
   f.Flags = static_cast<OMTVideoFlags>(fmt.alpha ? (OMTVideoFlags_Alpha | OMTVideoFlags_PreMultiplied) : 0);
+  // Also goes on the wire, so a receiver can say what is encoding the picture it shows.
+  const std::string encoderName =
+      encoder->name() + (gpu ? " (d3d11)" : "") + (alphaEncoder ? " + vmx alpha" : "");
   uint64_t sent = 0, keyframes = 0;
   for (Packet& p : packets) {
     const uint64_t n = seq++;  // numbered even when not sent, so the receiver sees the loss
@@ -238,7 +241,7 @@ void Sender::Impl::sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock:
         f.DataLength = static_cast<int>(payload.size());
       }
     }
-    seqMeta = seqMetadata(n, part);
+    seqMeta = seqMetadata(n, part, false, encoderName);
     f.FrameMetadata = seqMeta.data();
     f.FrameMetadataLength = static_cast<int>(seqMeta.size() + 1);  // with the terminating null
     omt_send(tx, &f);
@@ -247,7 +250,7 @@ void Sender::Impl::sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock:
   }
   {
     std::lock_guard lock(statsMutex);
-    stats.encoder = encoder->name() + (gpu ? " (d3d11)" : "") + (alphaEncoder ? " + vmx alpha" : "");
+    stats.encoder = encoderName;
     stats.framesSent += sent;
     stats.keyframes += keyframes;
     stats.lastEncodeMs = encodeMs;
@@ -289,7 +292,7 @@ void Sender::Impl::sendPreview(const VideoFormat& fmt, int64_t timestamp, int64_
       previewStamps.pop_front();
       f.Data = p.data.data();
       f.DataLength = static_cast<int>(p.data.size());
-      previewMeta = seqMetadata(n, {}, true);
+      previewMeta = seqMetadata(n, {}, true, previewEncoder->name());
       f.FrameMetadata = previewMeta.data();
       f.FrameMetadataLength = static_cast<int>(previewMeta.size() + 1);
       omt_send(tx, &f);
@@ -487,7 +490,7 @@ void Sender::sendCoded(const CodedFrame& c) {
   f.Data = const_cast<uint8_t*>(c.data.data());
   f.DataLength = static_cast<int>(c.data.size());
   if (c.mode == Mode::Hx) {  // the source's own number, so a frame lost before this sender shows downstream too
-    d_->seqMeta = seqMetadata(c.seq, AlphaPart{c.alphaBytes, c.alphaRepeats});
+    d_->seqMeta = seqMetadata(c.seq, AlphaPart{c.alphaBytes, c.alphaRepeats}, false, c.encoder);
     f.FrameMetadata = d_->seqMeta.data();
     f.FrameMetadataLength = static_cast<int>(d_->seqMeta.size() + 1);
   }
@@ -686,12 +689,15 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
     std::lock_guard lock(d_->statsMutex);
     d_->stats.mode = Mode::Full;
     d_->stats.decoder = "vmx";
+    d_->stats.encoder = "vmx";
     ++d_->stats.framesReceived;
     return true;
   }
 
   // OMT-HX: the patched libomt hands the HEVC or H.264 access unit over untouched.
   if (!f->CompressedData || f->CompressedLength <= 0) return false;
+  // The sender's encoder, for the receiver's stats panel. Older sources do not send it.
+  const std::string_view encoder = parseEncoder(metadataOf(f));
   // A preview stream's frame carries the source's size and flags, but holds a smaller fill without alpha.
   const bool small = isPreviewStream(metadataOf(f));
   if (small) fmt.alpha = false;
@@ -776,6 +782,7 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
   d_->stats.mode = Mode::Hx;
   d_->stats.codec = codec;
   d_->stats.decoder = d_->decoder->name() + (vmxAlpha ? " + vmx alpha" : "");
+  if (!encoder.empty()) d_->stats.encoder.assign(encoder.begin(), encoder.end());
   d_->stats.lastDecodeMs = msSince(t0);
   ++d_->stats.framesReceived;
   return true;
@@ -802,12 +809,14 @@ bool Receiver::receiveCoded(CodedFrame& out, int timeoutMs) {
     out.seq = seq;
     out.alphaBytes = part.bytes;
     out.alphaRepeats = part.repeats;
+    out.encoder = parseEncoder(metadataOf(f));
   } else if (f->Codec == OMTCodec_VMX1) {
     out.mode = Mode::Full;
     out.keyframe = true;
     out.seq = 0;
     out.alphaBytes = 0;
     out.alphaRepeats = false;
+    out.encoder.clear();
   } else {
     return false;
   }

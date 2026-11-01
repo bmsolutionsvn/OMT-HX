@@ -521,6 +521,8 @@ TEST_CASE("an HX relay passes coded frames on, and keyframe requests back") {
   CHECK(out.format == f);
   CHECK(forwarded >= 1);  // the late receiver asked, and the relay passed it on
   CHECK(relay.stats().encoder == "none");
+  CHECK_FALSE(c.encoder.empty());                         // the source said what codes it
+  CHECK(downstream.stats().encoder == c.encoder);         // and the relay passed that on, not "none"
   CHECK(coded.stats().decoder == "none");
   VideoFrame nothing;
   CHECK_FALSE(coded.receiveVideo(nothing, 0));  // a Coded receiver decodes nothing

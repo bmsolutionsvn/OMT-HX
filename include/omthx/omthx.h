@@ -95,6 +95,7 @@ struct CodedFrame {
   int flags = 0;              // OMT's video flags and colour space, as they came: pass them on untouched
   int colorSpace = 0;
   std::vector<uint8_t> data;
+  std::string encoder;        // Hx: the source's encoder as it reported it, which sendCoded passes on; or empty
 };
 
 // One OMT source. sendVideo and sendAudio may run on two threads, but each must stay on its own.
@@ -166,6 +167,7 @@ struct ReceiverStats {
   Mode mode = Mode::Full;        // what the source is sending
   Codec codec = Codec::Hevc;     // Hx only: which codec the source is sending
   std::string decoder;           // "vmx", "hevc (d3d11va)", "h264 (software)", "none" (Coded), ...
+  std::string encoder;           // the source's own encoder, "hevc_amf (d3d11)", ...; empty when it does not say
   uint64_t framesReceived = 0;   // pictures or coded frames handed to the caller
   uint64_t framesDiscarded = 0;  // Hx frames dropped while waiting for a keyframe
   uint64_t bytesReceived = 0;    // wire bytes

@@ -50,10 +50,13 @@ struct AlphaPart {
 };
 // preview: the frame belongs to the preview stream. libomt flags every frame it sends a preview receiver as
 // Preview, so only this tells a preview stream from a full stream sent to a preview receiver.
-std::string seqMetadata(uint64_t seq, AlphaPart alpha = {}, bool preview = false);
+// encoder: the sender's encoder for a receiver to show, e.g. "hevc_amf (d3d11)"; omitted when empty.
+std::string seqMetadata(uint64_t seq, AlphaPart alpha = {}, bool preview = false,
+                        std::string_view encoder = {});
 bool isPreviewStream(std::string_view metadata);
 bool parseSeq(std::string_view metadata, uint64_t& out);  // false when the metadata carries no number
 AlphaPart parseAlpha(std::string_view metadata);           // nothing set for a frame without VMX alpha
+std::string_view parseEncoder(std::string_view metadata);  // empty when the source does not say
 
 // Decides when the sender must force a keyframe (spec section 8). Time is passed in, so it is testable.
 class KeyframePolicy {

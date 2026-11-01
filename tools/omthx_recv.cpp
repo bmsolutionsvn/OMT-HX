@@ -99,12 +99,14 @@ int main(int argc, char** argv) {
       if (Clock::now() >= report) {
         report += std::chrono::seconds(1);
         const ReceiverStats s = receiver.stats();
-        std::printf("%-4s %-16s %3llu fps  %7.2f Mbps  decode %5.2f ms  discarded %llu  delay avg %6.2f max %6.2f ms  %dx%d%s\n",
+        std::printf("%-4s %-16s %3llu fps  %7.2f Mbps  decode %5.2f ms  discarded %llu  "
+                    "delay avg %6.2f max %6.2f ms  %dx%d%s  src %s\n",
                     s.mode == Mode::Hx ? "HX" : "Full", s.decoder.c_str(),
                     static_cast<unsigned long long>(s.framesReceived - last.framesReceived),
                     (s.bytesReceived - last.bytesReceived) * 8 / 1e6, s.lastDecodeMs,
                     static_cast<unsigned long long>(s.framesDiscarded), delays ? delaySum / delays : 0.0, delayMax,
-                    frame.format.width, frame.format.height, frame.format.alpha ? " +alpha" : "");
+                    frame.format.width, frame.format.height, frame.format.alpha ? " +alpha" : "",
+                    s.encoder.empty() ? "-" : s.encoder.c_str());
         last = s;
         delaySum = delayMax = 0;
         delays = 0;

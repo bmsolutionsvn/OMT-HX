@@ -53,6 +53,7 @@ struct omthx_c_receiver {
   omthx::VideoFrame video;
   omthx::AudioFrame audio;
   std::string decoder;
+  std::string encoder;
 };
 
 extern "C" {
@@ -305,6 +306,16 @@ const char* omthx_c_receiver_decoder(omthx_c_receiver* receiver) {
     fail(e);
   }
   return receiver->decoder.c_str();
+}
+
+const char* omthx_c_receiver_encoder(omthx_c_receiver* receiver) {
+  if (!receiver) return "";
+  try {
+    receiver->encoder = receiver->receiver->stats().encoder;
+  } catch (const std::exception& e) {
+    fail(e);
+  }
+  return receiver->encoder.c_str();
 }
 
 }  // extern "C"

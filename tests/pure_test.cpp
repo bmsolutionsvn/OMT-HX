@@ -1,6 +1,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <ostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -179,6 +180,18 @@ TEST_CASE("VMX alpha, or that the frame repeats the last one, rides in the same 
   CHECK_FALSE(parseAlpha("<OMTHX Seq=\"7\" Alpha=\"12").any());                 // cut short
   CHECK_FALSE(parseAlpha("<OMTHX Seq=\"7\" Alpha=\"sam").any());
   CHECK_FALSE(parseAlpha("<OMTHX Seq=\"7\" /><Other Alpha=\"5\" />").any());  // not the OMTHX element's
+}
+
+TEST_CASE("the sender's encoder rides in the metadata for a receiver to show") {
+  CHECK(seqMetadata(7, {}, false, "hevc_amf (d3d11)") ==
+        "<OMTHX Seq=\"7\" Enc=\"hevc_amf (d3d11)\" />");
+  CHECK(seqMetadata(7, AlphaPart{0, true}, true, "hevc_nvenc") ==
+        "<OMTHX Seq=\"7\" Alpha=\"same\" Preview=\"true\" Enc=\"hevc_nvenc\" />");
+  CHECK(parseEncoder(seqMetadata(7, {}, false, "hevc_amf (d3d11)")) == "hevc_amf (d3d11)");
+  CHECK(parseEncoder(seqMetadata(7)).empty());  // an older source does not say
+  CHECK(parseEncoder("").empty());
+  CHECK(parseEncoder("<OMTHX Seq=\"7\" Enc=\"hevc_amf").empty());             // cut short
+  CHECK(parseEncoder("<OMTHX Seq=\"7\" /><Other Enc=\"x\" />").empty());      // not the OMTHX element's
 }
 
 TEST_CASE("copyNv12 drops row padding and stretches limited range to full") {

@@ -88,7 +88,7 @@ bool isGap(int64_t previous, int64_t current, int fpsN, int fpsD) {
   return step <= 0 || step > frame + frame / 2;
 }
 
-std::string seqMetadata(uint64_t seq, AlphaPart alpha, bool preview) {
+std::string seqMetadata(uint64_t seq, AlphaPart alpha, bool preview, std::string_view encoder) {
   std::string m = "<OMTHX Seq=\"" + std::to_string(seq) + "\"";
   if (alpha.bytes) {
     m += " Alpha=\"" + std::to_string(alpha.bytes) + "\"";
@@ -96,6 +96,7 @@ std::string seqMetadata(uint64_t seq, AlphaPart alpha, bool preview) {
     m += " Alpha=\"same\"";
   }
   if (preview) m += " Preview=\"true\"";
+  if (!encoder.empty()) m += " Enc=\"" + std::string(encoder) + "\"";
   return m + " />";
 }
 
@@ -128,6 +129,18 @@ AlphaPart parseAlpha(std::string_view m) {
   const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), bytes);
   if (ec == std::errc() && end != value.data() && end < value.data() + value.size() && *end == '"') out.bytes = bytes;
   return out;
+}
+
+std::string_view parseEncoder(std::string_view m) {
+  static constexpr std::string_view kKey = " Enc=\"";
+  const size_t element = m.find("<OMTHX ");
+  if (element == std::string_view::npos) return {};
+  const size_t at = m.find(kKey, element);
+  if (at == std::string_view::npos || at > m.find("/>", element)) return {};
+  const size_t start = at + kKey.size();
+  const size_t end = m.find('"', start);
+  if (end == std::string_view::npos) return {};
+  return m.substr(start, end - start);
 }
 
 bool KeyframePolicy::next(int64_t nowMs, uint64_t dropped, bool requested) {
