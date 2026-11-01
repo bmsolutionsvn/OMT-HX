@@ -41,7 +41,7 @@ function(omthx_warnings target)
 endfunction()
 
 # ---- library ----
-set(OMTHX_SOURCES src/pure.cpp src/alpha.cpp src/encoder.cpp src/decoder.cpp src/link.cpp src/capi.cpp)
+set(OMTHX_SOURCES src/pure.cpp src/alpha.cpp src/encoder.cpp src/decoder.cpp src/link.cpp src/capi.cpp src/d3d11.cpp)
 function(omthx_library target type)
   add_library(${target} ${type} ${OMTHX_SOURCES})
   target_include_directories(${target} PUBLIC include PRIVATE src ${FFMPEG_INCLUDE_DIRS})
@@ -82,6 +82,9 @@ if(OMTHX_BUILD_TESTS)
   )
   target_include_directories(omthx_tests PRIVATE src tools)
   target_link_libraries(omthx_tests PRIVATE omthx doctest::doctest)
+  if(WIN32)
+    target_link_libraries(omthx_tests PRIVATE d3d11)  # the D3D11 send test makes its own device
+  endif()
   omthx_warnings(omthx_tests)
   omthx_copy_runtime(omthx_tests)
 

@@ -113,6 +113,7 @@ struct Sender::Impl {
   KeyframePolicy previewPolicy;
   Shrinker shrinker;
   Nv12 small, gpuCopy;
+  std::unique_ptr<BgraToNv12> bgraToNv12;  // sendVideoD3D11, made on first use
   std::deque<int64_t> previewStamps;
   uint64_t previewSeq = 0;
   std::string previewMeta;
@@ -404,6 +405,19 @@ void Sender::sendVideoUyvy(const VideoFormat& fmt, const uint8_t* uyvy, int stri
   const auto t0 = Clock::now();
   packUyvy(fmt, uyvy, stride, alpha, alphaStride, premultiplied, d_->picture, d_->vmxAlpha ? &d_->alphaPlane : nullptr);
   d_->sendPicture(fmt, timestamp, t0, f);
+}
+
+void Sender::sendVideoD3D11(const VideoFormat& fmt, void* texture, int64_t timestamp) {
+  if (fmt.alpha || !texture || fmt.width < 2 || fmt.height < 2 || fmt.width % 2 || fmt.height % 2)
+    throw std::invalid_argument("a D3D11 picture needs a texture, an even size and no alpha");
+  if (!d_->bgraToNv12) d_->bgraToNv12 = std::make_unique<BgraToNv12>();
+  VideoFrame frame;
+  frame.format = fmt;
+  frame.timestamp = timestamp;
+  auto pic = std::make_shared<GpuPicture>();
+  d_->bgraToNv12->convert(texture, fmt.width, fmt.height, *pic);
+  frame.gpu = std::move(pic);
+  sendVideo(frame);
 }
 
 void Sender::sendVideo(const VideoFrame& frame) {

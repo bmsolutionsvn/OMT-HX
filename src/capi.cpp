@@ -116,6 +116,17 @@ int omthx_c_sender_video_nv12(omthx_c_sender* sender, const omthx_c_video_format
   }
 }
 
+int omthx_c_sender_video_d3d11(omthx_c_sender* sender, const omthx_c_video_format* format, void* texture,
+                               int64_t timestamp) {
+  if (!sender || !format || !texture) return fail("sender_video_d3d11: a null argument");
+  try {
+    sender->sender->sendVideoD3D11(formatOf(*format), texture, timestamp);
+    return 1;
+  } catch (const std::exception& e) {
+    return fail(e);
+  }
+}
+
 int omthx_c_sender_audio(omthx_c_sender* sender, const float* planar, int sample_rate, int channels,
                          int samples_per_channel, int64_t timestamp) {
   if (!sender || !planar || channels <= 0 || samples_per_channel <= 0) return fail("sender_audio: a null argument");

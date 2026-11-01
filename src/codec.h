@@ -243,4 +243,21 @@ struct GpuPicture {
   bool inVideoMemory() const;  // a D3D11 frame, rather than a software decoder's frame in memory
 };
 
+// BGRA in video memory to NV12 in video memory (BT.709, full range, as Packer makes in memory), with the D3D11
+// video processor of the texture's own device (src/d3d11.cpp). Windows only; elsewhere convert throws.
+class BgraToNv12 {
+ public:
+  BgraToNv12();
+  ~BgraToNv12();
+  BgraToNv12(const BgraToNv12&) = delete;
+  BgraToNv12& operator=(const BgraToNv12&) = delete;
+  // The texture's top-left width x height as a D3D11 NV12 frame from a pool on its device; the GpuPicture owns it.
+  // Throws std::runtime_error when the device has no video processor or the conversion fails.
+  void convert(void* texture, int width, int height, GpuPicture& out);
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> d_;
+};
+
 }  // namespace omthx

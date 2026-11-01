@@ -52,6 +52,9 @@ OMTHX_C_API int omthx_c_sender_video(omthx_c_sender* sender, const omthx_c_video
 OMTHX_C_API int omthx_c_sender_video_nv12(omthx_c_sender* sender, const omthx_c_video_format* format,
                                           const uint8_t* y, int y_stride, const uint8_t* uv, int uv_stride,
                                           int full_range, int64_t timestamp);
+// Windows: a BGRA ID3D11Texture2D, converted and encoded in video memory (Sender::sendVideoD3D11).
+OMTHX_C_API int omthx_c_sender_video_d3d11(omthx_c_sender* sender, const omthx_c_video_format* format,
+                                           void* texture, int64_t timestamp);
 // planar: all samples of channel 0, then channel 1, as OBS hands audio out.
 OMTHX_C_API int omthx_c_sender_audio(omthx_c_sender* sender, const float* planar, int sample_rate, int channels,
                                      int samples_per_channel, int64_t timestamp);

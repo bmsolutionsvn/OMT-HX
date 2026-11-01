@@ -123,6 +123,12 @@ class OMTHX_API Sender {
   // stride / 2, as in OMT's and NDI's UYVA). Hx makes the NV12 picture without a colour matrix.
   void sendVideoUyvy(const VideoFormat& format, const uint8_t* uyvy, int stride, const uint8_t* alpha,
                      int alphaStride, bool premultiplied, int64_t timestamp);
+  // Windows: a BGRA picture already in video memory, an ID3D11Texture2D (B8G8R8A8, full range, alpha ignored) at
+  // least format's size, read from its top-left corner. The texture's device converts it to NV12 (the device's
+  // immediate context is made multithread-protected) and, in Hx, the GPU encoder codes it there; an encoder that
+  // takes no D3D11 pictures gets it through memory. The texture can be reused once this returns. Without alpha.
+  // Throws std::runtime_error elsewhere or when the device has no video processor.
+  void sendVideoD3D11(const VideoFormat& format, void* texture, int64_t timestamp);
   // Sends what a Receiver handed back, whichever picture it holds, at frame.timestamp. A Gpu picture to an Hx
   // sender is encoded where it is, in video memory, when the GPU encoder takes it, and through memory otherwise.
   void sendVideo(const VideoFrame& frame);
