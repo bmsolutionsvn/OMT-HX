@@ -23,6 +23,7 @@ AVPixelFormat pickFormat(AVCodecContext*, const AVPixelFormat* formats) {
 void copyPlane(uint8_t* dst, const uint8_t* src, int srcStride, int bytes, int rows) {
   for (int r = 0; r < rows; ++r) std::memcpy(dst + static_cast<size_t>(r) * bytes, src + static_cast<size_t>(r) * srcStride, bytes);
 }
+void borrowed(void*, uint8_t*) {}  // the buffer belongs to the caller
 }  // namespace
 
 Decoder::Decoder(Codec codec) : codec_(codec) {
@@ -97,6 +98,38 @@ bool downloadNv12(const AVFrame* frame, Nv12& out) {
   AVFrame* sw = nullptr;
   const AVFrame* f = frame;
   if (frame->format == AV_PIX_FMT_D3D11) {
+    // The transfer is a GPU-to-CPU copy; when the decoder hands back NV12, let it write straight into the
+    // picture instead of a frame of its own that would then be copied again. One 4K copy and one 12 MB
+    // allocation per frame saved.
+    if (frame->hw_frames_ctx &&
+        reinterpret_cast<AVHWFramesContext*>(frame->hw_frames_ctx->data)->sw_format == AV_PIX_FMT_NV12) {
+      const int w = frame->width, h = frame->height;
+      out.width = w;
+      out.height = h;
+      out.y.resize(static_cast<size_t>(w) * h);
+      out.uv.resize(static_cast<size_t>(w) * h / 2);
+      sw = av_frame_alloc();
+      sw->format = AV_PIX_FMT_NV12;
+      sw->width = w;
+      sw->height = h;
+      sw->data[0] = out.y.data();
+      sw->linesize[0] = w;
+      sw->data[1] = out.uv.data();
+      sw->linesize[1] = w;
+      sw->buf[0] = av_buffer_create(out.y.data(), out.y.size(), borrowed, nullptr, 0);
+      sw->buf[1] = av_buffer_create(out.uv.data(), out.uv.size(), borrowed, nullptr, 0);
+      bool ok = sw->buf[0] && sw->buf[1] && av_hwframe_transfer_data(sw, frame, 0) >= 0;
+      if (ok && sw->data[0] != out.y.data()) {
+        // FFmpeg allocated a buffer of its own anyway: copy it over, so the picture is still right.
+        ok = sw->format == AV_PIX_FMT_NV12 && sw->width == w && sw->height == h;
+        if (ok) {
+          copyPlane(out.y.data(), sw->data[0], sw->linesize[0], w, h);
+          copyPlane(out.uv.data(), sw->data[1], sw->linesize[1], w, h / 2);
+        }
+      }
+      av_frame_free(&sw);
+      return ok;
+    }
     sw = av_frame_alloc();
     if (av_hwframe_transfer_data(sw, frame, 0) < 0) {
       av_frame_free(&sw);
