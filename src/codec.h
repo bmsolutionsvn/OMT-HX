@@ -61,7 +61,7 @@ std::string_view parseEncoder(std::string_view metadata);  // empty when the sou
 // Decides when the sender must force a keyframe (spec section 8). Time is passed in, so it is testable.
 class KeyframePolicy {
  public:
-  // A backstop only: receivers ask for a keyframe when they join or lose a frame, within 500 ms. Each periodic
+  // A backstop only: receivers ask for a keyframe when they join or lose a frame, within 200 ms. Each periodic
   // keyframe is a bitrate spike or a quality dip on a two-frame rate buffer, so they are rare.
   static constexpr int64_t kPeriodicMs = 10'000;
   bool next(int64_t nowMs, uint64_t dropped, bool requested);

@@ -210,20 +210,18 @@ TEST_CASE("copyNv12 drops row padding and stretches limited range to full") {
                   std::invalid_argument);
 }
 
-TEST_CASE("KeyframePolicy: first frame, requests limited to one per 500 ms, new drops, every 10 s") {
+TEST_CASE("KeyframePolicy: first frame, requests limited to one per 200 ms, new drops, every 10 s") {
   KeyframePolicy p;
   CHECK(p.next(0, 0, false));          // first frame
   CHECK_FALSE(p.next(16, 0, false));
-  CHECK_FALSE(p.next(100, 0, true));   // asked, but 500 ms have not passed
-  CHECK_FALSE(p.next(400, 0, false));
-  CHECK(p.next(500, 0, false));        // the waiting request is served
-  CHECK_FALSE(p.next(516, 0, false));
-  CHECK_FALSE(p.next(600, 1, false));  // libomt dropped a frame
-  CHECK(p.next(1000, 1, false));
-  CHECK_FALSE(p.next(1016, 1, false)); // same drop count: nothing new
-  CHECK_FALSE(p.next(3000, 1, false)); // 2 seconds: no longer a reason
-  CHECK_FALSE(p.next(10999, 1, false));
-  CHECK(p.next(11000, 1, false));      // 10 seconds since the last keyframe
+  CHECK_FALSE(p.next(100, 0, true));   // asked, but 200 ms have not passed
+  CHECK(p.next(200, 0, false));        // the waiting request is served
+  CHECK_FALSE(p.next(216, 0, false));
+  CHECK(p.next(400, 1, false));        // libomt dropped a frame
+  CHECK_FALSE(p.next(416, 1, false));  // same drop count: nothing new
+  CHECK_FALSE(p.next(3000, 1, false)); // 2 seconds after the drop: no longer a reason
+  CHECK_FALSE(p.next(10399, 1, false));
+  CHECK(p.next(10400, 1, false));      // 10 seconds since the last keyframe
 }
 
 #include <cstdlib>

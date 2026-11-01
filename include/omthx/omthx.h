@@ -141,7 +141,7 @@ class OMTHX_API Sender {
   bool keyframeRequested();
   // planar: all samples of channel 0, then all of channel 1, and so on.
   void sendAudio(std::span<const float> planar, int sampleRate, int channels, int64_t timestamp);
-  void requestKeyframe();  // the next frame is coded as a keyframe (at most one per 500 ms)
+  void requestKeyframe();  // the next frame is coded as a keyframe (at most one per 200 ms)
   Tally tally();
   SenderStats stats();
   std::string address() const;  // "HOSTNAME (name)", the string a Receiver connects to
@@ -194,7 +194,7 @@ class OMTHX_API Receiver {
   // receiveVideo does; so the frames handed back always decode.
   bool receiveCoded(CodedFrame& out, int timeoutMs);
   bool receiveAudio(AudioFrame& out, int timeoutMs);
-  void requestKeyframe();  // asks an Hx source for a keyframe, at most once per 500 ms
+  void requestKeyframe();  // asks an Hx source for a keyframe, at most once per 200 ms
   void setTally(Tally tally);
   ReceiverStats stats();
 

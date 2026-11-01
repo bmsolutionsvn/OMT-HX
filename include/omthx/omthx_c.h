@@ -58,7 +58,7 @@ OMTHX_C_API int omthx_c_sender_video_d3d11(omthx_c_sender* sender, const omthx_c
 // planar: all samples of channel 0, then channel 1, as OBS hands audio out.
 OMTHX_C_API int omthx_c_sender_audio(omthx_c_sender* sender, const float* planar, int sample_rate, int channels,
                                      int samples_per_channel, int64_t timestamp);
-// The next coded frame is a keyframe (at most one per 500 ms).
+// The next coded frame is a keyframe (at most one per 200 ms).
 OMTHX_C_API void omthx_c_sender_keyframe(omthx_c_sender* sender);
 // "HOSTNAME (name)", the string a receiver connects to.
 OMTHX_C_API const char* omthx_c_sender_address(omthx_c_sender* sender);

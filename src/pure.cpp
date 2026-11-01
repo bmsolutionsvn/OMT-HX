@@ -147,7 +147,7 @@ bool KeyframePolicy::next(int64_t nowMs, uint64_t dropped, bool requested) {
   if (dropped > dropped_ || requested) pending_ = true;
   dropped_ = dropped;
   const int64_t since = nowMs - lastKeyMs_;
-  const bool key = first_ || since >= kPeriodicMs || (pending_ && since >= 500);
+  const bool key = first_ || since >= kPeriodicMs || (pending_ && since >= 200);
   if (key) {
     first_ = false;
     pending_ = false;

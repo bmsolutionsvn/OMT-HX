@@ -576,10 +576,10 @@ struct Receiver::Impl {
   std::mutex statsMutex;
   ReceiverStats stats;
 
-  // Asks the sender for a keyframe, at most once per 500 ms. Receiving thread only.
+  // Asks the sender for a keyframe, at most once per 200 ms. Receiving thread only.
   void ask() {
     const auto now = Clock::now();
-    if (now - lastAsk < std::chrono::milliseconds(500)) return;
+    if (now - lastAsk < std::chrono::milliseconds(200)) return;
     lastAsk = now;
     OMTMediaFrame m = {};
     m.Type = OMTFrameType_Metadata;

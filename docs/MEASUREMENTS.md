@@ -64,7 +64,7 @@ since 2026-10-13:
   unpack a 1080p frame, timed alone.
 - The UYVY path (no colour matrix) runs in bands on the thread pool, with a multiply-shift for the
   alpha multiply instead of a divide: 7.3 to 2.1 ms for a 1080p straight-alpha frame, timed alone.
-- The periodic keyframe is every 10 s instead of 2 s; receivers still get one within 500 ms of asking.
+- The periodic keyframe is every 10 s instead of 2 s; receivers still get one within 200 ms of asking.
 
 | Case | Sender fps | Recv fps | Mbps | Send ms | Receive ms | Delay avg ms | Delay max ms | Discarded |
 |------|-----------|----------|------|---------|------------|--------------|--------------|-----------|
