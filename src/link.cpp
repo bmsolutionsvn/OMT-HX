@@ -638,7 +638,8 @@ struct Receiver::Impl {
 
 Receiver::Receiver(const std::string& address, PixelFormat pixels, bool preview) : d_(std::make_unique<Impl>()) {
   d_->pixels = pixels;
-  const bool uyvy = pixels == PixelFormat::Uyvy || pixels == PixelFormat::Gpu;
+  // Nv12 packs a plain OMT source's UYVY, which is already YUV, rather than converting BGRA back.
+  const bool uyvy = pixels == PixelFormat::Uyvy || pixels == PixelFormat::Gpu || pixels == PixelFormat::Nv12;
   d_->rx = omt_receive_create(
       address.c_str(), static_cast<OMTFrameType>(OMTFrameType_Video | OMTFrameType_Audio | OMTFrameType_Metadata),
       uyvy ? OMTPreferredVideoFormat_UYVYorUYVA : OMTPreferredVideoFormat_BGRA,
@@ -652,6 +653,7 @@ Receiver::~Receiver() { omt_receive_destroy(d_->rx); }
 
 bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
   if (d_->pixels == PixelFormat::Coded) return false;
+  out.nv12Y = out.nv12UV = nullptr;  // set below only for an Nv12 receiver, and only for this call
   if (d_->askPending.exchange(false)) d_->ask();
   OMTMediaFrame* f = omt_receive(d_->rx, OMTFrameType_Video, timeoutMs);
   if (!f) return false;
@@ -671,6 +673,22 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
     if (static_cast<size_t>(f->Stride) < rowBytes || f->DataLength < 0 || static_cast<size_t>(f->DataLength) < needed)
       return false;  // a header that does not match its data
     const auto* data = static_cast<const uint8_t*>(f->Data);
+    if (d_->pixels == PixelFormat::Nv12) {  // the fill only, re-ranged to full-range NV12 like a decoded Hx picture
+      fmt.alpha = false;
+      packUyvy(fmt, data, f->Stride, nullptr, 0, false, d_->picture);
+      out.nv12Y = d_->picture.y.data();
+      out.nv12UV = d_->picture.uv.data();
+      out.gpu.reset();
+      out.format = fmt;
+      out.premultiplied = false;
+      out.timestamp = f->Timestamp;
+      std::lock_guard lock(d_->statsMutex);
+      d_->stats.mode = Mode::Full;
+      d_->stats.decoder = "vmx";
+      d_->stats.encoder = "vmx";
+      ++d_->stats.framesReceived;
+      return true;
+    }
     std::vector<uint8_t>& dst = uyvy ? out.uyvy : out.bgra;
     dst.resize(rowBytes * fmt.height + (uyvy && fmt.alpha ? rowBytes / 2 * fmt.height : 0));
     for (int r = 0; r < fmt.height; ++r)
@@ -763,7 +781,11 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
     picture->alpha = alpha;
   } else {
     try {
-      if (d_->pixels == PixelFormat::Uyvy) {
+      if (d_->pixels == PixelFormat::Nv12) {
+        // No copy: the decoder's own planes, which stay valid until the next receiveVideo call.
+        out.nv12Y = d_->picture.y.data();
+        out.nv12UV = d_->picture.uv.data();
+      } else if (d_->pixels == PixelFormat::Uyvy) {
         unpackUyvy(fmt, d_->picture, out.uyvy, alpha ? alpha->data() : nullptr);
       } else {
         d_->packer.unpack(fmt, d_->picture, out.bgra, alpha ? alpha->data() : nullptr);

@@ -215,6 +215,66 @@ TEST_CASE("an NV12 picture is sent without conversion and arrives as BGRA") {
                   std::invalid_argument);
 }
 
+TEST_CASE("an NV12 receiver gets the decoder's picture without a colour conversion") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{640, 360, 60, 1, false};
+  Sender sender("omthx-test-nv12-out", Mode::Hx, Quality::Medium);
+  Receiver receiver(sender.address(), PixelFormat::Nv12);
+  // Limited-range white over the left half, black over the right; rows padded to 704 bytes.
+  const int stride = 704;
+  std::vector<uint8_t> y(static_cast<size_t>(stride) * 360), uv(static_cast<size_t>(stride) * 180, 128);
+  for (int r = 0; r < 360; ++r)
+    for (int x = 0; x < 640; ++x) y[static_cast<size_t>(r) * stride + x] = x < 320 ? 235 : 16;
+  VideoFrame frame;
+  bool got = false;
+  auto next = Clock::now();
+  for (int i = 0; i < 300 && !got; ++i) {
+    sender.sendVideoNv12(f, y.data(), stride, uv.data(), stride, false, 1'000'000 + i * kFrame);
+    got = receiver.receiveVideo(frame, 0);
+    next += std::chrono::microseconds(16'667);
+    std::this_thread::sleep_until(next);
+  }
+  REQUIRE(got);
+  CHECK(frame.format == f);
+  REQUIRE(frame.nv12Y != nullptr);
+  REQUIRE(frame.nv12UV != nullptr);
+  const size_t middle = static_cast<size_t>(180) * 640;
+  CHECK(frame.nv12Y[middle + 100] > 200);  // the white half, still full range
+  CHECK(frame.nv12Y[middle + 540] < 40);   // the black half
+  CHECK(frame.bgra.empty());               // no BGRA conversion happened
+  CHECK(frame.uyvy.empty());
+}
+
+TEST_CASE("an NV12 receiver of a plain OMT source gets full-range NV12 planes") {
+  const VideoFormat f{640, 360, 60, 1, false};
+  Sender sender("omthx-test-nv12-full-in", Mode::Full, Quality::Medium);
+  Receiver receiver(sender.address(), PixelFormat::Nv12);
+  // White over the left half, black over the right.
+  std::vector<uint8_t> bgra(static_cast<size_t>(640) * 360 * 4);
+  for (int r = 0; r < 360; ++r)
+    for (int x = 0; x < 640; ++x)
+      for (int c = 0; c < 4; ++c) bgra[(static_cast<size_t>(r) * 640 + x) * 4 + c] = x < 320 || c == 3 ? 255 : 0;
+  VideoFrame frame;
+  bool got = false;
+  auto next = Clock::now();
+  for (int i = 0; i < 300 && !got; ++i) {
+    sender.sendVideo(f, bgra, false, 1'000'000 + i * kFrame);
+    got = receiver.receiveVideo(frame, 0);
+    next += std::chrono::microseconds(16'667);
+    std::this_thread::sleep_until(next);
+  }
+  REQUIRE(got);
+  CHECK(frame.format == f);
+  REQUIRE(frame.nv12Y != nullptr);
+  REQUIRE(frame.nv12UV != nullptr);
+  const size_t middle = static_cast<size_t>(180) * 640;
+  CHECK(frame.nv12Y[middle + 100] > 245);  // white, re-ranged to full range as a decoded Hx picture is
+  CHECK(frame.nv12Y[middle + 540] < 10);   // black
+  CHECK(frame.nv12UV[static_cast<size_t>(90) * 640 + 100] > 118);  // no colour
+  CHECK(frame.nv12UV[static_cast<size_t>(90) * 640 + 100] < 138);
+  CHECK(receiver.stats().mode == Mode::Full);
+}
+
 TEST_CASE("a change of picture size reaches the receiver") {
   if (!hardware(Codec::Hevc)) return;
   const VideoFormat small{640, 360, 60, 1, false};

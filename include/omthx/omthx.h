@@ -62,7 +62,7 @@ struct SenderStats {
 // video on. Gpu: an HX picture stays in video memory (VideoFrame::gpu) and a plain OMT picture arrives as Uyvy;
 // Sender::sendVideo(frame) re-codes it without a copy to memory. Coded: nothing is decoded; read the frames as the
 // source sent them with receiveCoded, and send them on with Sender::sendCoded.
-enum class PixelFormat { Bgra, Uyvy, Gpu, Coded };
+enum class PixelFormat { Bgra, Uyvy, Gpu, Coded, Nv12 };
 
 struct GpuPicture;  // a decoded HX picture in video memory, with its alpha picture if any; opaque
 
@@ -74,6 +74,11 @@ struct VideoFrame {
   // Uyvy receivers, and plain OMT on Gpu receivers: UYVY (BT.709, 16-235), rows of width * 2 bytes, then with
   // alpha the width * height alpha plane: OMT's and NDI's UYVA layout.
   std::vector<uint8_t> uyvy;
+  // Nv12 receivers: full-range BT.709 planes, valid until the next receiveVideo call. Y is width * height bytes
+  // and UV width * height / 2, both with rows of width bytes. An Hx source's are the decoder's own, with no copy;
+  // a plain OMT source's are packed from libomt's UYVY. No alpha: a source's alpha, if any, is dropped.
+  const uint8_t* nv12Y = nullptr;
+  const uint8_t* nv12UV = nullptr;
   // Gpu receivers, HX sources: the picture, set; otherwise null. Hold only a few at a time: they are the
   // decoder's own surfaces.
   std::shared_ptr<const GpuPicture> gpu;

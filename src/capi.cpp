@@ -222,6 +222,46 @@ omthx_c_receiver* omthx_c_receiver_open(const char* address, int preview) {
 
 void omthx_c_receiver_close(omthx_c_receiver* receiver) { delete receiver; }
 
+// NV12 receiver: the decoder's picture as it is, for a consumer that takes NV12 (OBS's async source does).
+omthx_c_receiver* omthx_c_receiver_open_nv12(const char* address, int preview) {
+  if (!address || !*address) {
+    fail("receiver_open_nv12: an empty address");
+    return nullptr;
+  }
+  try {
+    auto r = std::make_unique<omthx_c_receiver>();
+    r->receiver = std::make_unique<omthx::Receiver>(address, omthx::PixelFormat::Nv12, preview != 0);
+    r->decoder = r->receiver->stats().decoder;
+    return r.release();
+  } catch (const std::exception& e) {
+    fail(e);
+    return nullptr;
+  }
+}
+
+int omthx_c_receiver_video_nv12(omthx_c_receiver* receiver, int timeout_ms, omthx_c_video_format* format,
+                                const uint8_t** y, const uint8_t** uv, int* stride, int64_t* timestamp) {
+  if (!receiver || !format || !y || !uv || !stride || !timestamp)
+    return fail("receiver_video_nv12: a null argument");
+  try {
+    if (!receiver->receiver->receiveVideo(receiver->video, timeout_ms)) return 0;
+    const omthx::VideoFrame& f = receiver->video;
+    if (!f.nv12Y || !f.nv12UV) return fail("receiver_video_nv12: the picture has no NV12 planes");
+    format->width = f.format.width;
+    format->height = f.format.height;
+    format->fps_n = f.format.fpsN;
+    format->fps_d = f.format.fpsD;
+    format->alpha = 0;
+    *y = f.nv12Y;
+    *uv = f.nv12UV;
+    *stride = f.format.width;
+    *timestamp = f.timestamp;
+    return 1;
+  } catch (const std::exception& e) {
+    return fail(e);
+  }
+}
+
 int omthx_c_receiver_video(omthx_c_receiver* receiver, int timeout_ms, omthx_c_video_format* format,
                            int* premultiplied, const uint8_t** bgra, int64_t* timestamp) {
   if (!receiver || !format || !bgra || !timestamp) return fail("receiver_video: a null argument");

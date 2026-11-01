@@ -97,6 +97,13 @@ OMTHX_C_API void omthx_c_receiver_close(omthx_c_receiver* receiver);
 // 1 with a picture, 0 on timeout or a frame still waiting for a keyframe. `bgra` is valid until the next call.
 OMTHX_C_API int omthx_c_receiver_video(omthx_c_receiver* receiver, int timeout_ms, omthx_c_video_format* format,
                                        int* premultiplied, const uint8_t** bgra, int64_t* timestamp);
+// The same source read as NV12: no colour conversion at this end, and a third of the bytes to copy. For a
+// consumer that takes NV12 directly (OBS's async source does). No alpha: use the BGRA reader for a source with it.
+OMTHX_C_API omthx_c_receiver* omthx_c_receiver_open_nv12(const char* address, int preview);
+// 1 with a picture, 0 on timeout. `y` and `uv` are valid until the next call; both planes have `stride` = width.
+OMTHX_C_API int omthx_c_receiver_video_nv12(omthx_c_receiver* receiver, int timeout_ms,
+                                            omthx_c_video_format* format, const uint8_t** y, const uint8_t** uv,
+                                            int* stride, int64_t* timestamp);
 // 1 with a block, 0 on timeout. `planar` is valid until the next call.
 OMTHX_C_API int omthx_c_receiver_audio(omthx_c_receiver* receiver, int timeout_ms, const float** planar,
                                        int* sample_rate, int* channels, int* samples_per_channel, int64_t* timestamp);
