@@ -245,6 +245,46 @@ TEST_CASE("an NV12 receiver gets the decoder's picture without a colour conversi
   CHECK(frame.uyvy.empty());
 }
 
+TEST_CASE("an NV12 receiver drops a frame whose header lies about its size") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat honest{640, 360, 60, 1, false};
+  const VideoFormat lie{1280, 720, 60, 1, false};
+  Sender source("omthx-test-nv12-lie-in", Mode::Hx, Quality::Medium, Codec::Hevc);
+  Receiver coded(source.address(), PixelFormat::Coded);
+  Sender relay("omthx-test-nv12-lie-out", Mode::Hx, Quality::Medium);
+  Receiver receiver(relay.address(), PixelFormat::Nv12);
+  Pump pump(source, honest);
+  CodedFrame c;
+  VideoFrame out;
+  // Republish the 640x360 stream under a 1280x720 header: every frame must be dropped without reading past
+  // the decoder's picture and without an exception. Once the relay's decoder has a keyframe, a true return
+  // here means the size check is missing.
+  const auto until = Clock::now() + std::chrono::seconds(10);
+  while (receiver.stats().framesDiscarded < 10 && Clock::now() < until) {
+    if (relay.keyframeRequested()) coded.requestKeyframe();
+    if (!coded.receiveCoded(c, 20)) continue;
+    CHECK_FALSE(receiver.receiveVideo(out, 0));
+    CHECK(out.nv12Y == nullptr);
+    c.format = lie;
+    relay.sendCoded(c);
+  }
+  CHECK(receiver.stats().framesDiscarded >= 10);
+
+  // The honest header: the same frames arrive again.
+  bool got = false;
+  for (const auto end = Clock::now() + std::chrono::seconds(10); !got && Clock::now() < end;) {
+    if (relay.keyframeRequested()) coded.requestKeyframe();
+    if (coded.receiveCoded(c, 20)) {
+      c.format = honest;
+      relay.sendCoded(c);
+    }
+    got = receiver.receiveVideo(out, 0);
+  }
+  REQUIRE(got);
+  CHECK(out.format == honest);
+  REQUIRE(out.nv12Y != nullptr);
+}
+
 TEST_CASE("an NV12 receiver of a plain OMT source gets full-range NV12 planes") {
   const VideoFormat f{640, 360, 60, 1, false};
   Sender sender("omthx-test-nv12-full-in", Mode::Full, Quality::Medium);
