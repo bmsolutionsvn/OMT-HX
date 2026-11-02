@@ -465,6 +465,44 @@ TEST_CASE("packUyvy with a separate alpha plane, and unpackUyvy back to UYVA") {
   REQUIRE(back.size() == 64u * 2 * 40 + 64u * 40);
 }
 
+TEST_CASE("checkNv12Picture accepts a matching picture and rejects one that does not") {
+  const VideoFormat f{64, 40, 60, 1, false};
+  Nv12 pic;
+  pic.width = 64;
+  pic.height = 40;
+  pic.y.assign(64u * 40, 0);
+  pic.uv.assign(64u * 20, 128);
+  CHECK_NOTHROW(checkNv12Picture(f, pic, nullptr));
+
+  Nv12 narrow = pic;
+  narrow.width = 32;
+  CHECK_THROWS_AS(checkNv12Picture(f, narrow, nullptr), std::invalid_argument);
+  Nv12 shorter = pic;
+  shorter.height = 20;
+  CHECK_THROWS_AS(checkNv12Picture(f, shorter, nullptr), std::invalid_argument);
+  Nv12 lessY = pic, lessUv = pic;
+  lessY.y.pop_back();
+  lessUv.uv.pop_back();
+  CHECK_THROWS_AS(checkNv12Picture(f, lessY, nullptr), std::invalid_argument);
+  CHECK_THROWS_AS(checkNv12Picture(f, lessUv, nullptr), std::invalid_argument);
+  CHECK_THROWS_AS(checkNv12Picture(VideoFormat{65, 40, 60, 1, false}, pic, nullptr), std::invalid_argument);
+  CHECK_THROWS_AS(checkNv12Picture(VideoFormat{64, 39, 60, 1, false}, pic, nullptr), std::invalid_argument);
+
+  // Alpha stacked under the fill: codedHeight rows, no separate plane.
+  const VideoFormat keyed{64, 40, 60, 1, true};
+  Nv12 stacked;
+  stacked.width = 64;
+  stacked.height = codedHeight(keyed);
+  stacked.y.assign(64u * stacked.height, 0);
+  stacked.uv.assign(64u * stacked.height / 2, 128);
+  CHECK_NOTHROW(checkNv12Picture(keyed, stacked, nullptr));
+
+  // Alpha in its own plane: the picture stays at the display height.
+  const std::vector<uint8_t> alpha(64u * 40, 255);
+  CHECK_NOTHROW(checkNv12Picture(keyed, pic, alpha.data()));
+  CHECK_THROWS_AS(checkNv12Picture(keyed, pic, nullptr), std::invalid_argument);  // no room under the fill
+}
+
 TEST_CASE("mulDiv255 equals the rounded divide it replaces, for every value and alpha") {
   int wrong = 0;
   for (unsigned v = 0; v < 256; ++v)

@@ -77,6 +77,8 @@ struct VideoFrame {
   // Nv12 receivers: full-range BT.709 planes, valid until the next receiveVideo call. Y is width * height bytes
   // and UV width * height / 2, both with rows of width bytes. An Hx source's are the decoder's own, with no copy;
   // a plain OMT source's are packed from libomt's UYVY. No alpha: a source's alpha, if any, is dropped.
+  // When set, the planes always match format: an even size, Y width * height bytes, UV width * height / 2.
+  // A frame whose picture does not match its header is dropped.
   const uint8_t* nv12Y = nullptr;
   const uint8_t* nv12UV = nullptr;
   // Gpu receivers, HX sources: the picture, set; otherwise null. Hold only a few at a time: they are the

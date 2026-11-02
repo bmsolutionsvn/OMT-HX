@@ -675,7 +675,11 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
     const auto* data = static_cast<const uint8_t*>(f->Data);
     if (d_->pixels == PixelFormat::Nv12) {  // the fill only, re-ranged to full-range NV12 like a decoded Hx picture
       fmt.alpha = false;
-      packUyvy(fmt, data, f->Stride, nullptr, 0, false, d_->picture);
+      try {
+        packUyvy(fmt, data, f->Stride, nullptr, 0, false, d_->picture);
+      } catch (const std::invalid_argument&) {
+        return false;  // an odd size in the header: drop it like a decode error
+      }
       out.nv12Y = d_->picture.y.data();
       out.nv12UV = d_->picture.uv.data();
       out.gpu.reset();
@@ -783,6 +787,7 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
     try {
       if (d_->pixels == PixelFormat::Nv12) {
         // No copy: the decoder's own planes, which stay valid until the next receiveVideo call.
+        checkNv12Picture(fmt, d_->picture, alpha ? alpha->data() : nullptr);
         out.nv12Y = d_->picture.y.data();
         out.nv12UV = d_->picture.uv.data();
       } else if (d_->pixels == PixelFormat::Uyvy) {

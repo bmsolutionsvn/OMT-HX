@@ -327,6 +327,11 @@ const uint8_t* checkPictures(const VideoFormat& f, const Nv12& in, const uint8_t
 }
 }  // namespace
 
+void checkNv12Picture(const VideoFormat& f, const Nv12& in, const uint8_t* alpha) {
+  checkSize(f);
+  checkPictures(f, in, alpha);
+}
+
 // ponytail: one core, a table lookup per byte (about 1 ms for 1080p). Upgrade path: hand over full range.
 void copyNv12(const VideoFormat& f, const uint8_t* y, int yStride, const uint8_t* uv, int uvStride, bool fullRange,
               Nv12& out) {

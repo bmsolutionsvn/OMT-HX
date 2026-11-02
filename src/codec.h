@@ -80,6 +80,10 @@ struct Nv12 {
   std::vector<uint8_t> uv;  // width * height / 2, U and V interleaved
 };
 
+// A decoded picture handed to an Nv12 receiver must match its frame header: even, and wide and tall enough,
+// with planes of at least the bytes the header needs. Throws std::invalid_argument otherwise.
+void checkNv12Picture(const VideoFormat& format, const Nv12& in, const uint8_t* alpha);
+
 // BGRA to the packed NV12 picture and back (spec section 7). Added in Task 3.
 // An NV12 picture with any row strides into `out` (full range). Limited range is stretched to full.
 void copyNv12(const VideoFormat& format, const uint8_t* y, int yStride, const uint8_t* uv, int uvStride, bool fullRange,
