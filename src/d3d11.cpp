@@ -1,4 +1,4 @@
-// BGRA texture -> NV12 D3D11 frame on the GPU, so a captured picture reaches the encoder without leaving video memory.
+// BGRA or RGBA texture -> NV12 D3D11 frame on the GPU, so a captured picture reaches the encoder without leaving video memory.
 #include "codec.h"
 
 #include <stdexcept>
@@ -20,6 +20,29 @@ namespace {
 void check(HRESULT hr, const char* what) {
   if (FAILED(hr)) throw std::runtime_error(std::string("d3d11: ") + what + " failed");
 }
+
+// The texture formats a picture may arrive in: BGRA or RGBA, either colour space.
+constexpr DXGI_FORMAT kTextureFormats[] = {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+                                           DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB};
+
+int textureFormatIndex(DXGI_FORMAT format) {
+  int i = 0;
+  for (const DXGI_FORMAT f : kTextureFormats) {
+    if (f == format) return i;
+    ++i;
+  }
+  return -1;
+}
+
+const char* formatName(DXGI_FORMAT format) {
+  switch (format) {
+    case DXGI_FORMAT_B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return "B8G8R8A8_UNORM_SRGB";
+    case DXGI_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return "R8G8B8A8_UNORM_SRGB";
+    default: return "an unknown format";
+  }
+}
 }  // namespace
 
 struct BgraToNv12::Impl {
@@ -29,6 +52,7 @@ struct BgraToNv12::Impl {
   ComPtr<ID3D11VideoContext> context;
   ComPtr<ID3D11VideoProcessorEnumerator> enumerator;
   ComPtr<ID3D11VideoProcessor> processor;
+  unsigned formatsChecked = 0;  // a bit per kTextureFormats entry the enumerator has accepted
   AVBufferRef* hwDevice = nullptr;
   AVBufferRef* frames = nullptr;
 
@@ -41,6 +65,7 @@ struct BgraToNv12::Impl {
     enumerator.Reset();
     context.Reset();
     video.Reset();
+    formatsChecked = 0;  // the enumerator went with them
     device = nullptr;
   }
 
@@ -112,15 +137,27 @@ struct BgraToNv12::Impl {
     height = h;
   }
 
-  void convert(ID3D11Texture2D* bgra, int w, int h, AVFrame* out) {
+  // Whether the video processor can read this texture format, asked once per format and remembered.
+  void checkInputFormat(DXGI_FORMAT format) {
+    const int index = textureFormatIndex(format);
+    if (formatsChecked & (1u << index)) return;
+    UINT support = 0;
+    check(enumerator->CheckVideoProcessorFormat(format, &support), "CheckVideoProcessorFormat");
+    if (!(support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT))
+      throw std::runtime_error(std::string("the video processor cannot read ") + formatName(format));
+    formatsChecked |= 1u << index;
+  }
+
+  void convert(ID3D11Texture2D* texture, int w, int h, AVFrame* out) {
     D3D11_TEXTURE2D_DESC desc;
-    bgra->GetDesc(&desc);
-    if ((desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM && desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) ||
-        desc.Width < static_cast<UINT>(w) || desc.Height < static_cast<UINT>(h))
-      throw std::invalid_argument("the texture must be BGRA and at least the picture's size");
+    texture->GetDesc(&desc);
+    if (textureFormatIndex(desc.Format) < 0 || desc.Width < static_cast<UINT>(w) ||
+        desc.Height < static_cast<UINT>(h))
+      throw std::invalid_argument("the texture must be BGRA or RGBA and at least the picture's size");
     ComPtr<ID3D11Device> dev;
-    bgra->GetDevice(&dev);
+    texture->GetDevice(&dev);
     setup(dev.Get(), w, h);
+    checkInputFormat(desc.Format);
 
     if (av_hwframe_get_buffer(frames, out, 0) < 0) throw std::runtime_error("d3d11: no free NV12 frame in the pool");
     auto* nv12 = reinterpret_cast<ID3D11Texture2D*>(out->data[0]);
@@ -129,7 +166,7 @@ struct BgraToNv12::Impl {
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC in = {};
     in.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
     ComPtr<ID3D11VideoProcessorInputView> inView;
-    check(video->CreateVideoProcessorInputView(bgra, enumerator.Get(), &in, &inView), "the BGRA input view");
+    check(video->CreateVideoProcessorInputView(texture, enumerator.Get(), &in, &inView), "the input view");
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC o = {};
     o.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2DARRAY;
     o.Texture2DArray = {0, slice, 1};
