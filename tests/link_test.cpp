@@ -776,4 +776,60 @@ TEST_CASE("a BGRA texture is converted and encoded in video memory") {
   CHECK_THROWS_AS(sender.sendVideoD3D11(VideoFormat{640, 360, 60, 1, true}, texture.Get(), 0), std::invalid_argument);
   CHECK_THROWS_AS(sender.sendVideoD3D11(VideoFormat{700, 360, 60, 1, false}, texture.Get(), 0), std::invalid_argument);
 }
+
+TEST_CASE("sendVideoD3D11 takes an RGBA texture") {
+  if (!hardware(Codec::Hevc)) return;
+  // A device as windows-capture makes one: BGRA support, no video-support flag, 11.1 first.
+  Microsoft::WRL::ComPtr<ID3D11Device> device;
+  const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+  REQUIRE(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                      levels, 2, D3D11_SDK_VERSION, &device, nullptr, nullptr)));
+  // The texture is larger than the picture: white left half, red right half, green outside the picture.
+  const int tw = 648, th = 364;
+  std::vector<uint8_t> rgba(static_cast<size_t>(tw) * th * 4);
+  for (int r = 0; r < th; ++r)
+    for (int x = 0; x < tw; ++x) {
+      uint8_t* p = &rgba[(static_cast<size_t>(r) * tw + x) * 4];
+      const bool outside = x >= 640 || r >= 360;
+      p[0] = outside ? 0 : 255;
+      p[1] = outside ? 255 : x < 320 ? 255 : 0;
+      p[2] = outside ? 0 : x < 320 ? 255 : 0;
+      p[3] = 255;
+    }
+  D3D11_TEXTURE2D_DESC desc = {};
+  desc.Width = tw;
+  desc.Height = th;
+  desc.MipLevels = desc.ArraySize = 1;
+  desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+  const D3D11_SUBRESOURCE_DATA init{rgba.data(), static_cast<UINT>(tw * 4), 0};
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+  REQUIRE(SUCCEEDED(device->CreateTexture2D(&desc, &init, &texture)));
+
+  const VideoFormat f{640, 360, 60, 1, false};
+  Sender sender("omthx-test-d3d11-rgba", Mode::Hx, Quality::Medium);
+  Receiver receiver(sender.address());
+  VideoFrame frame;
+  bool got = false;
+  auto next = Clock::now();
+  for (int i = 0; i < 300 && !got; ++i) {
+    sender.sendVideoD3D11(f, texture.Get(), 1'000'000 + i * kFrame);
+    got = receiver.receiveVideo(frame, 0);
+    next += std::chrono::microseconds(16'667);
+    std::this_thread::sleep_until(next);
+  }
+  REQUIRE(got);
+  CHECK(frame.format == f);
+  MESSAGE("encoded by " << sender.stats().encoder);
+  CHECK(sender.stats().encoder.find("(d3d11)") != std::string::npos);  // no copy through memory
+  const uint8_t* white = &frame.bgra[(static_cast<size_t>(180) * 640 + 100) * 4];
+  const uint8_t* red = &frame.bgra[(static_cast<size_t>(180) * 640 + 636) * 4];
+  CHECK(white[0] > 240);
+  CHECK(white[1] > 240);
+  CHECK(white[2] > 240);
+  CHECK(red[0] < 20);  // red, so BT.709 full range on both sides, and no green from outside the picture
+  CHECK(red[1] < 20);
+  CHECK(red[2] > 235);
+}
 #endif
