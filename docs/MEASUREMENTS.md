@@ -1,13 +1,107 @@
 # OMT-HX measurements
 
-Measured with `omthx-send` and `omthx-recv`, driven by `scripts\measure.ps1`, on one PC over
-`localhost`, test picture with grain. One PC means no network in the path: these are codec and
-library figures, not link figures. It also means sender and receiver share one CPU and one GPU, so
-each runs slower than it would alone. Each row is the median of a 20 s run after a 2 s warm-up.
+The first section below is two PCs over a real network (`scripts\measure-two-pc.ps1`): use it for what
+a link does. The sections after it were measured with `omthx-send` and `omthx-recv`, driven by
+`scripts\measure.ps1`, on one PC over `localhost`, test picture with grain. One PC means no network in
+the path: those are codec and library figures, not link figures. It also means sender and receiver
+share one CPU and one GPU, so each runs slower than it would alone. Each row is the median of a 20 s run
+after a 2 s warm-up.
 
 Since 2026-10-20 the GPU codes the fill alone and alpha goes by VMX on the CPU, not stacked under the
-fill. The current alpha figures are the first table below; the tables after it keep the stacked-alpha
-numbers they were measured with.
+fill. The current alpha figures are in the two-PC table and the 2026-10-20 table; the tables after
+those keep the stacked-alpha numbers they were measured with.
+
+## 2026-11-03: two PCs
+
+`scripts\measure-two-pc.ps1 -Seconds 20` (receiver role on one PC, sender role on the other), OMT-HX
+`main` at 9192c09. The cases are `measure.ps1`'s, plus the 4K60 paths at the end.
+
+- **Sender PC:** AMD Ryzen 7 5700X, Radeon RX 6600 (`hevc_amf`, `h264_amf`), wired 1 Gbps Ethernet.
+- **Receiver PC:** GeForce GTX 1650 (decodes, `d3d11va`), Intel UHD 630 beside it, Wi-Fi 6 (Intel AX200,
+  2.4 Gbps link rate).
+- **Delay** is the **round trip on the sender's clock alone**: the app hands a frame to the sender ->
+  encode -> network -> decode -> the receiver's app has the picture -> the receiver's short reply ->
+  the sender reads it. The two PCs' clocks play no part (the receiver's own "delay" column compares
+  two clocks and is not used). It is an upper bound on the one-way delay: the sender reads replies
+  when it sends its next frame, so the figure rounds up to a frame (the steps 17, 35, 52, 69, 87 ms at
+  60 fps), and the reply's own trip back over Wi-Fi is in it.
+- **Send ms**: the sender's time per frame (pack, upload, encode). **Receive ms**: the receiver's time
+  for the picture it hands out (decode, and for the memory paths the copy to memory). With a `gpu`
+  receiver the picture is handed over while the GPU still decodes it, so its Receive ms and round trip
+  leave the decode out. Full (VMX) is decoded inside libomt and not timed here.
+- **Discarded** is the receiver's total over the run, including the frames before the first keyframe
+  it waits for when it joins (11 to 19 at 60 fps here). In the per-second link-check runs of the same
+  day, the discards all came in that first wait.
+- The 4K60 paths: the sender takes the picture as BGRA from memory (`mem`, what every other row and
+  `measure.ps1` send), as D3D11 textures (`gpu`: `sendVideoD3D11`, as BreadCamera and desktop capture
+  send) or as UYVY from memory (`uyvy`: `sendVideoUyvy`, as an SDI or NDI input sends). The receiver
+  hands it out as BGRA in memory (`bgra`, every other row), NV12 in memory (`nv12`) or a D3D11 texture
+  (`gpu`).
+
+| Case | Sender fps | Recv fps | Mbps | Send ms | Receive ms | Round trip ms | Round trip max | Discarded |
+|------|-----------|----------|------|---------|------------|---------------|----------------|-----------|
+| hx 720p60 | 60 | 60 | 13 | 4.1 | 6.6 | 17.3 | 30.8 | 11 |
+| hx 1080p60 | 60 | 60 | 29.9 | 7.8 | 2.2 | 51.2 | 52.3 | 12 |
+| hx 1440p60 | 60 | 60 | 52.7 | 10.2 | 2.6 | 52.4 | 53.2 | 14 |
+| hx 2160p60 | 60 | 60 | 119.5 | 16.5 | 8.6 | 87.6 | 92.8 | 17 |
+| hx 1080p30 | 30 | 30 | 14.9 | 7 | 12 | 34.9 | 35.8 | 12 |
+| hx 1080p120 | 120 | 115 | 59.8 | 6.6 | 2.2 | 42.6 | 52.1 | 15 |
+| hx 1080p60 low | 60 | 60 | 15 | 6.5 | 1.8 | 34.9 | 51.5 | 12 |
+| hx 1080p60 high | 60 | 60 | 49.9 | 6.8 | 1.9 | 51.4 | 52.5 | 12 |
+| hx 720p60 alpha | 60 | 60 | 17.8 | 4.9 | 5 | 18.2 | 19.7 | 12 |
+| hx 1080p60 alpha | 60 | 60 | 38.2 | 9.1 | 9 | 36.3 | 52.3 | 12 |
+| hx 1080p30 alpha | 30 | 30 | 19.1 | 8.9 | 9 | 36.5 | 37.2 | 11 |
+| h264 1080p60 | 60 | 60 | 41.8 | 6.8 | 2 | 51.2 | 68 | 12 |
+| h264 1080p60 low | 60 | 60 | 20.9 | 7.4 | 2 | 34.8 | 35.6 | 12 |
+| h264 1080p60 high | 60 | 60 | 69.7 | 7.8 | 1.8 | 51.4 | 53 | 13 |
+| h264 720p60 alpha | 60 | 60 | 23.2 | 5.2 | 5.3 | 18 | 18.9 | 12 |
+| h264 1080p60 alpha | 60 | 60 | 49.7 | 10.9 | 10 | 36.5 | 53 | 14 |
+| h264 720p60 | 60 | 60 | 18.6 | 4 | 7.2 | 17.5 | 33.8 | 13 |
+| full 720p60 | 60 | 60 | 71 | n/a | n/a | 33.4 | 50.8 | 0 |
+| full 1080p60 | 60 | 60 | 201.6 | n/a | n/a | 33.1 | 34.5 | 0 |
+| hx 2160p60 mem>bgra | 59 | 59 | 117.6 | 17.2 | 7.6 | 77.7 | 90.2 | 18 |
+| hx 2160p60 mem>nv12 | 59 | 59 | 117.4 | 16.8 | 3.1 | 73.1 | 122.8 | 17 |
+| hx 2160p60 mem>gpu | 59 | 59 | 117.5 | 17.1 | 0.7 | 55.9 | 64 | 15 |
+| hx 2160p60 gpu>bgra | 60 | 60 | 119.5 | 9.1 | 7.8 | 67 | 83.7 | 15 |
+| hx 2160p60 gpu>nv12 | 60 | 60 | 119.5 | 9.4 | 3 | 67 | 67.7 | 16 |
+| hx 2160p60 gpu>gpu | 60 | 60 | 119.5 | 9.4 | 1 | 50.1 | 83 | 15 |
+| hx 2160p60 uyvy>bgra | 60 | 60 | 119.5 | 12 | 7.4 | 69.7 | 86.4 | 19 |
+| hx 2160p60 uyvy>nv12 | 60 | 60 | 119.5 | 12.1 | 3 | 69.5 | 85.4 | 17 |
+| hx 2160p60 uyvy>gpu | 60 | 60 | 119.6 | 11.8 | 0.6 | 52.6 | 54.1 | 17 |
+
+- **4K60 holds on both ends**, every path, over Wi-Fi: 60 / 60 (59 / 59 with the picture taken from
+  memory as BGRA). On one PC on 2026-10-19 it reached 43 / 42. The changes of 2026-11-03 that made it:
+  the encoder no longer waits for each packet before taking the next picture (`hevc_amf` 4K measured
+  56 fps waiting, 100 fps overlapped); the receiver decodes on the high-performance GPU instead of
+  adapter 0; pictures come to memory without waiting on each copy; a receiver that falls behind shows
+  the newest picture instead of letting libomt drop coded frames.
+- **The GPU the decoder runs on mattered most.** FFmpeg's default is adapter 0, which on the receiver
+  PC is the Intel UHD 630. `readback-bench.exe` on that PC, 4K picture to memory:
+
+  | GPU | NV12 (12.4 MB) GPU copy | NV12 CPU read | BGRA (33.2 MB) GPU copy | BGRA CPU read |
+  |-----|------------------------|---------------|------------------------|---------------|
+  | Intel UHD 630 | 19.0 ms (0.66 GB/s) | 1.7 ms | 12.5 ms (2.65 GB/s) | 3.9 ms |
+  | GeForce GTX 1650 | 1.3 ms (9.5 GB/s) | 1.4 ms | 3.0 ms (11.2 GB/s) | 3.9 ms |
+
+  Decoding on the UHD 630, a 4K NV12 receiver held 48 to 50 fps and a BGRA one 26 to 32; on the
+  GTX 1650 both hold 60. The decoder now asks Windows for the high-performance GPU and names it in its
+  stats (`hevc (d3d11va, NVIDIA GeForce GTX 1650)`).
+- **Where the picture enters the sender** costs 7 to 8 ms at 4K: Send ms 9.4 from D3D11 textures, 12
+  from UYVY in memory, 16.5 to 17.2 from BGRA in memory (the CPU conversion and the upload). BGRA from
+  memory is at the limit at 4K60 (59 fps); a source that has the picture on the GPU or as UYVY should
+  send it that way.
+- **Where the picture leaves the receiver** costs about one frame at 4K: round trip 50 to 56 ms to a
+  texture, 67 to 78 ms to memory. On this GPU the decode and the copy of the newest 4K picture do not
+  finish within the half frame the receiver waits for it, so memory receivers run one frame behind
+  (with no frame dropped).
+- **1080p60 to memory is a frame slower than it needs to be**: 51 ms round trip against 36 ms with
+  alpha, which takes the path without the overlapped copy, and 35 ms at `low`. The likely cause, not
+  yet confirmed: the receiver falls a frame behind when one copy misses its half-frame wait, and once
+  behind it stays behind until the stream pauses (the `ponytail:` note in `Readback::take`). Catching
+  up would bring it to about 35 ms.
+- **1080p120** receives 115 of 120 fps: the last case that does not hold its rate.
+- The round trip does not include the receiving app's own work (OBS adds one full-size copy per frame,
+  about 5 to 10 ms at 4K).
 
 ## 2026-10-20: alpha by VMX
 
@@ -210,8 +304,11 @@ it.
 
 ## Not measured here
 
-- `hevc_nvenc`: this PC has no NVIDIA GPU. Run the HX rows on an NVIDIA PC before relying on it.
-- Two PCs over a real network. This matters most for 1080p60 with alpha, where one PC is the limit.
+- `hevc_nvenc`: neither sending PC has had an NVIDIA GPU (the two-PC run decodes on one, but encodes on
+  the RX 6600). Run the HX rows with an NVIDIA sender before relying on it.
+- Two PCs over a wired network: the 2026-11-03 receiver was on Wi-Fi.
+- A receiver whose only GPU is an integrated one, with the 2026-11-03 build: the overlapped copy is
+  meant for it, but it was measured only on the older build (Intel UHD 630: 48 to 50 fps NV12 at 4K).
 - An idle PC. Repeat the table with nothing else running before quoting a figure to the millisecond.
 - Picture quality by eye on real camera footage.
 
