@@ -1167,7 +1167,8 @@ std::vector<std::string> discover() {
 
 struct FrameDecoder::Impl {
   explicit Impl(PixelFormat p) : pixels(p) {
-    if (p != PixelFormat::Uyvy) throw std::invalid_argument("FrameDecoder decodes Uyvy only for now");
+    if (p != PixelFormat::Uyvy && p != PixelFormat::Nv12)
+      throw std::invalid_argument("FrameDecoder decodes Uyvy and Nv12 only");
   }
   ~Impl() { VMX_Destroy(vmx); }
 
@@ -1210,6 +1211,24 @@ bool FrameDecoder::decode(const CodedFrame& c, VideoFrame& out) {
     }
     if (VMX_LoadFrom(d_->vmx, const_cast<uint8_t*>(c.data.data()), static_cast<int>(c.data.size())) != VMX_ERR_OK)
       return false;
+    if (d_->pixels == PixelFormat::Nv12) {
+      // The fill only, packed to full-range NV12 as a Receiver of a plain OMT source does. No alpha.
+      VideoFormat fill = fmt;
+      fill.alpha = false;
+      std::vector<uint8_t> uyvy(static_cast<size_t>(fill.width) * fill.height * 2);
+      if (VMX_DecodeUYVY(d_->vmx, uyvy.data(), fill.width * 2) != VMX_ERR_OK) return false;
+      try {
+        packUyvy(fill, uyvy.data(), fill.width * 2, nullptr, 0, false, d_->picture);
+      } catch (const std::invalid_argument&) {
+        return false;
+      }
+      out.nv12Y = d_->picture.y.data();
+      out.nv12UV = d_->picture.uv.data();
+      out.format = fill;
+      out.premultiplied = false;
+      out.timestamp = c.timestamp;
+      return true;
+    }
     out.uyvy.resize(static_cast<size_t>(fmt.width) * fmt.height * (fmt.alpha ? 3 : 2));
     const int stride = fmt.width * 2;
     const VMX_ERR err = fmt.alpha ? VMX_DecodeUYVA(d_->vmx, out.uyvy.data(), stride)
@@ -1259,10 +1278,21 @@ bool FrameDecoder::decode(const CodedFrame& c, VideoFrame& out) {
     alpha = d_->hx.popAlpha(timestamp);
     if (!alpha) return fail();
   }
-  try {
-    unpackUyvy(fmt, d_->picture, out.uyvy, alpha ? alpha->data() : nullptr);
-  } catch (const std::invalid_argument&) {
-    return fail();  // the picture does not match its header: treat it like a decode error
+  if (d_->pixels == PixelFormat::Nv12) {
+    // No copy: the decoder's own planes, valid until the next decode. Alpha, if any, is dropped.
+    try {
+      checkNv12Picture(fmt, d_->picture, alpha ? alpha->data() : nullptr);
+    } catch (const std::invalid_argument&) {
+      return fail();
+    }
+    out.nv12Y = d_->picture.y.data();
+    out.nv12UV = d_->picture.uv.data();
+  } else {
+    try {
+      unpackUyvy(fmt, d_->picture, out.uyvy, alpha ? alpha->data() : nullptr);
+    } catch (const std::invalid_argument&) {
+      return fail();  // the picture does not match its header: treat it like a decode error
+    }
   }
   d_->waiting = false;
   out.format = fmt;
