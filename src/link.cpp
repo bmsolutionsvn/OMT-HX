@@ -4,6 +4,7 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <future>
@@ -88,6 +89,8 @@ struct Sender::Impl {
   bool vmxAlpha = false;       // with alpha: the GPU codes the fill alone and VMX codes alpha
   const void* gpuKey = nullptr;  // and the D3D11 frames context it takes pictures from, or null
   bool gpuRefused = false;     // no GPU encoder took D3D11 pictures: they go through memory
+  bool uyvyRefused = false;    // the UYVY conversion or its encoder refused: UYVY goes through packUyvy
+  bool uyvyGpu = true;         // read once from OMTHX_NO_GPU_UYVY: when set, UYVY keeps the CPU path
   std::unique_ptr<Encoder> encoder;            // the fill, or the stacked picture
   std::unique_ptr<AlphaEncoder> alphaEncoder;  // VMX alpha, or null
   Packer packer;
@@ -128,6 +131,7 @@ struct Sender::Impl {
   Shrinker shrinker;
   Nv12 small, gpuCopy;
   std::unique_ptr<BgraToNv12> bgraToNv12;  // sendVideoD3D11, made on first use
+  std::unique_ptr<UyvyToNv12> uyvyToNv12;  // sendVideoUyvy, made on first use
   std::deque<int64_t> previewStamps;
   uint64_t previewSeq = 0;
   std::string previewMeta;
@@ -378,6 +382,8 @@ Sender::Sender(const std::string& name, Mode mode, Quality quality, Codec codec)
   d_->codec = codec;
   d_->tx = omt_send_create(name.c_str(), kOmtQuality[static_cast<int>(quality)]);
   if (!d_->tx) throw std::runtime_error("cannot create the OMT source \"" + name + "\"");
+  const char* noGpuUyvy = std::getenv("OMTHX_NO_GPU_UYVY");
+  d_->uyvyGpu = !(noGpuUyvy && *noGpuUyvy);
   if (mode == Mode::Full) d_->stats.encoder = "vmx";
 }
 
@@ -472,6 +478,28 @@ void Sender::sendVideoUyvy(const VideoFormat& fmt, const uint8_t* uyvy, int stri
     }
     d_->sendFull(f);
     return;
+  }
+
+  // No alpha on an HX sender: the GPU makes the NV12 picture from the UYVY rows, and the encoder codes it there.
+  if (!fmt.alpha && !d_->uyvyRefused && d_->uyvyGpu) {
+    if (!d_->uyvyToNv12) d_->uyvyToNv12 = std::make_unique<UyvyToNv12>();
+    VideoFrame frame;
+    frame.format = fmt;
+    frame.timestamp = timestamp;
+    frame.premultiplied = premultiplied;
+    auto pic = std::make_shared<GpuPicture>();
+    try {
+      d_->uyvyToNv12->convert(uyvy, stride, fmt.width, fmt.height, *pic);
+    } catch (const std::runtime_error&) {
+      d_->uyvyRefused = true;  // no device, or no YUY2 input: from now on, packUyvy
+      d_->uyvyToNv12.reset();
+    }
+    if (!d_->uyvyRefused) {
+      frame.gpu = std::move(pic);
+      sendVideo(frame);
+      if (d_->gpuRefused) d_->uyvyRefused = true;  // the encoder took no D3D11 pictures: packUyvy from now on
+      return;
+    }
   }
 
   d_->openEncoder(fmt, true);
