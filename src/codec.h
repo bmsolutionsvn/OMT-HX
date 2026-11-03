@@ -273,9 +273,9 @@ class BgraToNv12 {
 };
 
 // Brings decoded D3D11 pictures to memory without waiting on each copy (src/d3d11.cpp). push queues a picture's
-// copy to a staging texture, converted to BGRA on the GPU when asked. take hands out the newest picture whose copy
-// has finished, but only once a newer one is on its way, so one copy overlaps the app's use of the picture before
-// it: one frame of delay, instead of waiting for the decode and the copy of every picture in turn.
+// copy to a staging texture, converted to BGRA on the GPU when asked. take hands out the newest picture when its
+// copy finishes within half a frame (a fast GPU: no added delay), else the one before it, whose copy had a frame's
+// time (a slow GPU: one frame of delay, the copy overlapping the app's use of the picture before).
 // take(wait = true) hands out the newest one, waiting for it: for when no newer picture is coming.
 // Windows only: elsewhere accepts is false.
 class Readback {

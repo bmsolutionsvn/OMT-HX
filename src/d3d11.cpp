@@ -202,6 +202,7 @@ struct Readback::Impl {
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     bool pending = false;
     uint64_t order = 0;  // larger is newer
+    std::chrono::steady_clock::time_point queued;
     int width = 0, height = 0;
     UINT planeRows = 0;  // NV12: the staging texture's height, where the UV plane starts
     Picture picture;
@@ -221,7 +222,10 @@ struct Readback::Impl {
   ComPtr<ID3D11Texture2D> target;  // the processor's BGRA output, copied to a slot's staging texture
   int vpWidth = 0, vpHeight = 0;
 
-  ~Impl() { detach(); }
+  ~Impl() {
+    detach();
+    if (timer) CloseHandle(timer);
+  }
 
   void detach() {
     for (Slot& s : slots) s = Slot{};
@@ -372,6 +376,19 @@ struct Readback::Impl {
     s.width = w;
     s.height = h;
     s.picture = Picture{format, timestamp, bgra};
+    s.queued = std::chrono::steady_clock::now();
+  }
+
+  // Waits about 200 us. Sleep() waits whole timer ticks (up to 15.6 ms); this timer wakes within ~0.5 ms.
+  HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  void nap() {
+    LARGE_INTEGER due{};
+    due.QuadPart = -2'000;  // 100 ns units; negative is relative
+    if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+      WaitForSingleObject(timer, INFINITE);
+    } else {
+      SwitchToThread();
+    }
   }
 
   bool take(bool wait, Nv12& nv12, std::vector<uint8_t>& bgra, Picture& out) {
@@ -381,14 +398,31 @@ struct Readback::Impl {
       if (s.pending && (!newest || s.order > newest->order)) newest = &s;
     for (Slot& s : slots)
       if (s.pending && &s != newest && (!older || s.order > older->order)) older = &s;
-    if (!newest || (!wait && !older)) return false;
-    Lock lock(hw);
+    if (!newest) return false;
     auto* ctx = hw->device_context;
     D3D11_MAPPED_SUBRESOURCE m = {};
     Slot* pick = newest;
-    HRESULT hr = ctx->Map(newest->staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+    // The newest picture if its copy finishes within half a frame of being queued: a fast GPU (1.3 ms for 4K
+    // NV12 on a GTX 1650) then adds no frame of delay. Past that, the one before, whose copy had a frame's time:
+    // a slow GPU (19 ms on an Intel UHD 630) keeps the overlap instead of waiting.
+    const VideoFormat& f = newest->picture.format;
+    const auto half = std::chrono::microseconds(
+        f.fpsN > 0 && f.fpsD > 0 ? 500'000LL * f.fpsD / f.fpsN : 8'333);
+    HRESULT hr;
+    for (;;) {
+      {
+        Lock lock(hw);
+        hr = ctx->Map(newest->staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+      }
+      if (hr != DXGI_ERROR_WAS_STILL_DRAWING || wait || std::chrono::steady_clock::now() - newest->queued >= half)
+        break;
+      nap();
+    }
+    // Still copying, and nothing older to hand out: keep it, the next call hands it out (or the app's timeout).
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING && !wait && !older) return false;
+    Lock lock(hw);
     if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
-      if (!wait) pick = older;  // a frame old by now: its copy has had a frame's time
+      if (!wait) pick = older;
       hr = ctx->Map(pick->staging.Get(), 0, D3D11_MAP_READ, 0, &m);
     }
     const uint64_t taken = pick->order;
