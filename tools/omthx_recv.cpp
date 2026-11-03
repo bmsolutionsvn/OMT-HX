@@ -17,7 +17,8 @@ namespace {
 [[noreturn]] void usage() {
   std::puts("omthx-recv --list\n"
             "omthx-recv --source \"HOST (Name)\" [--seconds N] [--dump FILE.bmp] [--tally program|preview] [--preview]\n"
-            "           [--pixels bgra|nv12|gpu]\n"
+            "           [--pixels bgra|nv12|gpu] [--live-seconds N]\n"
+            "--live-seconds N stops after N seconds in which pictures arrived; --seconds then caps the wait.\n"
             "--pixels: bgra (default) brings the picture to memory as BGRA; nv12 brings the decoder's NV12 with no\n"
             "conversion; gpu keeps an HX picture in video memory, as an app that draws it on the GPU would.\n"
             "Delay is only meaningful when omthx-send runs on this PC, or both PCs share a synchronised clock.");
@@ -48,6 +49,7 @@ int main(int argc, char** argv) {
   std::string source, dump, tally;
   bool list = false, preview = false;
   int seconds = 0;
+  int liveSeconds = 0, live = 0;  // stop after this many seconds with pictures
   PixelFormat pixels = PixelFormat::Bgra;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -58,6 +60,7 @@ int main(int argc, char** argv) {
     if (a == "--list") list = true;
     else if (a == "--source") source = value();
     else if (a == "--seconds") seconds = std::atoi(value().c_str());
+    else if (a == "--live-seconds") liveSeconds = std::atoi(value().c_str());
     else if (a == "--dump") dump = value();
     else if (a == "--tally") tally = value();
     else if (a == "--preview") preview = true;  // the small picture, as NDI's lowest bandwidth
@@ -123,9 +126,11 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(s.framesDiscarded), delays ? delaySum / delays : 0.0, delayMax,
                     frame.format.width, frame.format.height, frame.format.alpha ? " +alpha" : "",
                     s.encoder.empty() ? "-" : s.encoder.c_str());
+        const bool arrived = s.framesReceived > last.framesReceived;
         last = s;
         delaySum = delayMax = 0;
         delays = 0;
+        if (arrived && liveSeconds > 0 && ++live >= liveSeconds) break;
       }
     }
   } catch (const std::exception& e) {
