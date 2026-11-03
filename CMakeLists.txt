@@ -48,7 +48,7 @@ function(omthx_library target type)
   target_link_directories(${target} PUBLIC ${FFMPEG_LIBRARY_DIRS})
   target_link_libraries(${target} PUBLIC ${FFMPEG_LIBRARIES} libomt PRIVATE libvmx)
   if(WIN32)
-    target_link_libraries(${target} PRIVATE dxgi)  # the decoder picks the high-performance GPU
+    target_link_libraries(${target} PRIVATE dxgi d3d11)  # the decoder picks a GPU; d3d11.cpp converts UYVY
   endif()
   if(TBB_FOUND)
     target_link_libraries(${target} PRIVATE TBB::tbb)

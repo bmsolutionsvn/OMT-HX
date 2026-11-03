@@ -285,6 +285,23 @@ class BgraToNv12 {
   std::unique_ptr<Impl> d_;
 };
 
+// Limited-range UYVY in memory to a full-range NV12 frame in video memory (BT.709), on this object's own D3D11
+// device (src/d3d11.cpp). Windows only; elsewhere, or when the device cannot do it, convert throws
+// std::runtime_error. The picture's top-left width x height is the frame; rows of the input are `stride` bytes
+// apart, and the GpuPicture owns the frame.
+class UyvyToNv12 {
+ public:
+  UyvyToNv12();
+  ~UyvyToNv12();
+  UyvyToNv12(const UyvyToNv12&) = delete;
+  UyvyToNv12& operator=(const UyvyToNv12&) = delete;
+  void convert(const uint8_t* uyvy, int stride, int width, int height, GpuPicture& out);
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> d_;
+};
+
 // Brings decoded D3D11 pictures to memory without waiting on each copy (src/d3d11.cpp). push queues a picture's
 // copy to a staging texture, converted to BGRA on the GPU when asked. take hands pictures out in order, none
 // skipped: a picture whose copy finishes within half a frame goes out at once (a fast GPU: no added delay), one
