@@ -17,6 +17,7 @@ extern "C" {
 }
 
 #include <libomt.h>
+#include <vmxcodec.h>
 
 namespace omthx {
 namespace {
@@ -627,20 +628,70 @@ std::string Sender::address() const {
 
 // ---------------------------------------------------------------- Receiver
 
-struct Receiver::Impl {
-  omt_receive_t* rx = nullptr;
-  PixelFormat pixels = PixelFormat::Bgra;
+// One Hx stream's decoder and its VMX alpha. The rules live here so a Receiver and a FrameDecoder decode a
+// stream the same way; both feed it only the frames of one stream.
+struct HxStream {
   std::unique_ptr<Decoder> decoder;
   AlphaDecoder alphaDecoder;  // VMX alpha
   std::shared_ptr<std::vector<uint8_t>> alpha;  // the last VMX alpha plane, which a frame may repeat
   // The alpha of each frame the decoder still holds, by timestamp: a software decoder hands pictures back late.
   std::deque<std::pair<int64_t, std::shared_ptr<const std::vector<uint8_t>>>> pendingAlpha;
+  Codec codec = Codec::Hevc;
+  bool haveCodec = false;
+  bool haveAlpha = false;
+
+  // True when this frame is of the same stream as the last: same codec, same alpha layout. A change starts a
+  // new stream, whose first picture must come from a keyframe.
+  bool sameStream(Codec c, bool vmxAlpha) {
+    const bool same = haveCodec && c == codec && vmxAlpha == haveAlpha;
+    haveCodec = true;
+    codec = c;
+    haveAlpha = vmxAlpha;
+    return same;
+  }
+
+  // The stream restarts: the next picture comes from a keyframe.
+  void restart() {
+    decoder.reset();
+    pendingAlpha.clear();
+  }
+
+  // This frame's alpha plane: its VMX alpha decoded, or the last plane again. Null when there is none to be had.
+  std::shared_ptr<const std::vector<uint8_t>> takeAlpha(const VideoFormat& fmt, AlphaPart part,
+                                                        std::span<const uint8_t> vmx) {
+    if (part.repeats) return alpha && alpha->size() == static_cast<size_t>(fmt.width) * fmt.height ? alpha : nullptr;
+    if (!alpha || alpha.use_count() > 1) alpha = std::make_shared<std::vector<uint8_t>>();  // others hold the old one
+    if (!alphaDecoder.decode(vmx, fmt.width, fmt.height, *alpha)) alpha.reset();
+    return alpha;
+  }
+
+  // Queues this frame's alpha for the picture the decoder hands back later with its timestamp.
+  bool queueAlpha(const VideoFormat& fmt, AlphaPart part, std::span<const uint8_t> vmx, int64_t timestamp) {
+    auto a = takeAlpha(fmt, part, vmx);
+    if (!a) return false;
+    pendingAlpha.emplace_back(timestamp, std::move(a));
+    if (pendingAlpha.size() > 32) pendingAlpha.pop_front();  // far more than a decoder holds
+    return true;
+  }
+
+  // The alpha of the picture at `timestamp`, dropping the older ones. Null when that frame had none.
+  std::shared_ptr<const std::vector<uint8_t>> popAlpha(int64_t timestamp) {
+    std::shared_ptr<const std::vector<uint8_t>> a;
+    while (!pendingAlpha.empty() && !a) {
+      if (pendingAlpha.front().first == timestamp) a = pendingAlpha.front().second;
+      pendingAlpha.pop_front();
+    }
+    return a;
+  }
+};
+
+struct Receiver::Impl {
+  omt_receive_t* rx = nullptr;
+  PixelFormat pixels = PixelFormat::Bgra;
+  HxStream hx;  // Hx sources: the decoder and its VMX alpha
   Packer packer;
   Nv12 picture;
   bool waiting = true;  // Hx: discard until a keyframe
-  bool haveCodec = false;
-  Codec lastCodec = Codec::Hevc;
-  bool lastVmx = false;
   bool haveLast = false;
   int64_t lastTimestamp = 0;
   bool lastPreview = false;  // the last frame came from a preview stream
@@ -726,10 +777,10 @@ struct Receiver::Impl {
   // vmx: the frame has VMX alpha. VMX frames stand alone, so only the fill decides what is a keyframe.
   bool admit(const OMTMediaFrame* f, Codec codec, std::span<const uint8_t> au, bool vmx, uint64_t& seqOut) {
     // The source came back with the other codec, or started or stopped sending VMX alpha.
-    if (haveCodec && (codec != lastCodec || vmx != lastVmx)) waiting = true;
-    haveCodec = true;
-    lastCodec = codec;
-    lastVmx = vmx;
+    if (!hx.sameStream(codec, vmx)) {
+      hx.restart();
+      waiting = true;
+    }
     uint64_t seq = 0;
     const bool numbered = parseSeq(metadataOf(f), seq);
     if (numbered) {
@@ -748,15 +799,6 @@ struct Receiver::Impl {
       return false;
     }
     return true;
-  }
-
-  // This frame's alpha plane: its VMX alpha decoded, or the last plane again. Null when there is none to be had.
-  std::shared_ptr<const std::vector<uint8_t>> takeAlpha(const VideoFormat& fmt, AlphaPart part,
-                                                        std::span<const uint8_t> vmx) {
-    if (part.repeats) return alpha && alpha->size() == static_cast<size_t>(fmt.width) * fmt.height ? alpha : nullptr;
-    if (!alpha || alpha.use_count() > 1) alpha = std::make_shared<std::vector<uint8_t>>();  // others hold the old one
-    if (!alphaDecoder.decode(vmx, fmt.width, fmt.height, *alpha)) alpha.reset();
-    return alpha;
   }
 };
 
@@ -874,9 +916,8 @@ bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
   const bool small = isPreviewStream(metadataOf(f));
   if (small) fmt.alpha = false;
   if (small != d_->lastPreview) {  // the source started or stopped its preview stream: a new stream, a new size
-    d_->decoder.reset();
+    d_->hx.restart();
     d_->waiting = true;
-    d_->pendingAlpha.clear();
     d_->lastPreview = small;
   }
   const std::span<const uint8_t> data(static_cast<const uint8_t*>(f->CompressedData),
@@ -889,28 +930,22 @@ bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
     return false;
   }
   const bool vmxAlpha = fmt.alpha && part.any();  // otherwise alpha, if any, is stacked under the fill
-  if (d_->decoder && d_->decoder->codec() != codec) d_->decoder.reset();  // the source came back with the other codec
   uint64_t seq = 0;
   if (!d_->admit(f, codec, au, vmxAlpha, seq)) return false;
-  if (!d_->decoder) d_->decoder = std::make_unique<Decoder>(codec);
+  if (!d_->hx.decoder) d_->hx.decoder = std::make_unique<Decoder>(codec);
   auto fail = [&] {
     d_->waiting = true;
-    d_->pendingAlpha.clear();
+    d_->hx.pendingAlpha.clear();
     d_->discard();
     return false;
   };
 
   const auto t0 = Clock::now();
-  if (vmxAlpha) {
-    auto a = d_->takeAlpha(fmt, part, vmx);
-    if (!a) return fail();
-    d_->pendingAlpha.emplace_back(f->Timestamp, std::move(a));
-    if (d_->pendingAlpha.size() > 32) d_->pendingAlpha.pop_front();  // far more than a decoder holds
-  }
+  if (vmxAlpha && !d_->hx.queueAlpha(fmt, part, vmx, f->Timestamp)) return fail();
   int64_t timestamp = 0;
   const bool gpu = d_->pixels == PixelFormat::Gpu;
   const auto decoded = std::make_shared<GpuPicture>();
-  const Decoded result = d_->decoder->decodeFrame(au, f->Timestamp, decoded->frame, timestamp);
+  const Decoded result = d_->hx.decoder->decodeFrame(au, f->Timestamp, decoded->frame, timestamp);
   if (result == Decoded::NeedMore) {  // the decoder took the keyframe and is filling its pipeline
     d_->waiting = false;
     return false;
@@ -969,7 +1004,7 @@ bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
           std::lock_guard lock(d_->statsMutex);
           d_->stats.mode = Mode::Hx;
           d_->stats.codec = codec;
-          d_->stats.decoder = d_->decoder->name();
+          d_->stats.decoder = d_->hx.decoder->name();
           if (!encoder.empty()) d_->stats.encoder = encoder;
         }
         return d_->deliver(out, false, t0);
@@ -980,10 +1015,7 @@ bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
   std::shared_ptr<GpuPicture> picture = gpu ? decoded : nullptr;
   std::shared_ptr<const std::vector<uint8_t>> alpha;  // the alpha of the frame the picture came from
   if (vmxAlpha) {
-    while (!d_->pendingAlpha.empty() && !alpha) {
-      if (d_->pendingAlpha.front().first == timestamp) alpha = d_->pendingAlpha.front().second;
-      d_->pendingAlpha.pop_front();
-    }
+    alpha = d_->hx.popAlpha(timestamp);
     if (!alpha) return fail();
   }
   if (small) {
@@ -1019,7 +1051,7 @@ bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
   std::lock_guard lock(d_->statsMutex);
   d_->stats.mode = Mode::Hx;
   d_->stats.codec = codec;
-  d_->stats.decoder = d_->decoder->name() + (vmxAlpha ? " + vmx alpha" : "");
+  d_->stats.decoder = d_->hx.decoder->name() + (vmxAlpha ? " + vmx alpha" : "");
   if (!encoder.empty()) d_->stats.encoder.assign(encoder.begin(), encoder.end());
   d_->stats.lastDecodeMs = msSince(t0);
   ++d_->stats.framesReceived;
@@ -1129,6 +1161,110 @@ std::vector<std::string> discover() {
   std::vector<std::string> out;
   for (int i = 0; names && i < count; ++i) out.emplace_back(names[i]);
   return out;
+}
+
+// ---------------------------------------------------------------- FrameDecoder
+
+struct FrameDecoder::Impl {
+  explicit Impl(PixelFormat p) : pixels(p) {
+    if (p != PixelFormat::Uyvy) throw std::invalid_argument("FrameDecoder decodes Uyvy only for now");
+  }
+  ~Impl() { VMX_Destroy(vmx); }
+
+  PixelFormat pixels;
+  HxStream hx;
+  Nv12 picture;
+  bool waiting = true;  // Hx: no picture until a keyframe
+  ::VMX_INSTANCE* vmx = nullptr;
+  int width = 0;
+  int height = 0;
+};
+
+FrameDecoder::FrameDecoder(PixelFormat pixels) : d_(std::make_unique<Impl>(pixels)) {}
+
+FrameDecoder::~FrameDecoder() = default;
+
+void FrameDecoder::reset() {
+  d_->hx.restart();
+  d_->waiting = true;
+}
+
+std::string FrameDecoder::name() const {
+  if (d_->vmx) return "vmx";
+  return d_->hx.decoder ? d_->hx.decoder->name() : std::string();
+}
+
+bool FrameDecoder::decode(const CodedFrame& c, VideoFrame& out) {
+  const VideoFormat& fmt = c.format;
+  if (c.data.empty() || fmt.width <= 0 || fmt.height <= 0 || c.data.size() > 0x7FFFFFFF) return false;
+  out.gpu.reset();
+  out.nv12Y = out.nv12UV = nullptr;
+  // VMX is intra only: every frame stands alone, so there is no keyframe to wait for.
+  if (c.mode == Mode::Full) {
+    if (!d_->vmx || fmt.width != d_->width || fmt.height != d_->height) {
+      VMX_Destroy(d_->vmx);
+      d_->vmx = VMX_Create(VMX_SIZE{fmt.width, fmt.height}, VMX_PROFILE_OMT_SQ, VMX_COLORSPACE_BT709);
+      d_->width = d_->vmx ? fmt.width : 0;
+      d_->height = d_->vmx ? fmt.height : 0;
+      if (!d_->vmx) return false;
+    }
+    if (VMX_LoadFrom(d_->vmx, const_cast<uint8_t*>(c.data.data()), static_cast<int>(c.data.size())) != VMX_ERR_OK)
+      return false;
+    out.uyvy.resize(static_cast<size_t>(fmt.width) * fmt.height * (fmt.alpha ? 3 : 2));
+    const int stride = fmt.width * 2;
+    const VMX_ERR err = fmt.alpha ? VMX_DecodeUYVA(d_->vmx, out.uyvy.data(), stride)
+                                  : VMX_DecodeUYVY(d_->vmx, out.uyvy.data(), stride);
+    if (err != VMX_ERR_OK) {
+      out.uyvy.clear();
+      return false;
+    }
+    out.format = fmt;
+    out.premultiplied = fmt.alpha && (c.flags & OMTVideoFlags_PreMultiplied) != 0;
+    out.timestamp = c.timestamp;
+    return true;
+  }
+
+  // Hx: the same decode and alpha handling as Receiver::receiveVideo.
+  if (c.alphaBytes >= c.data.size()) return false;
+  const std::span<const uint8_t> data(c.data);
+  const std::span<const uint8_t> fill = data.first(data.size() - c.alphaBytes);
+  const std::span<const uint8_t> vmx = data.subspan(data.size() - c.alphaBytes);
+  const AlphaPart part{c.alphaBytes, c.alphaRepeats};
+  const bool vmxAlpha = fmt.alpha && part.any();  // otherwise alpha, if any, is stacked under the fill
+  if (!d_->hx.sameStream(c.codec, vmxAlpha)) {
+    d_->hx.restart();
+    d_->waiting = true;
+  }
+  auto fail = [&] {
+    d_->waiting = true;
+    d_->hx.pendingAlpha.clear();
+    return false;
+  };
+  if (d_->waiting && !c.keyframe) return false;
+  if (!d_->hx.decoder) d_->hx.decoder = std::make_unique<Decoder>(c.codec);
+  if (vmxAlpha && !d_->hx.queueAlpha(fmt, part, vmx, c.timestamp)) return fail();
+  int64_t timestamp = 0;
+  const Decoded result = d_->hx.decoder->decode(fill, c.timestamp, d_->picture, timestamp);
+  if (result == Decoded::NeedMore) {  // the decoder took the keyframe and is filling its pipeline
+    d_->waiting = false;
+    return false;
+  }
+  if (result != Decoded::Picture) return fail();
+  std::shared_ptr<const std::vector<uint8_t>> alpha;
+  if (vmxAlpha) {
+    alpha = d_->hx.popAlpha(timestamp);
+    if (!alpha) return fail();
+  }
+  try {
+    unpackUyvy(fmt, d_->picture, out.uyvy, alpha ? alpha->data() : nullptr);
+  } catch (const std::invalid_argument&) {
+    return fail();  // the picture does not match its header: treat it like a decode error
+  }
+  d_->waiting = false;
+  out.format = fmt;
+  out.premultiplied = fmt.alpha;
+  out.timestamp = timestamp;
+  return true;
 }
 
 }  // namespace omthx

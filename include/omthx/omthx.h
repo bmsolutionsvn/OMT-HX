@@ -175,6 +175,24 @@ class OMTHX_API Sender {
 // needs the picture in memory. False when frame.gpu is null or the copy fails.
 OMTHX_API bool download(VideoFrame& frame, PixelFormat pixels);
 
+// Decodes coded frames from a Coded receiver into pictures, as a Receiver of `pixels` would hand them back.
+// One thread at a time. Feed frames in order; after a gap, call reset().
+class OMTHX_API FrameDecoder {
+ public:
+  explicit FrameDecoder(PixelFormat pixels = PixelFormat::Uyvy);  // Uyvy only for now; others throw invalid_argument
+  ~FrameDecoder();
+  FrameDecoder(const FrameDecoder&) = delete;
+  FrameDecoder& operator=(const FrameDecoder&) = delete;
+  // False: no picture yet (waiting for a keyframe, the decoder filling its pipeline, or a bad frame).
+  bool decode(const CodedFrame& frame, VideoFrame& out);
+  void reset();  // forget the stream: the next picture comes from a keyframe
+  std::string name() const;  // "vmx", "hevc (d3d11va)", ... ; empty before the first frame
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> d_;
+};
+
 struct AudioFrame {
   int sampleRate = 0;
   int channels = 0;
