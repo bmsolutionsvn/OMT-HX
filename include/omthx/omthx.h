@@ -51,7 +51,6 @@ struct SenderStats {
   std::string encoder;         // "vmx", "hevc_amf", "h264_nvenc", ...
   uint64_t framesSent = 0;
   uint64_t keyframes = 0;      // Hx only
-  uint64_t framesIdle = 0;     // video frames not coded or sent because nobody was connected
   uint64_t bytesSent = 0;      // wire bytes, summed over all receivers
   uint64_t framesDropped = 0;  // a receiver was too slow to take a frame
   double lastEncodeMs = 0;     // Hx only: pack and encode of the last frame
@@ -60,6 +59,8 @@ struct SenderStats {
   // clock alone: the end-to-end delay without synchronised clocks. -1 until a receiver has replied; with several
   // receivers, the latest reply. Receivers reply about four times a second.
   double roundTripMs = -1;
+  // Video frames not coded or sent because nobody was connected (kept last: earlier fields keep their offsets).
+  uint64_t framesIdle = 0;
 };
 
 // What a Receiver hands back.
@@ -152,7 +153,8 @@ class OMTHX_API Sender {
   // frames or pictures, not both. Keyframe requests from this sender's receivers show in keyframeRequested.
   void sendCoded(const CodedFrame& frame);
   // True once after a receiver of this source asked for a keyframe, or lost a frame on its link: a relay passes
-  // it to its own source with Receiver::requestKeyframe. Only sendCoded collects them.
+  // it to its own source with Receiver::requestKeyframe. Only sendCoded collects them; a sender woken from idle
+  // also reports one, so the frame its new receiver gets is a keyframe.
   bool keyframeRequested();
   // planar: all samples of channel 0, then all of channel 1, and so on.
   void sendAudio(std::span<const float> planar, int sampleRate, int channels, int64_t timestamp);

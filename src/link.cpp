@@ -111,8 +111,9 @@ struct Sender::Impl {
   std::mutex statsMutex;
   SenderStats stats;
   // omt_send_connections, cached: the gate asks every frame, and the count costs a lock in libomt.
-  std::atomic<int64_t> receiversCheckedMs{-1};  // -1: never read, so the first call always counts
-  std::atomic<bool> receivers{false};
+  std::mutex receiversMutex;                     // one refresh at a time, so a stale count cannot outlive a fresh one
+  int64_t receiversCheckedMs = -1;               // -1: never read, so the first call always counts
+  bool receivers = false;
   // When the app handed this frame over, before any packing or encoding: the round trip covers the whole path.
   void noteSent(int64_t timestamp, Clock::time_point handedOver = Clock::now()) {
     sentAt.emplace_back(timestamp, handedOver);
@@ -201,12 +202,11 @@ bool Sender::Impl::askedForKeyframe() {
 
 bool Sender::Impl::hasReceivers() {
   const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
-  const int64_t checked = receiversCheckedMs.load(std::memory_order_relaxed);
-  if (checked >= 0 && nowMs - checked < 100) return receivers.load(std::memory_order_relaxed);
-  const bool any = omt_send_connections(tx) > 0;
-  receivers.store(any, std::memory_order_relaxed);
-  receiversCheckedMs.store(nowMs, std::memory_order_relaxed);
-  return any;
+  std::lock_guard lock(receiversMutex);
+  if (receiversCheckedMs >= 0 && nowMs - receiversCheckedMs < 100) return receivers;
+  receivers = omt_send_connections(tx) > 0;
+  receiversCheckedMs = nowMs;
+  return receivers;
 }
 
 bool Sender::Impl::skipVideo() {
