@@ -392,42 +392,44 @@ struct Readback::Impl {
   }
 
   bool take(bool wait, Nv12& nv12, std::vector<uint8_t>& bgra, Picture& out) {
+    // Pictures go out in order and none is skipped here: skipping stale frames is receiveVideo's job, before the
+    // decode. Skipping here dropped every picture the copy left behind: 1080p60 received 48 fps on a GTX 1650.
+    Slot* oldest = nullptr;
     Slot* newest = nullptr;
-    Slot* older = nullptr;  // the newest of the others
-    for (Slot& s : slots)
-      if (s.pending && (!newest || s.order > newest->order)) newest = &s;
-    for (Slot& s : slots)
-      if (s.pending && &s != newest && (!older || s.order > older->order)) older = &s;
-    if (!newest) return false;
+    for (Slot& s : slots) {
+      if (!s.pending) continue;
+      if (!oldest || s.order < oldest->order) oldest = &s;
+      if (!newest || s.order > newest->order) newest = &s;
+    }
+    if (!oldest) return false;
     auto* ctx = hw->device_context;
     D3D11_MAPPED_SUBRESOURCE m = {};
-    Slot* pick = newest;
-    // The newest picture if its copy finishes within half a frame of being queued: a fast GPU (1.3 ms for 4K
-    // NV12 on a GTX 1650) then adds no frame of delay. Past that, the one before, whose copy had a frame's time:
-    // a slow GPU (19 ms on an Intel UHD 630) keeps the overlap instead of waiting.
-    const VideoFormat& f = newest->picture.format;
-    const auto half = std::chrono::microseconds(
-        f.fpsN > 0 && f.fpsD > 0 ? 500'000LL * f.fpsD / f.fpsN : 8'333);
+    Slot* pick = oldest;
     HRESULT hr;
-    for (;;) {
-      {
-        Lock lock(hw);
-        hr = ctx->Map(newest->staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+    if (oldest == newest && !wait) {
+      // One copy in flight: wait up to half a frame for it, so a fast GPU (1.3 ms for 4K NV12 on a GTX 1650) adds
+      // no delay. Past that it is kept and handed out by the next call, one frame late, its copy overlapping the
+      // app's use of this frame: a slow GPU (19 ms on an Intel UHD 630) then still keeps up.
+      // ponytail: once a frame behind it stays behind until the stream pauses; catch up only if that matters.
+      const VideoFormat& f = oldest->picture.format;
+      const auto half = std::chrono::microseconds(
+          f.fpsN > 0 && f.fpsD > 0 ? 500'000LL * f.fpsD / f.fpsN : 8'333);
+      for (;;) {
+        {
+          Lock lock(hw);
+          hr = ctx->Map(oldest->staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+        }
+        if (hr != DXGI_ERROR_WAS_STILL_DRAWING) break;
+        if (std::chrono::steady_clock::now() - oldest->queued >= half) return false;
+        nap();
       }
-      if (hr != DXGI_ERROR_WAS_STILL_DRAWING || wait || std::chrono::steady_clock::now() - newest->queued >= half)
-        break;
-      nap();
+    } else {
+      // Two in flight (the older had a frame's time), or no newer picture is coming: the oldest, waiting for it.
+      Lock lock(hw);
+      hr = ctx->Map(oldest->staging.Get(), 0, D3D11_MAP_READ, 0, &m);
     }
-    // Still copying, and nothing older to hand out: keep it, the next call hands it out (or the app's timeout).
-    if (hr == DXGI_ERROR_WAS_STILL_DRAWING && !wait && !older) return false;
     Lock lock(hw);
-    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
-      if (!wait) pick = older;
-      hr = ctx->Map(pick->staging.Get(), 0, D3D11_MAP_READ, 0, &m);
-    }
-    const uint64_t taken = pick->order;
-    for (Slot& s : slots)
-      if (s.pending && s.order <= taken) s.pending = false;  // older ones are stale now
+    pick->pending = false;
     check(hr, "Map of the staging texture");
     const auto* p = static_cast<const uint8_t*>(m.pData);
     const int w = pick->width, h = pick->height;
