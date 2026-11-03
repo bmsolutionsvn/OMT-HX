@@ -76,7 +76,7 @@ foreach ($c in $cases) {
   $log = Join-Path $logDir ('{0:D2}-{1}.log' -f $i, $Role)
   if ($Role -eq 'sender') {
     $a = "--name `"$name`" --mode $($c.Mode) --quality $($c.Q) --size $($c.Size) --fps $($c.Fps)" +
-      " --until-watched $($Seconds + 30) --seconds 300"
+      " --until-watched $($Seconds + 30) --seconds 900"
     if ($c.Alpha) { $a += ' --alpha' }
     if ($c.Codec) { $a += " --codec $($c.Codec)" }
     if ($c.Send -eq 'gpu') { $a += ' --gpu' } elseif ($c.Send -eq 'uyvy') { $a += ' --uyvy' }
