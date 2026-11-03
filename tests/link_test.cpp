@@ -672,10 +672,11 @@ TEST_CASE("a coded stream that starts mid-GOP shows nothing until its next keyfr
     if (downstream.receiveVideo(out, 50)) first = out.timestamp;
   }
   replay.join();
-  // The first picture is the keyframe itself: the 20 frames before it were discarded, not decoded. Later
-  // frames are not counted: a frame lost while the decoder opens makes the receiver ask for a keyframe,
-  // which a live source answers and this replay cannot.
-  CHECK(first == rec[key].timestamp);
+  // The first picture is the keyframe or a later one: the 20 frames before it were discarded, not decoded. It
+  // may be later because frames that queue while the decoder opens are decoded but not brought to memory: the
+  // receiver shows the newest. Later frames are not counted: a frame lost while the decoder opens makes the
+  // receiver ask for a keyframe, which a live source answers and this replay cannot.
+  CHECK(first >= rec[key].timestamp);
   CHECK(downstream.stats().framesDiscarded >= 20);
   CHECK(out.format == f);
 }

@@ -2,6 +2,7 @@
 #include "codec.h"
 
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstring>
 #include <deque>
@@ -9,6 +10,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -104,8 +106,14 @@ struct Sender::Impl {
   std::string seqMeta;
   std::vector<uint8_t> payload;  // the fill's packet with its VMX alpha after it
   Clock::time_point start = Clock::now();
+  std::deque<std::pair<int64_t, Clock::time_point>> sentAt;  // recent frames' timestamps and send times, for echoes
   std::mutex statsMutex;
   SenderStats stats;
+  // When the app handed this frame over, before any packing or encoding: the round trip covers the whole path.
+  void noteSent(int64_t timestamp, Clock::time_point handedOver = Clock::now()) {
+    sentAt.emplace_back(timestamp, handedOver);
+    if (sentAt.size() > 600) sentAt.pop_front();  // ten seconds at 60 fps: far longer than any reply takes
+  }
   // Preview: a second, smaller stream, coded only while a receiver asks for it (libomt routes the frames).
   std::unique_ptr<Encoder> previewEncoder;
   VideoFormat previewSource;  // the format it was opened for
@@ -128,6 +136,8 @@ struct Sender::Impl {
   void sendPreview(const VideoFormat& fmt, int64_t timestamp, int64_t nowMs, uint64_t dropped, bool requested,
                    const AVFrame* gpu);
   void sendFull(OMTMediaFrame& f) {  // libomt encodes VMX itself
+    askedForKeyframe();  // VMX frames are all keyframes: this only reads the receivers' echoes
+    noteSent(f.Timestamp);  // before omt_send, which codes VMX
     omt_send(tx, &f);
     std::lock_guard lock(statsMutex);
     ++stats.framesSent;
@@ -161,10 +171,21 @@ void Sender::Impl::openEncoder(const VideoFormat& fmt, bool vmx, AVBufferRef* gp
 bool Sender::Impl::askedForKeyframe() {
   bool asked = false;
   while (OMTMediaFrame* m = omt_send_receive(tx, 0)) {  // messages from receivers
-    if (m->Data && m->DataLength > 0 &&
-        std::string_view(static_cast<const char*>(m->Data), static_cast<size_t>(m->DataLength)).find("<OMTHX Keyframe") !=
-            std::string_view::npos)
-      asked = true;
+    if (!m->Data || m->DataLength <= 0) continue;
+    const std::string_view text(static_cast<const char*>(m->Data), static_cast<size_t>(m->DataLength));
+    if (text.find("<OMTHX Keyframe") != std::string_view::npos) asked = true;
+    if (const size_t at = text.find(kEchoTag); at != std::string_view::npos) {
+      const std::string_view digits = text.substr(at + sizeof(kEchoTag) - 1);
+      int64_t ts = 0;
+      if (std::from_chars(digits.data(), digits.data() + digits.size(), ts).ec != std::errc()) continue;
+      for (auto it = sentAt.rbegin(); it != sentAt.rend(); ++it) {
+        if (it->first != ts) continue;
+        const double rtt = msSince(it->second);
+        std::lock_guard lock(statsMutex);
+        stats.roundTripMs = rtt;
+        break;
+      }
+    }
   }
   return asked;
 }
@@ -172,6 +193,7 @@ bool Sender::Impl::askedForKeyframe() {
 void Sender::Impl::sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock::time_point t0, OMTMediaFrame& f,
                                const AVFrame* gpu) {
   const bool requested = appKeyframe.exchange(false) | askedForKeyframe();
+  noteSent(timestamp, t0);  // t0: when sendVideo* was called, before the pack
   OMTStatistics omt = {};
   omt_send_getvideostatistics(tx, &omt);
   const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
@@ -500,6 +522,7 @@ void Sender::sendCoded(const CodedFrame& c) {
   const uint64_t dropped = static_cast<uint64_t>(omt.FramesDropped);
   if (d_->askedForKeyframe() || dropped > d_->codedDropped) d_->forward = true;
   d_->codedDropped = dropped;
+  d_->noteSent(f.Timestamp);
   omt_send(d_->tx, &f);
   std::lock_guard lock(d_->statsMutex);
   d_->stats.encoder = "none";
@@ -572,9 +595,56 @@ struct Receiver::Impl {
   uint64_t lastSeq = 0;
   uint64_t count = 0;    // Hx frames seen, the number given to frames of a source that does not number them
   Clock::time_point lastAsk{};
+  Clock::time_point lastEcho{};  // the last reply naming a delivered picture (Receiver::receiveVideo)
   std::atomic<bool> askPending{false};  // requestKeyframe, served on the receiving thread
+  OMTMediaFrame* stash = nullptr;  // a video frame taken from libomt while looking ahead, used by the next call
+  int skips = 0;                   // pictures skipped in this receiveVideo call, at most kMaxSkips
+  Readback readback;               // Hx pictures to memory without waiting on each copy (after decoder: goes first)
+  bool readbackFailed = false;     // the GPU refused a copy: the pictures come over as before, one by one
+  bool gpuBgraFailed = false;      // the video processor refused BGRA: copy NV12 and convert on the CPU
   std::mutex statsMutex;
   ReceiverStats stats;
+
+  // Hands out the picture Readback has ready (or, with wait, the newest one in flight) in the pixels asked for.
+  bool deliver(VideoFrame& out, bool wait, Clock::time_point t0) {
+    Readback::Picture p;
+    try {
+      if (!readback.take(wait, picture, out.bgra, p)) return false;
+    } catch (const std::runtime_error&) {
+      readbackFailed = true;
+      return false;
+    }
+    // A picture that does not match its header is treated like a decode error, as on the path without Readback.
+    auto mismatch = [&] {
+      out.nv12Y = out.nv12UV = nullptr;
+      waiting = true;
+      discard();
+      return false;
+    };
+    try {
+      if (pixels == PixelFormat::Nv12) {
+        checkNv12Picture(p.format, picture, nullptr);
+        out.nv12Y = picture.y.data();
+        out.nv12UV = picture.uv.data();
+      } else if (pixels == PixelFormat::Uyvy) {
+        unpackUyvy(p.format, picture, out.uyvy, nullptr);
+      } else if (!p.bgra) {
+        packer.unpack(p.format, picture, out.bgra, nullptr);
+      } else if (out.bgra.size() != static_cast<size_t>(p.format.width) * p.format.height * 4) {
+        return mismatch();  // the GPU made the decoder's size, not the header's
+      }
+    } catch (const std::invalid_argument&) {
+      return mismatch();
+    }
+    out.gpu.reset();
+    out.format = p.format;
+    out.premultiplied = false;
+    out.timestamp = p.timestamp;
+    std::lock_guard lock(statsMutex);
+    stats.lastDecodeMs = msSince(t0);
+    ++stats.framesReceived;
+    return true;
+  }
 
   // Asks the sender for a keyframe, at most once per 200 ms. Receiving thread only.
   void ask() {
@@ -652,11 +722,29 @@ Receiver::Receiver(const std::string& address, PixelFormat pixels, bool preview)
 Receiver::~Receiver() { omt_receive_destroy(d_->rx); }
 
 bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
+  if (!receiveOne(out, timeoutMs)) return false;
+  // About four times a second, name the picture just handed out, so the sender can time the round trip.
+  const auto now = Clock::now();
+  if (now - d_->lastEcho >= std::chrono::milliseconds(250)) {
+    d_->lastEcho = now;
+    const std::string echo = std::string(kEchoTag) + std::to_string(out.timestamp) + "\" />";
+    OMTMediaFrame m = {};
+    m.Type = OMTFrameType_Metadata;
+    m.Data = const_cast<char*>(echo.c_str());
+    m.DataLength = static_cast<int>(echo.size() + 1);  // with the terminating null, like the keyframe request
+    omt_receive_send(d_->rx, &m);
+  }
+  return true;
+}
+
+bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
   if (d_->pixels == PixelFormat::Coded) return false;
   out.nv12Y = out.nv12UV = nullptr;  // set below only for an Nv12 receiver, and only for this call
   if (d_->askPending.exchange(false)) d_->ask();
-  OMTMediaFrame* f = omt_receive(d_->rx, OMTFrameType_Video, timeoutMs);
-  if (!f) return false;
+  // A stashed frame is still valid: libomt keeps a frame until the next omt_receive for video.
+  OMTMediaFrame* f = d_->stash ? std::exchange(d_->stash, nullptr) : omt_receive(d_->rx, OMTFrameType_Video, timeoutMs);
+  // No newer frame came: hand out the one whose copy is still waiting for a successor.
+  if (!f) return d_->readback.pending() && d_->deliver(out, true, Clock::now());
   VideoFormat fmt = formatOf(f);
 
   Codec codec = Codec::Hevc;
@@ -719,7 +807,7 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
   // OMT-HX: the patched libomt hands the HEVC or H.264 access unit over untouched.
   if (!f->CompressedData || f->CompressedLength <= 0) return false;
   // The sender's encoder, for the receiver's stats panel. Older sources do not send it.
-  const std::string_view encoder = parseEncoder(metadataOf(f));
+  const std::string encoder(parseEncoder(metadataOf(f)));  // a copy: f's metadata goes when we look ahead
   // A preview stream's frame carries the source's size and flags, but holds a smaller fill without alpha.
   const bool small = isPreviewStream(metadataOf(f));
   if (small) fmt.alpha = false;
@@ -759,14 +847,69 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
   }
   int64_t timestamp = 0;
   const bool gpu = d_->pixels == PixelFormat::Gpu;
-  std::shared_ptr<GpuPicture> picture = gpu ? std::make_shared<GpuPicture>() : nullptr;
-  const Decoded result = gpu ? d_->decoder->decodeFrame(au, f->Timestamp, picture->frame, timestamp)
-                             : d_->decoder->decode(au, f->Timestamp, d_->picture, timestamp);
+  const auto decoded = std::make_shared<GpuPicture>();
+  const Decoded result = d_->decoder->decodeFrame(au, f->Timestamp, decoded->frame, timestamp);
   if (result == Decoded::NeedMore) {  // the decoder took the keyframe and is filling its pipeline
     d_->waiting = false;
     return false;
   }
   if (result != Decoded::Picture) return fail();
+  if (!gpu) {
+    // Bringing a 4K picture to memory costs far more than decoding it (about 30 ms against 1 ms on a GTX 1650).
+    // If the next frame is already queued, this picture is stale: it stays decoded, as the next one refers to it,
+    // but is not brought over. A receiver slower than the stream then shows the newest picture, and libomt's
+    // queue never overflows and drops a coded frame, which would break the picture until a keyframe.
+    constexpr int kMaxSkips = 8;  // a decoder slower than the stream still delivers every ninth picture
+    if (OMTMediaFrame* next = omt_receive(d_->rx, OMTFrameType_Video, 0)) {
+      d_->stash = next;  // taken by the call below, or by the app's next call
+      if (d_->skips < kMaxSkips) {
+        d_->waiting = false;
+        struct Depth {
+          int& n;
+          ~Depth() { --n; }
+        } depth{++d_->skips};
+        return receiveOne(out, timeoutMs);
+      }
+    }
+    // In video memory and without alpha: queue this picture's copy (converted to BGRA on the GPU for a Bgra
+    // receiver) and hand out the one before it, whose copy ran while the app used the picture before that.
+    if (!fmt.alpha && !d_->readbackFailed && Readback::accepts(decoded->frame)) {
+      if (small) {
+        fmt.width = decoded->frame->width;
+        fmt.height = decoded->frame->height;
+      }
+      bool queued = false;
+      const bool bgra = d_->pixels == PixelFormat::Bgra && !d_->gpuBgraFailed;
+      try {
+        d_->readback.push(decoded->frame, fmt, timestamp, bgra);
+        queued = true;
+      } catch (const std::runtime_error&) {
+        if (bgra) d_->gpuBgraFailed = true;
+        else d_->readbackFailed = true;
+      }
+      if (!queued && bgra && !d_->readbackFailed) {
+        try {
+          d_->readback.push(decoded->frame, fmt, timestamp, false);
+          queued = true;
+        } catch (const std::runtime_error&) {
+          d_->readbackFailed = true;
+        }
+      }
+      if (queued) {
+        d_->waiting = false;
+        {
+          std::lock_guard lock(d_->statsMutex);
+          d_->stats.mode = Mode::Hx;
+          d_->stats.codec = codec;
+          d_->stats.decoder = d_->decoder->name();
+          if (!encoder.empty()) d_->stats.encoder = encoder;
+        }
+        return d_->deliver(out, false, t0);
+      }
+    }
+    if (!downloadNv12(decoded->frame, d_->picture)) return fail();
+  }
+  std::shared_ptr<GpuPicture> picture = gpu ? decoded : nullptr;
   std::shared_ptr<const std::vector<uint8_t>> alpha;  // the alpha of the frame the picture came from
   if (vmxAlpha) {
     while (!d_->pendingAlpha.empty() && !alpha) {

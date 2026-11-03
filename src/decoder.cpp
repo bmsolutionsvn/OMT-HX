@@ -9,6 +9,11 @@ extern "C" {
 #include <stdexcept>
 #include <string>
 
+#ifdef _WIN32
+#include <dxgi1_6.h>
+#include <wrl/client.h>
+#endif
+
 namespace omthx {
 namespace {
 // Take D3D11 when FFmpeg offers it; otherwise the software format, which FFmpeg lists last.
@@ -24,6 +29,33 @@ void copyPlane(uint8_t* dst, const uint8_t* src, int srcStride, int bytes, int r
   for (int r = 0; r < rows; ++r) std::memcpy(dst + static_cast<size_t>(r) * bytes, src + static_cast<size_t>(r) * srcStride, bytes);
 }
 void borrowed(void*, uint8_t*) {}  // the buffer belongs to the caller
+
+#ifdef _WIN32
+// The GPU Windows ranks first for performance, as FFmpeg's adapter index, with its name. Without it FFmpeg takes
+// adapter 0, which on a PC with an integrated GPU may be that one: a 4K NV12 copy to memory measured 19 ms on an
+// Intel UHD 630 against 1.3 ms on the GTX 1650 in the same PC. Empty when DXGI cannot say.
+std::string highPerformanceAdapter(std::string& name) {
+  Microsoft::WRL::ComPtr<IDXGIFactory6> factory;
+  if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return {};
+  Microsoft::WRL::ComPtr<IDXGIAdapter1> best;
+  if (FAILED(factory->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&best))))
+    return {};
+  DXGI_ADAPTER_DESC1 want;
+  best->GetDesc1(&want);
+  Microsoft::WRL::ComPtr<IDXGIAdapter1> a;
+  for (UINT i = 0; factory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; ++i) {  // FFmpeg counts in this order
+    DXGI_ADAPTER_DESC1 d;
+    a->GetDesc1(&d);
+    if (d.AdapterLuid.LowPart != want.AdapterLuid.LowPart || d.AdapterLuid.HighPart != want.AdapterLuid.HighPart)
+      continue;
+    char utf8[256] = {};
+    WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, utf8, sizeof(utf8) - 1, nullptr, nullptr);
+    name = utf8;
+    return std::to_string(i);
+  }
+  return {};
+}
+#endif
 }  // namespace
 
 Decoder::Decoder(Codec codec) : codec_(codec) {
@@ -32,12 +64,22 @@ Decoder::Decoder(Codec codec) : codec_(codec) {
   if (!av) throw std::runtime_error("FFmpeg was built without the " + base + " decoder");
   ctx_ = avcodec_alloc_context3(av);
   ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
-  if (av_hwdevice_ctx_create(&hw_, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0) >= 0) {
+  std::string gpu, adapter;
+#ifdef _WIN32
+  adapter = highPerformanceAdapter(gpu);
+#endif
+  int rc = av_hwdevice_ctx_create(&hw_, AV_HWDEVICE_TYPE_D3D11VA, adapter.empty() ? nullptr : adapter.c_str(),
+                                  nullptr, 0);
+  if (rc < 0 && !adapter.empty()) {  // that GPU refused: FFmpeg's default, as before
+    gpu.clear();
+    rc = av_hwdevice_ctx_create(&hw_, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0);
+  }
+  if (rc >= 0) {
     ctx_->hw_device_ctx = av_buffer_ref(hw_);
     ctx_->get_format = pickFormat;
     // Surfaces a Gpu receiver's app and the encoders it feeds may still hold while the decoder goes on.
     ctx_->extra_hw_frames = 8;
-    name_ = base + " (d3d11va)";
+    name_ = base + (gpu.empty() ? " (d3d11va)" : " (d3d11va, " + gpu + ")");
   } else {
     // ponytail: four frame threads keep 1080p60 in real time but add three frames of delay.
     // Hardware decoding is the real path; this is the fallback for a PC without it.
