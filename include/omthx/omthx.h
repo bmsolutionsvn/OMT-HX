@@ -51,6 +51,7 @@ struct SenderStats {
   std::string encoder;         // "vmx", "hevc_amf", "h264_nvenc", ...
   uint64_t framesSent = 0;
   uint64_t keyframes = 0;      // Hx only
+  uint64_t framesIdle = 0;     // video frames not coded or sent because nobody was connected
   uint64_t bytesSent = 0;      // wire bytes, summed over all receivers
   uint64_t framesDropped = 0;  // a receiver was too slow to take a frame
   double lastEncodeMs = 0;     // Hx only: pack and encode of the last frame
@@ -110,8 +111,10 @@ struct CodedFrame {
 };
 
 // One OMT source. sendVideo and sendAudio may run on two threads, but each must stay on its own.
+// While nobody is connected the sends return at once: no pixels are packed, coded or handed to libomt; the first
+// frame after a receiver connects is a keyframe, and the Hx encoder stays open for 10 s of idleness.
 // In Mode::Hx, while a receiver asks for preview, the sendVideo calls also code a small preview stream for it.
-// requestKeyframe, keyframeRequested, tally and stats are safe from any thread.
+// hasReceivers, requestKeyframe, keyframeRequested, tally and stats are safe from any thread.
 class OMTHX_API Sender {
  public:
   // codec picks the Hx video codec and is ignored in Mode::Full. The receiver needs no setting.
@@ -154,6 +157,9 @@ class OMTHX_API Sender {
   // planar: all samples of channel 0, then all of channel 1, and so on.
   void sendAudio(std::span<const float> planar, int sampleRate, int channels, int64_t timestamp);
   void requestKeyframe();  // the next frame is coded as a keyframe (at most one per 200 ms)
+  // True while a receiver is connected (any connection counts, a probe's included); cached, refreshed at most
+  // every 100 ms. Safe from any thread.
+  bool hasReceivers();
   Tally tally();
   SenderStats stats();
   std::string address() const;  // "HOSTNAME (name)", the string a Receiver connects to

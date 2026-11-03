@@ -62,6 +62,8 @@ OMTHX_C_API int omthx_c_sender_audio(omthx_c_sender* sender, const float* planar
 OMTHX_C_API void omthx_c_sender_keyframe(omthx_c_sender* sender);
 // "HOSTNAME (name)", the string a receiver connects to.
 OMTHX_C_API const char* omthx_c_sender_address(omthx_c_sender* sender);
+// 1 while a receiver is connected, 0 otherwise (and for null). Cached, refreshed at most every 100 ms.
+OMTHX_C_API int omthx_c_sender_has_receivers(omthx_c_sender* sender);
 
 // Counters for the stats panel. Port and subscriber counts are not in omthx's sender stats.
 typedef struct omthx_c_sender_counters {

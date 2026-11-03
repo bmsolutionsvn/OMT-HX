@@ -136,3 +136,11 @@ TEST_CASE("the C API sends plain OMT too") {
   CHECK(omthx_c_receiver_mode(receiver) == OMTHX_C_MODE_FULL);
   omthx_c_receiver_close(receiver);
 }
+
+TEST_CASE("has_receivers is 0 for a fresh sender and for null") {
+  omthx_c_sender* sender = omthx_c_sender_open("capi-idle", OMTHX_C_MODE_HX, OMTHX_C_QUALITY_MEDIUM, OMTHX_C_CODEC_HEVC);
+  REQUIRE_MESSAGE(sender != nullptr, omthx_c_error());
+  CHECK(omthx_c_sender_has_receivers(sender) == 0);
+  CHECK(omthx_c_sender_has_receivers(nullptr) == 0);
+  omthx_c_sender_close(sender);
+}
