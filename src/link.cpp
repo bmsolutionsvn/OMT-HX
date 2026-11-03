@@ -105,6 +105,7 @@ struct Sender::Impl {
   IdleGate gate;  // send only while a receiver is connected
   std::atomic<bool> appKeyframe{false};
   std::atomic<bool> forward{false};  // sendCoded: a receiver asked for a keyframe
+  bool lastFrameCoded = false;       // the last video frame sent was coded, not a picture
   uint64_t codedDropped = 0;
   std::deque<int64_t> stamps;  // timestamps of pictures the encoder still holds
   uint64_t seq = 0;            // number of the next coded frame, carried in its metadata
@@ -151,6 +152,7 @@ struct Sender::Impl {
   void sendPreview(const VideoFormat& fmt, int64_t timestamp, int64_t nowMs, uint64_t dropped, bool requested,
                    const AVFrame* gpu);
   void sendFull(OMTMediaFrame& f) {  // libomt encodes VMX itself
+    lastFrameCoded = false;
     askedForKeyframe();  // VMX frames are all keyframes: this only reads the receivers' echoes
     noteSent(f.Timestamp);  // before omt_send, which codes VMX
     omt_send(tx, &f);
@@ -241,6 +243,10 @@ bool Sender::Impl::skipVideo() {
 
 void Sender::Impl::sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock::time_point t0, OMTMediaFrame& f,
                                const AVFrame* gpu) {
+  if (lastFrameCoded) {  // pictures after coded frames: the stream starts over, so this picture is a keyframe
+    policy = KeyframePolicy();
+    lastFrameCoded = false;
+  }
   const bool requested = appKeyframe.exchange(false) | askedForKeyframe();
   noteSent(timestamp, t0);  // t0: when sendVideo* was called, before the pack
   OMTStatistics omt = {};
@@ -587,6 +593,10 @@ void Sender::sendCoded(const CodedFrame& c) {
   if (c.mode == Mode::Hx && (c.alphaBytes >= c.data.size() || (c.alphaBytes && c.alphaRepeats)))
     throw std::invalid_argument("alphaBytes must leave room for the fill, and a frame that repeats alpha has none");
   if (d_->skipVideo()) return;
+  // Coded after pictures: the receiver's decoder has been on this sender's own stream, so the source stream has
+  // to restart with a keyframe. Asked of the source at once; a fresh relay's first coded frame asks too.
+  if (!d_->lastFrameCoded) d_->forward = true;
+  d_->lastFrameCoded = true;
   OMTMediaFrame f = videoHeader(c.format, c.timestamp);
   f.Flags = static_cast<OMTVideoFlags>(c.flags);
   f.ColorSpace = static_cast<OMTColorSpace>(c.colorSpace);

@@ -149,8 +149,10 @@ class OMTHX_API Sender {
   // Sends what a Receiver handed back, whichever picture it holds, at frame.timestamp. A Gpu picture to an Hx
   // sender is encoded where it is, in video memory, when the GPU encoder takes it, and through memory otherwise.
   void sendVideo(const VideoFrame& frame);
-  // Sends a coded frame on untouched, whatever this sender's mode (no encoder runs). Feed a sender either coded
-  // frames or pictures, not both. Keyframe requests from this sender's receivers show in keyframeRequested.
+  // Sends a coded frame on untouched, whatever this sender's mode (no encoder runs). A sender may switch between
+  // coded frames and pictures: after pictures, the next coded frame asks its source for a keyframe; after coded
+  // frames, the first picture is coded as a keyframe. Keyframe requests from this sender's receivers show in
+  // keyframeRequested.
   void sendCoded(const CodedFrame& frame);
   // True once after a receiver of this source asked for a keyframe, or lost a frame on its link: a relay passes
   // it to its own source with Receiver::requestKeyframe. Only sendCoded collects them; a sender woken from idle
