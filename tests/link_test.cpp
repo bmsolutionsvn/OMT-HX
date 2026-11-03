@@ -629,6 +629,53 @@ TEST_CASE("an HX relay passes coded frames on, and keyframe requests back") {
   CHECK_FALSE(coded.receiveVideo(nothing, 0));  // a Coded receiver decodes nothing
 }
 
+TEST_CASE("a sender switches from coded frames to pictures and back") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{640, 360, 60, 1, false};
+  Sender source("omthx-test-switch-in", Mode::Hx, Quality::Medium, Codec::Hevc);
+  Receiver coded(source.address(), PixelFormat::Coded);
+  Sender relay("omthx-test-switch-out", Mode::Hx, Quality::Medium);
+  Receiver downstream(relay.address(), PixelFormat::Uyvy);
+  Pump pump(source, f);
+  for (const auto until = Clock::now() + std::chrono::seconds(5);
+       relay.stats().connections == 0 && Clock::now() < until;)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  std::vector<uint8_t> bgra;
+  VideoFrame out;
+  bool asked = false;
+  // One second of one kind of frame, reading the receiver after each send.
+  auto spell = [&](bool pictures, int frames) {
+    int got = 0;
+    auto next = Clock::now();
+    for (int i = 0; i < frames; ++i) {
+      if (pictures) {
+        drawPattern(bgra, f.width, f.height, i, f.alpha);
+        relay.sendVideo(f, bgra, false, 1'000'000 + i * kFrame);
+      } else if (CodedFrame c; coded.receiveCoded(c, 20)) {
+        relay.sendCoded(c);
+      }
+      if (relay.keyframeRequested()) {
+        if (!pictures) asked = true;  // the switch back to coded asks its source
+        coded.requestKeyframe();
+      }
+      if (downstream.receiveVideo(out, 0)) ++got;
+      next += std::chrono::microseconds(16'667);
+      std::this_thread::sleep_until(next);
+    }
+    return got;
+  };
+  const int first = spell(false, 60);
+  const int second = spell(true, 60);
+  relay.keyframeRequested();  // drain what the pictures asked for
+  asked = false;
+  const int third = spell(false, 60);
+  CHECK(first >= 10);
+  CHECK(second >= 10);
+  CHECK(third >= 10);
+  CHECK(asked);
+}
+
 TEST_CASE("a coded stream that starts mid-GOP shows nothing until its next keyframe") {
   if (!hardware(Codec::Hevc)) return;
   const VideoFormat f{640, 360, 60, 1, false};
