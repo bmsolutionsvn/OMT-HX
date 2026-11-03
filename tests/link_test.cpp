@@ -1016,6 +1016,82 @@ TEST_CASE("sendVideoUyvy on the GPU costs less CPU than the pack") {
   MESSAGE("CPU seconds for 300 pictures at 1920x1080: GPU path " << gpu << ", pack " << pack);
   CHECK(gpu < pack);
 }
+
+namespace {
+// The same picture as UYVY for the measurement's second loop: BT.709, limited range, chroma shared by pixel pairs.
+// Its exact colour does not matter here; both loops must carry the same picture so VMX codes the same thing.
+std::vector<uint8_t> uyvyFor(const std::vector<uint8_t>& bgra, int w, int h) {
+  std::vector<uint8_t> out(static_cast<size_t>(w) * h * 2);
+  auto byte = [](int v) { return static_cast<uint8_t>(std::clamp(v, 0, 255)); };
+  for (int y = 0; y < h; ++y) {
+    const uint8_t* row = bgra.data() + static_cast<size_t>(y) * w * 4;
+    uint8_t* o = out.data() + static_cast<size_t>(y) * w * 2;
+    for (int x = 0; x < w; x += 2) {
+      const uint8_t* a = row + x * 4;
+      const uint8_t* b = a + 4;
+      const int r = (a[2] + b[2]) / 2, g = (a[1] + b[1]) / 2, bl = (a[0] + b[0]) / 2;
+      o[x * 2] = byte(128 + ((-38 * r - 74 * g + 112 * bl) >> 8));              // U
+      o[x * 2 + 1] = byte(16 + ((47 * a[2] + 157 * a[1] + 16 * a[0]) >> 8));    // Y0
+      o[x * 2 + 2] = byte(128 + ((112 * r - 94 * g - 18 * bl) >> 8));           // V
+      o[x * 2 + 3] = byte(16 + ((47 * b[2] + 157 * b[1] + 16 * b[0]) >> 8));    // Y1
+    }
+  }
+  return out;
+}
+}  // namespace
+
+TEST_CASE("plain OMT: CPU per frame, BGRA vs UYVY") {
+  const VideoFormat f{1920, 1080, 60, 1, false};
+  Sender sender("omthx-test-full-cost", Mode::Full, Quality::Medium);
+  Receiver receiver(sender.address(), PixelFormat::Uyvy);
+  std::atomic<int> pictures{0};
+  std::jthread drain([&](std::stop_token token) {
+    VideoFrame frame;
+    while (!token.stop_requested())
+      if (receiver.receiveVideo(frame, 20)) ++pictures;
+  });
+  const auto deadline = Clock::now() + std::chrono::seconds(5);
+  while (!sender.hasReceivers() && Clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  REQUIRE(sender.hasReceivers());
+
+  std::vector<uint8_t> bgra;
+  drawPattern(bgra, f.width, f.height, 0, false);
+  const std::vector<uint8_t> uyvy = uyvyFor(bgra, f.width, f.height);
+
+  const auto processSeconds = [] {
+    FILETIME idle{}, kernel{}, user{}, exit{};
+    GetProcessTimes(GetCurrentProcess(), &idle, &kernel, &user, &exit);
+    auto ticks = [](const FILETIME& t) { return (static_cast<uint64_t>(t.dwHighDateTime) << 32) | t.dwLowDateTime; };
+    return static_cast<double>(ticks(kernel) + ticks(user)) / 10'000'000.0;  // FILETIME: 100 ns
+  };
+  const auto measure = [&](bool asUyvy) {
+    const uint64_t sentBefore = sender.stats().framesSent;
+    const double cpu = processSeconds();
+    auto next = Clock::now();
+    for (int i = 0; i < 300; ++i) {
+      if (asUyvy)
+        sender.sendVideoUyvy(f, uyvy.data(), f.width * 2, nullptr, 0, false, 1'000'000 + i * kFrame);
+      else
+        sender.sendVideo(f, bgra, false, 1'000'000 + i * kFrame);
+      next += std::chrono::microseconds(16'667);
+      std::this_thread::sleep_until(next);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));  // the drain thread takes the last frames too
+    return std::make_pair(processSeconds() - cpu, sender.stats().framesSent - sentBefore);
+  };
+
+  const auto bgraRun = measure(false);
+  const auto uyvyRun = measure(true);
+  drain.request_stop();
+  drain.join();
+
+  const double bgraMs = bgraRun.first * 1000 / 300, uyvyMs = uyvyRun.first * 1000 / 300;
+  MESSAGE("plain OMT 1920x1080: BGRA " << bgraMs << " ms per frame, UYVY " << uyvyMs << " ms, "
+                                       << (bgraMs > 0 ? (bgraMs - uyvyMs) * 100 / bgraMs : 0) << "% less CPU");
+  CHECK(bgraRun.second == 300);
+  CHECK(uyvyRun.second == 300);  // the saving is not frames skipped
+  CHECK(pictures.load() > 0);
+}
 #endif
 
 TEST_CASE("an HX sender with no receiver codes nothing") {
