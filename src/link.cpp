@@ -384,6 +384,9 @@ Sender::Sender(const std::string& name, Mode mode, Quality quality, Codec codec)
   if (!d_->tx) throw std::runtime_error("cannot create the OMT source \"" + name + "\"");
   const char* noGpuUyvy = std::getenv("OMTHX_NO_GPU_UYVY");
   d_->uyvyGpu = !(noGpuUyvy && *noGpuUyvy);
+  // Test hook: stands in for an encoder the default adapter cannot feed, which no test PC can provide for real.
+  const char* pretendRefused = std::getenv("OMTHX_TEST_GPU_REFUSED");
+  if (pretendRefused && *pretendRefused) d_->gpuRefused = true;
   if (mode == Mode::Full) d_->stats.encoder = "vmx";
 }
 

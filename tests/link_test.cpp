@@ -962,6 +962,29 @@ TEST_CASE("OMTHX_NO_GPU_UYVY keeps the CPU path") {
   CHECK(sender.stats().encoder.rfind(codecName(Codec::Hevc), 0) == 0);
 }
 
+TEST_CASE("UYVY keeps sending when the encoder refuses D3D11 frames") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{640, 360, 60, 1, false};
+  const std::vector<uint8_t> pic = uyvyGrey(f.width, f.height);
+  // A PC whose adapter cannot feed the encoder: the hook stands in for an encoder that takes no D3D11 pictures.
+  _putenv_s("OMTHX_TEST_GPU_REFUSED", "1");
+  Sender sender("omthx-test-uyvy-refused", Mode::Hx, Quality::Medium);
+  Receiver receiver(sender.address(), PixelFormat::Nv12);
+  VideoFrame frame;
+  int got = 0;
+  auto next = Clock::now();
+  for (int i = 0; i < 120; ++i) {
+    sender.sendVideoUyvy(f, pic.data(), f.width * 2, nullptr, 0, false, 1'000'000 + i * kFrame);
+    if (receiver.receiveVideo(frame, 0)) ++got;
+    next += std::chrono::microseconds(16'667);
+    std::this_thread::sleep_until(next);
+  }
+  _putenv_s("OMTHX_TEST_GPU_REFUSED", "");
+  MESSAGE("encoded by " << sender.stats().encoder << ", " << got << " pictures");
+  CHECK(got > 10);  // the frame that met the refusal goes through memory; the later ones through packUyvy
+  CHECK(sender.stats().encoder.find("(d3d11)") == std::string::npos);
+}
+
 TEST_CASE("sendVideoUyvy on the GPU costs less CPU than the pack") {
   if (!hardware(Codec::Hevc)) return;
   const VideoFormat f{1920, 1080, 60, 1, false};
