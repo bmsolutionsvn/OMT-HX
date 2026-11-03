@@ -77,6 +77,19 @@ class KeyframePolicy {
   int64_t lastKeyMs_ = 0;
 };
 
+// Whether a sender codes this video frame: only while a receiver is connected (encode on demand).
+class IdleGate {
+ public:
+  static constexpr int64_t kWarmMs = 10'000;  // encoders stay open this long after the last receiver leaves
+  enum class Step { Send, Resume, Skip, SkipAndClose };
+  Step next(int64_t nowMs, bool receivers);
+
+ private:
+  bool idle_ = false;
+  bool closed_ = false;
+  int64_t spellStartedMs_ = 0;
+};
+
 struct Nv12 {
   int width = 0;
   int height = 0;

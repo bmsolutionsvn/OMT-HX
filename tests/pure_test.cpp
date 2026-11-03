@@ -224,6 +224,33 @@ TEST_CASE("KeyframePolicy: first frame, requests limited to one per 200 ms, new 
   CHECK(p.next(10400, 1, false));      // 10 seconds since the last keyframe
 }
 
+TEST_CASE("IdleGate: sends while a receiver is connected") {
+  IdleGate g;
+  CHECK(g.next(0, true) == IdleGate::Step::Send);
+  CHECK(g.next(16, true) == IdleGate::Step::Send);
+}
+
+TEST_CASE("IdleGate: skips while idle, closes once after 10 s, resumes with a keyframe") {
+  IdleGate g;
+  CHECK(g.next(0, true) == IdleGate::Step::Send);
+  CHECK(g.next(100, false) == IdleGate::Step::Skip);
+  CHECK(g.next(10'099, false) == IdleGate::Step::Skip);
+  CHECK(g.next(10'100, false) == IdleGate::Step::SkipAndClose);
+  CHECK(g.next(10'116, false) == IdleGate::Step::Skip);
+  CHECK(g.next(20'000, true) == IdleGate::Step::Resume);
+  CHECK(g.next(20'016, true) == IdleGate::Step::Send);
+}
+
+TEST_CASE("IdleGate: a receiver back within 10 s resumes without a close, and the next spell starts afresh") {
+  IdleGate g;
+  CHECK(g.next(0, false) == IdleGate::Step::Skip);
+  CHECK(g.next(5'000, false) == IdleGate::Step::Skip);
+  CHECK(g.next(5'016, true) == IdleGate::Step::Resume);
+  CHECK(g.next(6'000, false) == IdleGate::Step::Skip);
+  CHECK(g.next(15'999, false) == IdleGate::Step::Skip);
+  CHECK(g.next(16'000, false) == IdleGate::Step::SkipAndClose);
+}
+
 #include <cstdlib>
 #include <stdexcept>
 
