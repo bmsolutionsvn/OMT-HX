@@ -124,12 +124,18 @@ modes spend bandwidth to save latency.
 | OMT (full) | VMX, intra, visually lossless | ~200 Mbps | ~9 ms | yes, in the BGRA frame | libomt owns it, no GPU codec |
 | OMT-HX, HEVC | HEVC (H.265), GPU hardware | 15 / 30 / 50 Mbps | 10-15 ms | optional, VMX on the CPU | ~4-7 ms to send, ~4-7 ms to receive, CPU colour conversion included |
 | OMT-HX, H.264 | H.264, GPU hardware | 21 / 42 / 70 Mbps | 10-16 ms | optional, VMX on the CPU | ~5-8 ms to send, ~4-7 ms to receive, CPU colour conversion included |
-| NDI (High Bandwidth) | SpeedHQ, intra | ~150 Mbps | ~16 ms | yes, RGBA 4:4:4:4 | CPU |
-| NDI\|HX | H.264 / HEVC | 1-50 Mbps | 80-200 ms | limited, 4:2:0 | CPU or GPU |
+| NDI (High Bandwidth) | SpeedHQ, intra | ~130 Mbps | "ultra-low", no figure published | yes, RGBA 4:4:4:4 | CPU |
+| NDI\|HX3 | H.264 / HEVC | ~62 / ~50 Mbps | under 100 ms glass-to-glass | limited, 4:2:0 | CPU or GPU |
+| NDI\|HX2 | H.264 / HEVC | ~16 / ~11 Mbps | under 150 ms glass-to-glass | limited, 4:2:0 | CPU or GPU |
 
 - The OMT and OMT-HX rows are measured on one PC over `localhost` ([docs/MEASUREMENTS.md](docs/MEASUREMENTS.md)),
-  so they are codec and library figures with no network in the path. The NDI and NDI|HX rows are
-  vendor-published typicals, not measured here. A real link adds its one-way time to every mode.
+  so they are codec and library figures with no network in the path. The NDI rows are NDI's own
+  published typicals, not measured here: [High Bandwidth](https://docs.ndi.video/brand/ndi-formats/understanding-ndi-formats/ndi-high-bandwidth),
+  [NDI|HX3](https://docs.ndi.video/brand/ndi-formats/understanding-ndi-formats/ndi-hx3) and
+  [NDI|HX2](https://docs.ndi.video/brand/ndi-formats/understanding-ndi-formats/ndi-hx2) (read 2026-11-03).
+  NDI quotes glass-to-glass latency, camera to screen, so its latency column is not the same
+  measurement as the OMT rows'. A real link adds its one-way time to every mode; the two-PC figures
+  are in docs/MEASUREMENTS.md.
 - OMT-HX's delay is the encode/decode round trip, with no frame held at either end: it measured
   10 ms at 720p60 and 15 ms at 1080p60 (29 and 42 ms before 2026-10-19, when every packet left the
   sender one frame late). The sender waits the few ms the hardware encoder needs for each packet.
