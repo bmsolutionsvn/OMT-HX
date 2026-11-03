@@ -599,6 +599,7 @@ struct Receiver::Impl {
   std::atomic<bool> askPending{false};  // requestKeyframe, served on the receiving thread
   OMTMediaFrame* stash = nullptr;  // a video frame taken from libomt while looking ahead, used by the next call
   int skips = 0;                   // pictures skipped in this receiveVideo call, at most kMaxSkips
+  bool lookedBehind = false;       // the last look ahead found a newer frame already waiting
   Readback readback;               // Hx pictures to memory without waiting on each copy (after decoder: goes first)
   bool readbackFailed = false;     // the GPU refused a copy: the pictures come over as before, one by one
   bool gpuBgraFailed = false;      // the video processor refused BGRA: copy NV12 and convert on the CPU
@@ -860,9 +861,12 @@ bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
     // but is not brought over. A receiver slower than the stream then shows the newest picture, and libomt's
     // queue never overflows and drops a coded frame, which would break the picture until a keyframe.
     constexpr int kMaxSkips = 8;  // a decoder slower than the stream still delivers every ninth picture
+    // Behind means a newer frame was waiting on the last look too: two frames that arrive together (a network
+    // burst) are both shown, and only a receiver that stays behind skips.
     if (OMTMediaFrame* next = omt_receive(d_->rx, OMTFrameType_Video, 0)) {
       d_->stash = next;  // taken by the call below, or by the app's next call
-      if (d_->skips < kMaxSkips) {
+      const bool behind = std::exchange(d_->lookedBehind, true);
+      if (behind && d_->skips < kMaxSkips) {
         d_->waiting = false;
         struct Depth {
           int& n;
@@ -870,6 +874,8 @@ bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
         } depth{++d_->skips};
         return receiveOne(out, timeoutMs);
       }
+    } else {
+      d_->lookedBehind = false;
     }
     // In video memory and without alpha: queue this picture's copy (converted to BGRA on the GPU for a Bgra
     // receiver) and hand out the one before it, whose copy ran while the app used the picture before that.
