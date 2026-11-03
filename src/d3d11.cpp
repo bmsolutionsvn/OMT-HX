@@ -405,28 +405,21 @@ struct Readback::Impl {
     auto* ctx = hw->device_context;
     D3D11_MAPPED_SUBRESOURCE m = {};
     Slot* pick = oldest;
+    // Without wait and one copy in flight: wait up to half a frame for it, then keep it for the next call.
+    const VideoFormat& f = oldest->picture.format;
+    const auto half = std::chrono::microseconds(f.fpsN > 0 && f.fpsD > 0 ? 500'000LL * f.fpsD / f.fpsN : 8'333);
+    const bool mayKeep = oldest == newest && !wait;
+    // Polled, never a blocking Map: that one holds the decoder's lock and, on a GTX 1650, took 17 ms for a 4K NV12
+    // copy and up to 70 ms for BGRA (2026-11-04), against 1.3 and 3 ms of GPU work.
     HRESULT hr;
-    if (oldest == newest && !wait) {
-      // One copy in flight: wait up to half a frame for it, so a fast GPU (1.3 ms for 4K NV12 on a GTX 1650) adds
-      // no delay. Past that it is kept and handed out by the next call, one frame late, its copy overlapping the
-      // app's use of this frame: a slow GPU (19 ms on an Intel UHD 630) then still keeps up.
-      // ponytail: once a frame behind it stays behind until the stream pauses; catch up only if that matters.
-      const VideoFormat& f = oldest->picture.format;
-      const auto half = std::chrono::microseconds(
-          f.fpsN > 0 && f.fpsD > 0 ? 500'000LL * f.fpsD / f.fpsN : 8'333);
-      for (;;) {
-        {
-          Lock lock(hw);
-          hr = ctx->Map(oldest->staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
-        }
-        if (hr != DXGI_ERROR_WAS_STILL_DRAWING) break;
-        if (std::chrono::steady_clock::now() - oldest->queued >= half) return false;
-        nap();
+    for (;;) {
+      {
+        Lock lock(hw);
+        hr = ctx->Map(oldest->staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
       }
-    } else {
-      // Two in flight (the older had a frame's time), or no newer picture is coming: the oldest, waiting for it.
-      Lock lock(hw);
-      hr = ctx->Map(oldest->staging.Get(), 0, D3D11_MAP_READ, 0, &m);
+      if (hr != DXGI_ERROR_WAS_STILL_DRAWING) break;
+      if (mayKeep && std::chrono::steady_clock::now() - oldest->queued >= half) return false;
+      nap();
     }
     Lock lock(hw);
     pick->pending = false;
@@ -480,6 +473,8 @@ bool Readback::pending() const {
   return false;
 }
 
+void Readback::nap() { d_->nap(); }
+
 }  // namespace omthx
 
 #else
@@ -499,6 +494,7 @@ void Readback::push(const AVFrame*, const VideoFormat&, int64_t, bool) {
   throw std::runtime_error("D3D11 readback is Windows only");
 }
 bool Readback::take(bool, Nv12&, std::vector<uint8_t>&, Picture&) { return false; }
+void Readback::nap() {}
 bool Readback::pending() const { return false; }
 }  // namespace omthx
 

@@ -795,6 +795,14 @@ bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
   if (d_->pixels == PixelFormat::Coded) return false;
   out.nv12Y = out.nv12UV = nullptr;  // set below only for an Nv12 receiver, and only for this call
   if (d_->askPending.exchange(false)) d_->ask();
+  // A copy left over from the last call goes out as soon as it is done, unless the next frame comes first (then
+  // the copies overlap, as a 4K stream needs on a GTX 1650). Waiting for the next frame instead kept a receiver
+  // that once missed the half-frame wait a frame behind: 1080p60 at 25 ms against 15.
+  while (!d_->stash && d_->readback.pending() && !d_->readbackFailed) {
+    if (d_->deliver(out, false, Clock::now())) return true;
+    if ((d_->stash = omt_receive(d_->rx, OMTFrameType_Video, 0))) break;
+    d_->readback.nap();
+  }
   // A stashed frame is still valid: libomt keeps a frame until the next omt_receive for video.
   OMTMediaFrame* f = d_->stash ? std::exchange(d_->stash, nullptr) : omt_receive(d_->rx, OMTFrameType_Video, timeoutMs);
   // No newer frame came: hand out the one whose copy is still waiting for a successor.
@@ -931,7 +939,8 @@ bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
       d_->lookedBehind = false;
     }
     // In video memory and without alpha: queue this picture's copy (converted to BGRA on the GPU for a Bgra
-    // receiver) and hand out the one before it, whose copy ran while the app used the picture before that.
+    // receiver) and hand it out if it is done within half a frame, else on the next call. Waiting for every copy
+    // instead held a GTX 1650 to 46 fps at 4K NV12 and 21 at BGRA (2026-11-04).
     if (!fmt.alpha && !d_->readbackFailed && Readback::accepts(decoded->frame)) {
       if (small) {
         fmt.width = decoded->frame->width;
