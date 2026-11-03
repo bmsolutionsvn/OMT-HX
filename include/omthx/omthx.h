@@ -179,7 +179,8 @@ OMTHX_API bool download(VideoFrame& frame, PixelFormat pixels);
 // One thread at a time. Feed frames in order; after a gap, call reset().
 class OMTHX_API FrameDecoder {
  public:
-  explicit FrameDecoder(PixelFormat pixels = PixelFormat::Uyvy);  // Uyvy only for now; others throw invalid_argument
+  // Uyvy or Nv12, with the meanings a Receiver of that format gives; others throw invalid_argument.
+  explicit FrameDecoder(PixelFormat pixels = PixelFormat::Uyvy);
   ~FrameDecoder();
   FrameDecoder(const FrameDecoder&) = delete;
   FrameDecoder& operator=(const FrameDecoder&) = delete;

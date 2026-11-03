@@ -1017,6 +1017,62 @@ TEST_CASE("FrameDecoder decodes an HX source's coded frames like a Uyvy receiver
   CHECK_FALSE(decoder.name().empty());
 }
 
+TEST_CASE("FrameDecoder(Nv12) hands back the decoder's planes") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{640, 360, 60, 1, false};
+  Sender sender("omthx-test-framedecoder-nv12", Mode::Hx, Quality::Medium, Codec::Hevc);
+  Receiver coded(sender.address(), PixelFormat::Coded);
+  Receiver nv12(sender.address(), PixelFormat::Nv12);
+  Pump pump(sender, f);
+
+  FrameDecoder decoder(PixelFormat::Nv12);
+  CodedFrame c;
+  VideoFrame out;
+  std::map<int64_t, uint8_t> centre;  // the Nv12 receiver's Y at the centre, by timestamp
+  int pictures = 0, compared = 0;
+  const auto deadline = Clock::now() + std::chrono::seconds(10);
+  while (pictures < 30 && Clock::now() < deadline) {
+    VideoFrame r;
+    while (nv12.receiveVideo(r, 0)) centre[r.timestamp] = r.nv12Y[180u * 640 + 320];
+    if (!coded.receiveCoded(c, 20)) continue;
+    if (!decoder.decode(c, out)) continue;
+    ++pictures;
+    REQUIRE(out.nv12Y != nullptr);
+    REQUIRE(out.nv12UV != nullptr);
+    CHECK(out.format == f);
+    const auto it = centre.find(out.timestamp);
+    if (it != centre.end()) {
+      CHECK(std::abs(static_cast<int>(out.nv12Y[180u * 640 + 320]) - it->second) <= 4);
+      ++compared;
+    }
+  }
+  CHECK(pictures >= 25);
+  CHECK(compared > 0);
+}
+
+TEST_CASE("FrameDecoder(Nv12) packs a VMX frame") {
+  const VideoFormat f{640, 360, 60, 1, false};
+  Sender sender("omthx-test-framedecoder-vmx-nv12", Mode::Full, Quality::Medium);
+  Receiver coded(sender.address(), PixelFormat::Coded);
+  Pump pump(sender, f);
+
+  FrameDecoder decoder(PixelFormat::Nv12);
+  CodedFrame c;
+  VideoFrame out;
+  bool picture = false;
+  const auto deadline = Clock::now() + std::chrono::seconds(10);
+  while (!picture && Clock::now() < deadline) {
+    if (coded.receiveCoded(c, 50)) picture = decoder.decode(c, out);
+  }
+  REQUIRE(picture);
+  CHECK(out.nv12Y != nullptr);
+  CHECK(out.nv12UV != nullptr);
+  CHECK(out.format.width == f.width);
+  CHECK(out.format.height == f.height);
+  CHECK_FALSE(out.format.alpha);
+  CHECK(decoder.name() == "vmx");
+}
+
 TEST_CASE("FrameDecoder decodes plain OMT VMX with alpha") {
   const VideoFormat f{640, 360, 60, 1, true};
   Sender sender("omthx-test-framedecoder-vmx", Mode::Full, Quality::Medium);
