@@ -55,6 +55,10 @@ struct SenderStats {
   uint64_t framesDropped = 0;  // a receiver was too slow to take a frame
   double lastEncodeMs = 0;     // Hx only: pack and encode of the last frame
   int connections = 0;
+  // From sending a frame to a receiver handing it to its app, plus the receiver's short reply, timed on this PC's
+  // clock alone: the end-to-end delay without synchronised clocks. -1 until a receiver has replied; with several
+  // receivers, the latest reply. Receivers reply about four times a second.
+  double roundTripMs = -1;
 };
 
 // What a Receiver hands back.
@@ -207,6 +211,7 @@ class OMTHX_API Receiver {
   ReceiverStats stats();
 
  private:
+  bool receiveOne(VideoFrame& out, int timeoutMs);  // receiveVideo without the reply that times the round trip
   struct Impl;
   std::unique_ptr<Impl> d_;
 };

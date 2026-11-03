@@ -178,41 +178,56 @@ std::vector<Packet> Encoder::encodeGpu(const AVFrame* pic, bool forceKeyframe) {
 }
 
 std::vector<Packet> Encoder::send(bool forceKeyframe) {
+  const auto started = std::chrono::steady_clock::now();
   frame_->color_range = AVCOL_RANGE_JPEG;
   frame_->colorspace = AVCOL_SPC_BT709;
   frame_->pts = index_++;
   frame_->pict_type = forceKeyframe ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+  std::vector<Packet> out;
+  while (receive(out) >= 0) {
+  }  // the previous picture's packet, if it came out since the last call: it goes before this upload
   const int rc = avcodec_send_frame(ctx_, frame_);
   av_frame_unref(frame_);  // the encoder holds its own reference, or its own copy
   if (rc < 0) throw std::runtime_error(std::string(codecName(codec_)) + " encode failed: " + averr(rc));
   ++owed_;
-  return drain();
+  drain(started, out);
+  return out;
 }
 
-// AMF hands the packet back a few ms after the picture, not inside avcodec_send_frame: taking only what is ready
-// would send every picture one frame late (16.7 ms at 60 fps). Waiting for it measured about 3 ms for 1080p on
-// hevc_amf. The wait stops after one frame time, so a stalled encoder costs one frame, as before.
-std::vector<Packet> Encoder::drain() {
+// One ready packet into out; returns avcodec_receive_packet's result.
+int Encoder::receive(std::vector<Packet>& out) {
+  const int rc = avcodec_receive_packet(ctx_, packet_);
+  if (rc < 0) return rc;
   const int firstParameterSet = codec_ == Codec::H264 ? 7 : 32;  // SPS; VPS
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(frameUs_);
-  std::vector<Packet> out;
+  Packet p;
+  p.data.assign(packet_->data, packet_->data + packet_->size);
+  p.keyframe = isKeyframe(codec_, p.data);
+  // Safety net for an encoder that keeps its parameter sets out of band.
+  if (p.keyframe && !hasNalType(codec_, p.data, firstParameterSet) && ctx_->extradata_size > 4 &&
+      ctx_->extradata[0] == 0 && ctx_->extradata[1] == 0) {
+    p.data.insert(p.data.begin(), ctx_->extradata, ctx_->extradata + ctx_->extradata_size);
+  }
+  out.push_back(std::move(p));
+  av_packet_unref(packet_);
+  owed_ = owed_ > 0 ? owed_ - 1 : 0;
+  return rc;
+}
+
+// AMF hands the packet back some ms after the picture, not inside avcodec_send_frame. Waiting for it costs
+// nothing while it fits in the frame (about 3 ms for 1080p on hevc_amf), so this picture's packet is waited for
+// until half a frame after the call began. Past that the encoder would run one picture at a time: 4K HEVC on an
+// RX 6600 measured 56 fps waiting and 100 fps overlapped. The packet then goes out at the start of the next call.
+// Older pictures are still waited for up to one frame time, so a stalled encoder costs one frame, as before.
+// ponytail: a fixed half-frame budget; time the caller's own per-frame work if a caller needs more of the frame.
+void Encoder::drain(std::chrono::steady_clock::time_point started, std::vector<Packet>& out) {
+  const auto stalled = std::chrono::steady_clock::now() + std::chrono::microseconds(frameUs_);
+  const auto own = started + std::chrono::microseconds(frameUs_ / 2);
   for (;;) {
-    const int rc = avcodec_receive_packet(ctx_, packet_);
-    if (rc >= 0) {
-      Packet p;
-      p.data.assign(packet_->data, packet_->data + packet_->size);
-      p.keyframe = isKeyframe(codec_, p.data);
-      // Safety net for an encoder that keeps its parameter sets out of band.
-      if (p.keyframe && !hasNalType(codec_, p.data, firstParameterSet) && ctx_->extradata_size > 4 &&
-          ctx_->extradata[0] == 0 && ctx_->extradata[1] == 0) {
-        p.data.insert(p.data.begin(), ctx_->extradata, ctx_->extradata + ctx_->extradata_size);
-      }
-      out.push_back(std::move(p));
-      av_packet_unref(packet_);
-      owed_ = owed_ > 0 ? owed_ - 1 : 0;
-      continue;
-    }
-    if (rc != AVERROR(EAGAIN) || owed_ == 0 || std::chrono::steady_clock::now() >= deadline) break;
+    const int rc = receive(out);
+    if (rc >= 0) continue;
+    if (rc != AVERROR(EAGAIN) || owed_ == 0) break;
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= stalled || (owed_ == 1 && now >= own)) break;
 #ifdef _WIN32
     if (timer_) {
       LARGE_INTEGER due{};
@@ -225,7 +240,6 @@ std::vector<Packet> Encoder::drain() {
     std::this_thread::sleep_for(std::chrono::microseconds(200));
 #endif
   }
-  return out;
 }
 
 }  // namespace omthx

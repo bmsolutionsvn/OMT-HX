@@ -1,5 +1,6 @@
 #pragma once
 // Internal to omthx. Apps include omthx/omthx.h only.
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -21,6 +22,9 @@ namespace omthx {
 inline constexpr int kCodecHevc = 0x43564548;  // 'HEVC' as OMT writes FourCCs
 inline constexpr int kCodecH264 = 0x34363248;  // 'H264'
 inline constexpr char kKeyframeRequest[] = "<OMTHX Keyframe=\"true\" />";
+// A receiver's reply naming a frame it handed to its app, by timestamp: <OMTHX Echo="123456" />. The sender times
+// the round trip on its own clock (SenderStats::roundTripMs).
+inline constexpr char kEchoTag[] = "<OMTHX Echo=\"";
 
 // ---- pure functions (src/pure.cpp) ----
 uint8_t mulDiv255(unsigned value, unsigned alpha);  // value * alpha / 255, rounded; both 0 to 255
@@ -156,14 +160,15 @@ class Encoder {
   static const std::vector<std::string>& order(Codec codec);
   Codec codec() const { return codec_; }
   const std::string& name() const { return name_; }
-  // One packet per picture, normally this picture's: the call waits up to one frame time for it. A picture
-  // that takes longer comes out with a later call; packets come out in order.
+  // One packet per picture, normally this picture's: the call waits up to half a frame time for it. A picture
+  // that takes longer comes out with the next call; packets come out in order.
   std::vector<Packet> encode(const Nv12& picture, bool forceKeyframe);
   std::vector<Packet> encodeGpu(const AVFrame* picture, bool forceKeyframe);  // a frame of gpuFrames
 
  private:
   std::vector<Packet> send(bool forceKeyframe);  // frame_ is set up
-  std::vector<Packet> drain();
+  int receive(std::vector<Packet>& out);
+  void drain(std::chrono::steady_clock::time_point started, std::vector<Packet>& out);
 
   Codec codec_ = Codec::Hevc;
   AVCodecContext* ctx_ = nullptr;
@@ -172,7 +177,7 @@ class Encoder {
   std::string name_;
   int64_t index_ = 0;
   int64_t owed_ = 0;         // pictures sent whose packet has not come out yet
-  int64_t frameUs_ = 16'667;  // how long encode waits for its packet
+  int64_t frameUs_ = 16'667;  // one frame time: encode waits half of it for its own packet
   bool planar_ = false;      // libx265 takes YUV420P: NV12's chroma is split before encode
   std::vector<uint8_t> u_, v_;
   void* timer_ = nullptr;     // a high-resolution waitable timer for the short waits
@@ -261,6 +266,34 @@ class BgraToNv12 {
   // The texture's top-left width x height as a D3D11 NV12 frame from a pool on its device; the GpuPicture owns it.
   // Throws std::runtime_error when the device has no video processor or the conversion fails.
   void convert(void* texture, int width, int height, GpuPicture& out);
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> d_;
+};
+
+// Brings decoded D3D11 pictures to memory without waiting on each copy (src/d3d11.cpp). push queues a picture's
+// copy to a staging texture, converted to BGRA on the GPU when asked. take hands out the newest picture whose copy
+// has finished, but only once a newer one is on its way, so one copy overlaps the app's use of the picture before
+// it: one frame of delay, instead of waiting for the decode and the copy of every picture in turn.
+// take(wait = true) hands out the newest one, waiting for it: for when no newer picture is coming.
+// Windows only: elsewhere accepts is false.
+class Readback {
+ public:
+  struct Picture {
+    VideoFormat format;
+    int64_t timestamp = 0;
+    bool bgra = false;  // true: the picture is in take's bgra, else in its nv12
+  };
+  Readback();
+  ~Readback();
+  Readback(const Readback&) = delete;
+  Readback& operator=(const Readback&) = delete;
+  static bool accepts(const AVFrame* frame);  // an NV12 frame in video memory
+  // Throws std::runtime_error when the GPU refuses: no video processor for BGRA, or a failed copy.
+  void push(const AVFrame* frame, const VideoFormat& format, int64_t timestamp, bool bgra);
+  bool take(bool wait, Nv12& nv12, std::vector<uint8_t>& bgra, Picture& out);  // throws std::runtime_error
+  bool pending() const;
 
  private:
   struct Impl;

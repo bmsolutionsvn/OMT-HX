@@ -1,6 +1,7 @@
 // BGRA or RGBA texture -> NV12 D3D11 frame on the GPU, so a captured picture reaches the encoder without leaving video memory.
 #include "codec.h"
 
+#include <cstring>
 #include <stdexcept>
 
 #ifdef _WIN32
@@ -192,6 +193,257 @@ void BgraToNv12::convert(void* texture, int width, int height, GpuPicture& out) 
   d_->convert(static_cast<ID3D11Texture2D*>(texture), width, height, out.frame);
 }
 
+// ---------------------------------------------------------------- Readback
+
+struct Readback::Impl {
+  struct Slot {
+    ComPtr<ID3D11Texture2D> staging;
+    UINT texWidth = 0, texHeight = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    bool pending = false;
+    uint64_t order = 0;  // larger is newer
+    int width = 0, height = 0;
+    UINT planeRows = 0;  // NV12: the staging texture's height, where the UV plane starts
+    Picture picture;
+  };
+  // Two copies in flight at most (this picture and the one before), and one spare.
+  static constexpr int kSlots = 3;
+  Slot slots[kSlots];
+  uint64_t next = 0;
+
+  AVBufferRef* deviceRef = nullptr;  // the decoder's FFmpeg device: its D3D11 device, context and lock
+  AVD3D11VADeviceContext* hw = nullptr;
+  // BGRA on the GPU: the device's video processor, made on first use and per size.
+  ComPtr<ID3D11VideoDevice> video;
+  ComPtr<ID3D11VideoContext> vcontext;
+  ComPtr<ID3D11VideoProcessorEnumerator> enumerator;
+  ComPtr<ID3D11VideoProcessor> processor;
+  ComPtr<ID3D11Texture2D> target;  // the processor's BGRA output, copied to a slot's staging texture
+  int vpWidth = 0, vpHeight = 0;
+
+  ~Impl() { detach(); }
+
+  void detach() {
+    for (Slot& s : slots) s = Slot{};
+    target.Reset();
+    processor.Reset();
+    enumerator.Reset();
+    vcontext.Reset();
+    video.Reset();
+    vpWidth = vpHeight = 0;
+    hw = nullptr;
+    av_buffer_unref(&deviceRef);
+  }
+
+  // Follows the decoder's device: a new decoder (another codec, the preview stream) may bring a new one.
+  void attach(const AVFrame* frame) {
+    auto* fc = reinterpret_cast<AVHWFramesContext*>(frame->hw_frames_ctx->data);
+    if (deviceRef && deviceRef->data == fc->device_ref->data) return;
+    detach();
+    deviceRef = av_buffer_ref(fc->device_ref);
+    if (!deviceRef) throw std::runtime_error("d3d11: cannot hold the decoder's device");
+    hw = static_cast<AVD3D11VADeviceContext*>(reinterpret_cast<AVHWDeviceContext*>(deviceRef->data)->hwctx);
+  }
+
+  struct Lock {
+    AVD3D11VADeviceContext* hw;
+    explicit Lock(AVD3D11VADeviceContext* h) : hw(h) { hw->lock(hw->lock_ctx); }
+    ~Lock() { hw->unlock(hw->lock_ctx); }
+  };
+
+  void ensureStaging(Slot& s, UINT w, UINT h, DXGI_FORMAT format) {
+    if (s.staging && s.texWidth == w && s.texHeight == h && s.format == format) return;
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = w;
+    d.Height = h;
+    d.MipLevels = d.ArraySize = 1;
+    d.Format = format;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_STAGING;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    s.staging.Reset();
+    check(hw->device->CreateTexture2D(&d, nullptr, &s.staging), "the staging texture");
+    s.texWidth = w;
+    s.texHeight = h;
+    s.format = format;
+  }
+
+  // The video processor for NV12 -> BGRA at this size, full-range BT.709 in (as the encoder signals), full-range
+  // RGB out: what Packer::unpack makes on the CPU.
+  void ensureProcessor(int w, int h) {
+    if (processor && w == vpWidth && h == vpHeight) return;
+    processor.Reset();
+    enumerator.Reset();
+    target.Reset();
+    if (!video) {
+      check(hw->device->QueryInterface(IID_PPV_ARGS(&video)), "the device's video interface");
+      check(hw->device_context->QueryInterface(IID_PPV_ARGS(&vcontext)), "the context's video interface");
+    }
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC content = {};
+    content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    content.InputFrameRate = {60, 1};
+    content.InputWidth = static_cast<UINT>(w);
+    content.InputHeight = static_cast<UINT>(h);
+    content.OutputFrameRate = {60, 1};
+    content.OutputWidth = static_cast<UINT>(w);
+    content.OutputHeight = static_cast<UINT>(h);
+    content.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
+    check(video->CreateVideoProcessorEnumerator(&content, &enumerator), "CreateVideoProcessorEnumerator");
+    UINT support = 0;
+    check(enumerator->CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM, &support), "CheckVideoProcessorFormat");
+    if (!(support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT))
+      throw std::runtime_error("the video processor cannot write BGRA");
+    check(video->CreateVideoProcessor(enumerator.Get(), 0, &processor), "CreateVideoProcessor");
+    ComPtr<ID3D11VideoContext1> context1;
+    if (SUCCEEDED(vcontext.As(&context1))) {
+      context1->VideoProcessorSetStreamColorSpace1(processor.Get(), 0, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709);
+      context1->VideoProcessorSetOutputColorSpace1(processor.Get(), DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+    } else {
+      D3D11_VIDEO_PROCESSOR_COLOR_SPACE cs = {};
+      cs.YCbCr_Matrix = 1;  // BT.709
+      cs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
+      vcontext->VideoProcessorSetStreamColorSpace(processor.Get(), 0, &cs);
+      vcontext->VideoProcessorSetOutputColorSpace(processor.Get(), &cs);
+    }
+    vcontext->VideoProcessorSetStreamFrameFormat(processor.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+    vcontext->VideoProcessorSetStreamAutoProcessingMode(processor.Get(), 0, FALSE);
+    const RECT rect{0, 0, w, h};  // the decoder's surface is larger (aligned): only its top-left is the picture
+    vcontext->VideoProcessorSetStreamSourceRect(processor.Get(), 0, TRUE, &rect);
+    vcontext->VideoProcessorSetStreamDestRect(processor.Get(), 0, TRUE, &rect);
+    vcontext->VideoProcessorSetOutputTargetRect(processor.Get(), TRUE, &rect);
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = static_cast<UINT>(w);
+    d.Height = static_cast<UINT>(h);
+    d.MipLevels = d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    d.SampleDesc.Count = 1;
+    d.BindFlags = D3D11_BIND_RENDER_TARGET;
+    check(hw->device->CreateTexture2D(&d, nullptr, &target), "the BGRA texture");
+    vpWidth = w;
+    vpHeight = h;
+  }
+
+  Slot& freeSlot() {
+    Slot* oldest = &slots[0];
+    for (Slot& s : slots) {
+      if (!s.pending) return s;
+      if (s.order < oldest->order) oldest = &s;
+    }
+    oldest->pending = false;  // all in flight: the oldest is dropped, it would never be handed out
+    return *oldest;
+  }
+
+  void push(const AVFrame* frame, const VideoFormat& format, int64_t timestamp, bool bgra) {
+    attach(frame);
+    auto* texture = reinterpret_cast<ID3D11Texture2D*>(frame->data[0]);
+    const UINT index = static_cast<UINT>(reinterpret_cast<intptr_t>(frame->data[1]));
+    D3D11_TEXTURE2D_DESC desc;
+    texture->GetDesc(&desc);
+    const int w = frame->width, h = frame->height;
+    Slot& s = freeSlot();
+    if (bgra) {
+      ensureProcessor(w, h);
+      ensureStaging(s, static_cast<UINT>(w), static_cast<UINT>(h), DXGI_FORMAT_B8G8R8A8_UNORM);
+      D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC in = {};
+      in.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+      in.Texture2D.ArraySlice = index;  // the decoder's surfaces are one texture array
+      ComPtr<ID3D11VideoProcessorInputView> inView;
+      check(video->CreateVideoProcessorInputView(texture, enumerator.Get(), &in, &inView), "the input view");
+      D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC o = {};
+      o.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+      ComPtr<ID3D11VideoProcessorOutputView> outView;
+      check(video->CreateVideoProcessorOutputView(target.Get(), enumerator.Get(), &o, &outView), "the output view");
+      D3D11_VIDEO_PROCESSOR_STREAM stream = {};
+      stream.Enable = TRUE;
+      stream.pInputSurface = inView.Get();
+      Lock lock(hw);
+      check(vcontext->VideoProcessorBlt(processor.Get(), outView.Get(), 0, 1, &stream), "VideoProcessorBlt");
+      hw->device_context->CopyResource(s.staging.Get(), target.Get());
+      hw->device_context->Flush();  // start now, not at the Map
+    } else {
+      ensureStaging(s, desc.Width, desc.Height, desc.Format);
+      s.planeRows = desc.Height;
+      Lock lock(hw);
+      hw->device_context->CopySubresourceRegion(s.staging.Get(), 0, 0, 0, 0, texture, index, nullptr);
+      hw->device_context->Flush();
+    }
+    s.pending = true;
+    s.order = ++next;
+    s.width = w;
+    s.height = h;
+    s.picture = Picture{format, timestamp, bgra};
+  }
+
+  bool take(bool wait, Nv12& nv12, std::vector<uint8_t>& bgra, Picture& out) {
+    Slot* newest = nullptr;
+    Slot* older = nullptr;  // the newest of the others
+    for (Slot& s : slots)
+      if (s.pending && (!newest || s.order > newest->order)) newest = &s;
+    for (Slot& s : slots)
+      if (s.pending && &s != newest && (!older || s.order > older->order)) older = &s;
+    if (!newest || (!wait && !older)) return false;
+    Lock lock(hw);
+    auto* ctx = hw->device_context;
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    Slot* pick = newest;
+    HRESULT hr = ctx->Map(newest->staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+      if (!wait) pick = older;  // a frame old by now: its copy has had a frame's time
+      hr = ctx->Map(pick->staging.Get(), 0, D3D11_MAP_READ, 0, &m);
+    }
+    const uint64_t taken = pick->order;
+    for (Slot& s : slots)
+      if (s.pending && s.order <= taken) s.pending = false;  // older ones are stale now
+    check(hr, "Map of the staging texture");
+    const auto* p = static_cast<const uint8_t*>(m.pData);
+    const int w = pick->width, h = pick->height;
+    if (pick->picture.bgra) {
+      bgra.resize(static_cast<size_t>(w) * h * 4);
+      for (int r = 0; r < h; ++r)
+        std::memcpy(bgra.data() + static_cast<size_t>(r) * w * 4, p + static_cast<size_t>(r) * m.RowPitch,
+                    static_cast<size_t>(w) * 4);
+    } else {
+      nv12.width = w;
+      nv12.height = h;
+      nv12.y.resize(static_cast<size_t>(w) * h);
+      nv12.uv.resize(static_cast<size_t>(w) * h / 2);
+      const uint8_t* uv = p + static_cast<size_t>(m.RowPitch) * pick->planeRows;
+      for (int r = 0; r < h; ++r)
+        std::memcpy(nv12.y.data() + static_cast<size_t>(r) * w, p + static_cast<size_t>(r) * m.RowPitch,
+                    static_cast<size_t>(w));
+      for (int r = 0; r < h / 2; ++r)
+        std::memcpy(nv12.uv.data() + static_cast<size_t>(r) * w, uv + static_cast<size_t>(r) * m.RowPitch,
+                    static_cast<size_t>(w));
+    }
+    ctx->Unmap(pick->staging.Get(), 0);
+    out = pick->picture;
+    return true;
+  }
+};
+
+Readback::Readback() : d_(std::make_unique<Impl>()) {}
+Readback::~Readback() = default;
+
+bool Readback::accepts(const AVFrame* frame) {
+  return frame && frame->format == AV_PIX_FMT_D3D11 && frame->hw_frames_ctx &&
+         reinterpret_cast<AVHWFramesContext*>(frame->hw_frames_ctx->data)->sw_format == AV_PIX_FMT_NV12 &&
+         frame->width % 2 == 0 && frame->height % 2 == 0;
+}
+
+void Readback::push(const AVFrame* frame, const VideoFormat& format, int64_t timestamp, bool bgra) {
+  d_->push(frame, format, timestamp, bgra);
+}
+
+bool Readback::take(bool wait, Nv12& nv12, std::vector<uint8_t>& bgra, Picture& out) {
+  return d_->take(wait, nv12, bgra, out);
+}
+
+bool Readback::pending() const {
+  for (const auto& s : d_->slots)
+    if (s.pending) return true;
+  return false;
+}
+
 }  // namespace omthx
 
 #else
@@ -203,6 +455,15 @@ BgraToNv12::~BgraToNv12() = default;
 void BgraToNv12::convert(void*, int, int, GpuPicture&) {
   throw std::runtime_error("D3D11 textures are Windows only");
 }
+struct Readback::Impl {};
+Readback::Readback() = default;
+Readback::~Readback() = default;
+bool Readback::accepts(const AVFrame*) { return false; }
+void Readback::push(const AVFrame*, const VideoFormat&, int64_t, bool) {
+  throw std::runtime_error("D3D11 readback is Windows only");
+}
+bool Readback::take(bool, Nv12&, std::vector<uint8_t>&, Picture&) { return false; }
+bool Readback::pending() const { return false; }
 }  // namespace omthx
 
 #endif
