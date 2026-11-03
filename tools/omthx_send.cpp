@@ -32,7 +32,9 @@ namespace {
             "--gpu (Windows, no --alpha) sends D3D11 textures with sendVideoD3D11, as BreadCamera and desktop\n"
             "capture do: the picture never comes to memory.\n"
             "--uyvy (no --alpha, not with --gpu) sends UYVY pictures from memory with sendVideoUyvy, as an SDI or\n"
-            "NDI input does: no GPU before the encoder.\n");
+            "NDI input does: no GPU before the encoder.\n"
+            "--until-watched N stops once receivers have been connected for N seconds, or 3 s after the last\n"
+            "one left, so a receiver on another PC sets the pace; --seconds then caps the wait.\n");
   std::exit(2);
 }
 
@@ -68,6 +70,8 @@ int main(int argc, char** argv) {
   bool tone = false;
   bool gpu = false;
   bool uyvy = false;
+  int untilWatched = 0;  // stop after this many seconds with a receiver connected
+  int watched = 0, gone = 0;
   std::vector<float> block;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -94,6 +98,8 @@ int main(int argc, char** argv) {
       seconds = std::atoi(value().c_str());
     } else if (a == "--tone") {
       tone = true;
+    } else if (a == "--until-watched") {
+      untilWatched = std::atoi(value().c_str());
     } else if (a == "--gpu") {
       gpu = true;
     } else if (a == "--uyvy") {
@@ -188,6 +194,14 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(s.keyframes), static_cast<unsigned long long>(s.framesDropped),
                     s.connections, rtt, t.program ? "PGM " : "", t.preview ? "PVW" : "");
         last = s;
+        if (s.connections > 0) {
+          ++watched;
+          gone = 0;
+        } else if (watched > 0) {
+          ++gone;
+        }
+        // Watched long enough, or the receiver has left (3 s, so a reconnect does not end the run).
+        if (untilWatched > 0 && (watched >= untilWatched || gone >= 3)) break;
       }
     }
     #ifdef _WIN32
