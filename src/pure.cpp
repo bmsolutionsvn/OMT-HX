@@ -156,6 +156,23 @@ bool KeyframePolicy::next(int64_t nowMs, uint64_t dropped, bool requested) {
   return key;
 }
 
+IdleGate::Step IdleGate::next(int64_t nowMs, bool receivers) {
+  if (receivers) {
+    if (!idle_) return Step::Send;
+    idle_ = false;
+    return Step::Resume;
+  }
+  if (!idle_) {
+    idle_ = true;
+    closed_ = false;
+    spellStartedMs_ = nowMs;
+  } else if (!closed_ && nowMs - spellStartedMs_ >= kWarmMs) {
+    closed_ = true;
+    return Step::SkipAndClose;
+  }
+  return Step::Skip;
+}
+
 uint8_t mulDiv255(unsigned value, unsigned alpha) {
   const unsigned x = value * alpha + 128;  // round(x / 255) without a divide: exact for x up to 255 * 255
   return static_cast<uint8_t>((x + (x >> 8)) >> 8);

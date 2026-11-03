@@ -59,6 +59,8 @@ struct SenderStats {
   // clock alone: the end-to-end delay without synchronised clocks. -1 until a receiver has replied; with several
   // receivers, the latest reply. Receivers reply about four times a second.
   double roundTripMs = -1;
+  // Video frames not coded or sent because nobody was connected (kept last: earlier fields keep their offsets).
+  uint64_t framesIdle = 0;
 };
 
 // What a Receiver hands back.
@@ -110,8 +112,10 @@ struct CodedFrame {
 };
 
 // One OMT source. sendVideo and sendAudio may run on two threads, but each must stay on its own.
+// While nobody is connected the sends return at once: no pixels are packed, coded or handed to libomt; the first
+// frame after a receiver connects is a keyframe, and the Hx encoder stays open for 10 s of idleness.
 // In Mode::Hx, while a receiver asks for preview, the sendVideo calls also code a small preview stream for it.
-// requestKeyframe, keyframeRequested, tally and stats are safe from any thread.
+// hasReceivers, requestKeyframe, keyframeRequested, tally and stats are safe from any thread.
 class OMTHX_API Sender {
  public:
   // codec picks the Hx video codec and is ignored in Mode::Full. The receiver needs no setting.
@@ -149,11 +153,15 @@ class OMTHX_API Sender {
   // frames or pictures, not both. Keyframe requests from this sender's receivers show in keyframeRequested.
   void sendCoded(const CodedFrame& frame);
   // True once after a receiver of this source asked for a keyframe, or lost a frame on its link: a relay passes
-  // it to its own source with Receiver::requestKeyframe. Only sendCoded collects them.
+  // it to its own source with Receiver::requestKeyframe. Only sendCoded collects them; a sender woken from idle
+  // also reports one, so the frame its new receiver gets is a keyframe.
   bool keyframeRequested();
   // planar: all samples of channel 0, then all of channel 1, and so on.
   void sendAudio(std::span<const float> planar, int sampleRate, int channels, int64_t timestamp);
   void requestKeyframe();  // the next frame is coded as a keyframe (at most one per 200 ms)
+  // True while a receiver is connected (any connection counts, a probe's included); cached, refreshed at most
+  // every 100 ms. Safe from any thread.
+  bool hasReceivers();
   Tally tally();
   SenderStats stats();
   std::string address() const;  // "HOSTNAME (name)", the string a Receiver connects to

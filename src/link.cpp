@@ -98,6 +98,7 @@ struct Sender::Impl {
   std::vector<uint8_t> uyva;  // Full: a UYVA picture whose alpha plane did not follow its UYVY plane
   std::vector<uint8_t> gpuUyva;  // Full: a Gpu picture copied to memory
   KeyframePolicy policy;
+  IdleGate gate;  // send only while a receiver is connected
   std::atomic<bool> appKeyframe{false};
   std::atomic<bool> forward{false};  // sendCoded: a receiver asked for a keyframe
   uint64_t codedDropped = 0;
@@ -109,6 +110,10 @@ struct Sender::Impl {
   std::deque<std::pair<int64_t, Clock::time_point>> sentAt;  // recent frames' timestamps and send times, for echoes
   std::mutex statsMutex;
   SenderStats stats;
+  // omt_send_connections, cached: the gate asks every frame, and the count costs a lock in libomt.
+  std::mutex receiversMutex;                     // one refresh at a time, so a stale count cannot outlive a fresh one
+  int64_t receiversCheckedMs = -1;               // -1: never read, so the first call always counts
+  bool receivers = false;
   // When the app handed this frame over, before any packing or encoding: the round trip covers the whole path.
   void noteSent(int64_t timestamp, Clock::time_point handedOver = Clock::now()) {
     sentAt.emplace_back(timestamp, handedOver);
@@ -129,6 +134,11 @@ struct Sender::Impl {
   // vmx: code alpha, when the format has it and VMX takes its size, with VMX rather than stacked under the fill.
   void openEncoder(const VideoFormat& fmt, bool vmx, AVBufferRef* gpuFrames = nullptr);
   bool askedForKeyframe();
+  // True while omt_send_connections is above zero, refreshed at most every 100 ms. Any connection counts.
+  bool hasReceivers();
+  // True when this video frame is not coded or sent: nobody is connected, or the encoder just closed. Also
+  // re-arms the keyframe policies when a receiver comes back, so the next frame is a keyframe.
+  bool skipVideo();
   // Codes `picture`, or `gpu` when set, with `alphaPlane` when alpha goes by VMX, and sends what comes back.
   void sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock::time_point t0, OMTMediaFrame& f,
                    const AVFrame* gpu = nullptr);
@@ -188,6 +198,40 @@ bool Sender::Impl::askedForKeyframe() {
     }
   }
   return asked;
+}
+
+bool Sender::Impl::hasReceivers() {
+  const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
+  std::lock_guard lock(receiversMutex);
+  if (receiversCheckedMs >= 0 && nowMs - receiversCheckedMs < 100) return receivers;
+  receivers = omt_send_connections(tx) > 0;
+  receiversCheckedMs = nowMs;
+  return receivers;
+}
+
+bool Sender::Impl::skipVideo() {
+  const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
+  switch (gate.next(nowMs, hasReceivers())) {
+    case IdleGate::Step::Send:
+      return false;
+    case IdleGate::Step::Resume:
+      // A fresh policy codes a keyframe at once, past the 200 ms limit; a relay asks its source for one.
+      policy = KeyframePolicy();
+      previewPolicy = KeyframePolicy();
+      forward = true;
+      return false;
+    case IdleGate::Step::SkipAndClose:
+      encoder.reset();
+      alphaEncoder.reset();
+      previewEncoder.reset();
+      previewStamps.clear();
+      break;
+    case IdleGate::Step::Skip:
+      break;
+  }
+  std::lock_guard lock(statsMutex);
+  ++stats.framesIdle;
+  return true;
 }
 
 void Sender::Impl::sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock::time_point t0, OMTMediaFrame& f,
@@ -340,6 +384,7 @@ Sender::~Sender() { omt_send_destroy(d_->tx); }
 
 void Sender::sendVideo(const VideoFormat& fmt, std::span<const uint8_t> bgra, bool premultiplied, int64_t timestamp) {
   checkBgra(fmt, bgra);
+  if (d_->skipVideo()) return;
   OMTMediaFrame f = videoHeader(fmt, timestamp);
 
   if (d_->mode == Mode::Full) {
@@ -364,12 +409,13 @@ void Sender::sendVideoNv12(const VideoFormat& fmt, const uint8_t* y, int yStride
   if (!y || !uv || yStride < fmt.width || uvStride < fmt.width || fmt.width < 2 || fmt.height < 2 || fmt.width % 2 ||
       fmt.height % 2)
     throw std::invalid_argument("NV12 needs an even size and a stride of at least the width for each plane");
+  if (d_->mode == Mode::Full && fullRange) throw std::invalid_argument("plain OMT takes limited-range NV12 only");
+  if (d_->skipVideo()) return;
   OMTMediaFrame f = videoHeader(fmt, timestamp);
 
   if (d_->mode == Mode::Full) {
     // VMX takes limited-range NV12 as it is and makes its 4:2:2 itself. libomt reads the chroma plane right after
     // the luma plane, so planes that are apart, or a full-range picture, are copied first.
-    if (fullRange) throw std::invalid_argument("plain OMT takes limited-range NV12 only");
     const size_t plane = static_cast<size_t>(yStride) * fmt.height;
     f.Codec = OMTCodec_NV12;
     f.Stride = yStride;
@@ -398,6 +444,7 @@ void Sender::sendVideoUyvy(const VideoFormat& fmt, const uint8_t* uyvy, int stri
   if (fmt.width < 2 || fmt.height < 2 || fmt.width % 2 || !uyvy || stride < fmt.width * 2 ||
       (fmt.alpha && (!alpha || alphaStride < fmt.width)))
     throw std::invalid_argument("uyvy needs an even width and a stride of at least width * 2, and alpha a plane");
+  if (d_->skipVideo()) return;
   OMTMediaFrame f = videoHeader(fmt, timestamp);
 
   if (d_->mode == Mode::Full) {
@@ -435,6 +482,7 @@ void Sender::sendVideoUyvy(const VideoFormat& fmt, const uint8_t* uyvy, int stri
 void Sender::sendVideoD3D11(const VideoFormat& fmt, void* texture, int64_t timestamp) {
   if (fmt.alpha || !texture || fmt.width < 2 || fmt.height < 2 || fmt.width % 2 || fmt.height % 2)
     throw std::invalid_argument("a D3D11 picture needs a texture, an even size and no alpha");
+  if (d_->skipVideo()) return;
   if (!d_->bgraToNv12) d_->bgraToNv12 = std::make_unique<BgraToNv12>();
   VideoFrame frame;
   frame.format = fmt;
@@ -455,6 +503,7 @@ void Sender::sendVideo(const VideoFrame& frame) {
     if (pic->width != fmt.width || pic->height != (vmx ? fmt.height : codedHeight(fmt)) ||
         (vmx && alpha->size() != static_cast<size_t>(fmt.width) * fmt.height))
       throw std::invalid_argument("the Gpu picture does not match its format");
+    if (d_->skipVideo()) return;
     auto toMemory = [&] {
       if (!downloadNv12(pic, d_->picture)) throw std::runtime_error("cannot copy the picture from video memory");
     };
@@ -505,6 +554,7 @@ void Sender::sendCoded(const CodedFrame& c) {
     throw std::invalid_argument("a coded frame needs its data and its size");
   if (c.mode == Mode::Hx && (c.alphaBytes >= c.data.size() || (c.alphaBytes && c.alphaRepeats)))
     throw std::invalid_argument("alphaBytes must leave room for the fill, and a frame that repeats alpha has none");
+  if (d_->skipVideo()) return;
   OMTMediaFrame f = videoHeader(c.format, c.timestamp);
   f.Flags = static_cast<OMTVideoFlags>(c.flags);
   f.ColorSpace = static_cast<OMTColorSpace>(c.colorSpace);
@@ -532,9 +582,12 @@ void Sender::sendCoded(const CodedFrame& c) {
 
 bool Sender::keyframeRequested() { return d_->forward.exchange(false); }
 
+bool Sender::hasReceivers() { return d_->hasReceivers(); }
+
 void Sender::sendAudio(std::span<const float> planar, int sampleRate, int channels, int64_t timestamp) {
   if (channels <= 0 || channels > 32 || planar.empty() || planar.size() % static_cast<size_t>(channels) != 0)
     throw std::invalid_argument("audio must hold the same number of samples for each of 1 to 32 channels");
+  if (!d_->hasReceivers()) return;  // nobody to hear it
   OMTMediaFrame f = {};
   f.Type = OMTFrameType_Audio;
   f.Codec = OMTCodec_FPA1;

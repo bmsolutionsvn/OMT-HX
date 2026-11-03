@@ -151,6 +151,16 @@ void omthx_c_sender_keyframe(omthx_c_sender* sender) {
 
 const char* omthx_c_sender_address(omthx_c_sender* sender) { return sender ? sender->address.c_str() : ""; }
 
+int omthx_c_sender_has_receivers(omthx_c_sender* sender) {
+  if (!sender) return 0;
+  try {
+    return sender->sender->hasReceivers() ? 1 : 0;
+  } catch (const std::exception& e) {
+    fail(e);
+    return 0;
+  }
+}
+
 int omthx_c_sender_get_counters(omthx_c_sender* sender, omthx_c_sender_counters* out) {
   if (!sender || !out) return fail("sender_counters: a null argument");
   try {

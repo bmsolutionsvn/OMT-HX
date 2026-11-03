@@ -874,3 +874,111 @@ TEST_CASE("sendVideoD3D11 takes an RGBA texture") {
   CHECK(red[2] > 235);
 }
 #endif
+
+TEST_CASE("an HX sender with no receiver codes nothing") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{640, 360, 60, 1, false};
+  Sender sender("omthx-test-idle-hx", Mode::Hx, Quality::Medium, Codec::Hevc);
+  std::vector<uint8_t> bgra;
+  for (int i = 0; i < 120; ++i) {
+    drawPattern(bgra, f.width, f.height, i, false);
+    sender.sendVideo(f, bgra, false, 1'000'000 + i * kFrame);
+  }
+  const SenderStats s = sender.stats();
+  CHECK(s.framesIdle == 120);
+  CHECK(s.framesSent == 0);
+  CHECK(s.encoder.empty());  // no encoder was opened
+  CHECK_FALSE(sender.hasReceivers());
+
+  Receiver receiver(sender.address());
+  Pump pump(sender, f);
+  VideoFrame frame;
+  REQUIRE(receiveSome(receiver, frame, 1, 3) == 1);
+  CHECK(sender.hasReceivers());
+}
+
+TEST_CASE("a receiver that comes back to a warm HX sender gets a keyframe at once") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{640, 360, 60, 1, false};
+  Sender sender("omthx-test-idle-warm", Mode::Hx, Quality::Medium, Codec::Hevc);
+  Pump pump(sender, f);
+  {
+    Receiver first(sender.address());
+    VideoFrame frame;
+    REQUIRE(receiveSome(first, frame, 1, 3) == 1);
+  }
+  const uint64_t idleAfter = sender.stats().framesIdle;
+  for (const auto until = Clock::now() + std::chrono::seconds(2);
+       Clock::now() < until && (sender.hasReceivers() || sender.stats().framesIdle == idleAfter);)
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  REQUIRE_FALSE(sender.hasReceivers());
+  REQUIRE(sender.stats().framesIdle > idleAfter);
+
+  const uint64_t before = sender.stats().keyframes;
+  const auto t0 = Clock::now();
+  Receiver second(sender.address());
+  VideoFrame frame;
+  REQUIRE(receiveSome(second, frame, 1, 2) == 1);
+  const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
+  MESSAGE("picture " << waited << " ms after the receiver came back");
+  CHECK(waited < 1000);
+  CHECK(sender.stats().keyframes > before);
+}
+
+TEST_CASE("probe reads an idle HX source") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{640, 360, 60, 1, false};
+  Sender sender("omthx-test-idle-probe", Mode::Hx, Quality::Medium, Codec::Hevc);
+  Pump pump(sender, f);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  REQUIRE(sender.stats().framesIdle > 0);  // nothing codes until the probe connects
+  SourceInfo info;
+  REQUIRE(probe(sender.address(), 3000, info));
+  CHECK(info.format == f);
+}
+
+TEST_CASE("a plain OMT sender with no receiver hands libomt nothing") {
+  const VideoFormat f{640, 360, 60, 1, false};
+  Sender sender("omthx-test-idle-full", Mode::Full, Quality::Medium);
+  std::vector<uint8_t> bgra;
+  for (int i = 0; i < 120; ++i) {
+    drawPattern(bgra, f.width, f.height, i, false);
+    sender.sendVideo(f, bgra, false, 1'000'000 + i * kFrame);
+  }
+  CHECK(sender.stats().framesIdle == 120);
+  CHECK(sender.stats().framesSent == 0);
+  Receiver receiver(sender.address());
+  Pump pump(sender, f);
+  VideoFrame frame;
+  REQUIRE(receiveSome(receiver, frame, 1, 3) == 1);
+  CHECK(frame.format == f);
+}
+
+TEST_CASE("a plain OMT relay with no receiver sends nothing, and asks for a keyframe when one joins") {
+  const VideoFormat f{640, 360, 60, 1, false};
+  Sender source("omthx-test-idle-relay-in", Mode::Full, Quality::Medium);
+  Receiver coded(source.address(), PixelFormat::Coded);
+  Pump pump(source, f);
+  CodedFrame c;
+  const auto until = Clock::now() + std::chrono::seconds(5);
+  while (!coded.receiveCoded(c, 100) && Clock::now() < until) {
+  }
+  REQUIRE_FALSE(c.data.empty());
+
+  Sender relay("omthx-test-idle-relay-out", Mode::Full, Quality::Medium);
+  for (int i = 0; i < 10; ++i) relay.sendCoded(c);
+  CHECK(relay.stats().framesIdle == 10);
+  CHECK(relay.stats().framesSent == 0);
+  CHECK_FALSE(relay.keyframeRequested());
+
+  Receiver downstream(relay.address(), PixelFormat::Coded);
+  bool requested = false;
+  for (const auto deadline = Clock::now() + std::chrono::seconds(2);
+       !requested && Clock::now() < deadline;) {
+    relay.sendCoded(c);
+    requested = relay.keyframeRequested();
+    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+  }
+  CHECK(requested);
+  CHECK(relay.stats().framesSent > 0);
+}
