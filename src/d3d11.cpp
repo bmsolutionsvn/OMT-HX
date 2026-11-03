@@ -1,6 +1,8 @@
-// BGRA or RGBA texture -> NV12 D3D11 frame on the GPU, so a captured picture reaches the encoder without leaving video memory.
+// BGRA or RGBA or UYVY -> NV12 D3D11 frame on the GPU, so a picture reaches the encoder without leaving video memory.
 #include "codec.h"
 
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <stdexcept>
 
@@ -41,23 +43,40 @@ const char* formatName(DXGI_FORMAT format) {
     case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return "B8G8R8A8_UNORM_SRGB";
     case DXGI_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
     case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return "R8G8B8A8_UNORM_SRGB";
+    case DXGI_FORMAT_YUY2: return "YUY2";
     default: return "an unknown format";
   }
 }
-}  // namespace
 
-struct BgraToNv12::Impl {
+using RangeTable = std::array<uint8_t, 256>;
+// packUyvy's limited-range-to-full mapping (makeTable in src/pure.cpp), rounded half up in integers.
+RangeTable rangeTable(int offsetIn, int num, int den, int offsetOut) {
+  RangeTable t{};
+  for (int i = 0; i < 256; ++i) {
+    const int v = 2 * (i - offsetIn) * num + (2 * offsetOut + 1) * den;
+    const int q = v >= 0 ? v / (2 * den) : -((-v + 2 * den - 1) / (2 * den));
+    t[i] = static_cast<uint8_t>(std::clamp(q, 0, 255));
+  }
+  return t;
+}
+const RangeTable kLumaToFull = rangeTable(16, 255, 219, 0);
+const RangeTable kChromaToFull = rangeTable(128, 255, 224, 128);
+
+// The video processor and the NV12 frame pool it writes, on one device at one size: what BgraToNv12 and
+// UyvyToNv12 share.
+struct VideoConverter {
   ID3D11Device* device = nullptr;  // not owned: identifies the device the objects below belong to
   int width = 0, height = 0;
+  bool rgbStream = false;  // the stream is full-range RGB, else full-range BT.709 YCbCr
   ComPtr<ID3D11VideoDevice> video;
   ComPtr<ID3D11VideoContext> context;
   ComPtr<ID3D11VideoProcessorEnumerator> enumerator;
   ComPtr<ID3D11VideoProcessor> processor;
-  unsigned formatsChecked = 0;  // a bit per kTextureFormats entry the enumerator has accepted
+  DXGI_FORMAT checked = DXGI_FORMAT_UNKNOWN;  // the input format the enumerator last accepted
   AVBufferRef* hwDevice = nullptr;
   AVBufferRef* frames = nullptr;
 
-  ~Impl() { reset(); }
+  ~VideoConverter() { reset(); }
 
   void reset() {
     av_buffer_unref(&frames);
@@ -66,13 +85,13 @@ struct BgraToNv12::Impl {
     enumerator.Reset();
     context.Reset();
     video.Reset();
-    formatsChecked = 0;  // the enumerator went with them
+    checked = DXGI_FORMAT_UNKNOWN;  // the enumerator went with them
     device = nullptr;
   }
 
-  // The video processor and the NV12 frame pool for this device and size, made once.
-  void setup(ID3D11Device* dev, int w, int h) {
-    if (dev == device && w == width && h == height) return;
+  // The video processor and the NV12 frame pool for this device, size and stream colour, made once.
+  void setup(ID3D11Device* dev, int w, int h, bool rgb) {
+    if (dev == device && w == width && h == height && rgb == rgbStream) return;
     reset();
     check(dev->QueryInterface(IID_PPV_ARGS(&video)), "the device's video interface");
     ComPtr<ID3D11DeviceContext> immediate;
@@ -94,10 +113,12 @@ struct BgraToNv12::Impl {
     check(video->CreateVideoProcessorEnumerator(&content, &enumerator), "CreateVideoProcessorEnumerator");
     check(video->CreateVideoProcessor(enumerator.Get(), 0, &processor), "CreateVideoProcessor");
 
-    // Full-range BT.709 both sides, the matrix and range the encoder signals.
+    // Both sides full-range BT.709, the matrix and range the encoder signals. UyvyToNv12 expands the range itself:
+    // this GPU's video processor passes YCbCr to YCbCr through without converting the range (measured 2026-11-04).
     ComPtr<ID3D11VideoContext1> context1;
     if (SUCCEEDED(context.As(&context1))) {
-      context1->VideoProcessorSetStreamColorSpace1(processor.Get(), 0, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+      context1->VideoProcessorSetStreamColorSpace1(processor.Get(), 0, rgb ? DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+                                                                          : DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709);
       context1->VideoProcessorSetOutputColorSpace1(processor.Get(), DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709);
     } else {
       D3D11_VIDEO_PROCESSOR_COLOR_SPACE cs = {};
@@ -136,30 +157,21 @@ struct BgraToNv12::Impl {
     device = dev;
     width = w;
     height = h;
+    rgbStream = rgb;
   }
 
-  // Whether the video processor can read this texture format, asked once per format and remembered.
+  // Whether the video processor can read this format, asked once per format and remembered.
   void checkInputFormat(DXGI_FORMAT format) {
-    const int index = textureFormatIndex(format);
-    if (formatsChecked & (1u << index)) return;
+    if (checked == format) return;
     UINT support = 0;
     check(enumerator->CheckVideoProcessorFormat(format, &support), "CheckVideoProcessorFormat");
     if (!(support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT))
       throw std::runtime_error(std::string("the video processor cannot read ") + formatName(format));
-    formatsChecked |= 1u << index;
+    checked = format;
   }
 
-  void convert(ID3D11Texture2D* texture, int w, int h, AVFrame* out) {
-    D3D11_TEXTURE2D_DESC desc;
-    texture->GetDesc(&desc);
-    if (textureFormatIndex(desc.Format) < 0 || desc.Width < static_cast<UINT>(w) ||
-        desc.Height < static_cast<UINT>(h))
-      throw std::invalid_argument("the texture must be BGRA or RGBA and at least the picture's size");
-    ComPtr<ID3D11Device> dev;
-    texture->GetDevice(&dev);
-    setup(dev.Get(), w, h);
-    checkInputFormat(desc.Format);
-
+  // The top-left corner set up as the picture, as a new NV12 frame in `out`.
+  void blt(ID3D11Texture2D* texture, AVFrame* out) {
     if (av_hwframe_get_buffer(frames, out, 0) < 0) throw std::runtime_error("d3d11: no free NV12 frame in the pool");
     auto* nv12 = reinterpret_cast<ID3D11Texture2D*>(out->data[0]);
     const UINT slice = static_cast<UINT>(reinterpret_cast<intptr_t>(out->data[1]));
@@ -184,6 +196,22 @@ struct BgraToNv12::Impl {
     check(hr, "VideoProcessorBlt");
   }
 };
+}  // namespace
+
+struct BgraToNv12::Impl : VideoConverter {
+  void convert(ID3D11Texture2D* texture, int w, int h, AVFrame* out) {
+    D3D11_TEXTURE2D_DESC desc;
+    texture->GetDesc(&desc);
+    if (textureFormatIndex(desc.Format) < 0 || desc.Width < static_cast<UINT>(w) ||
+        desc.Height < static_cast<UINT>(h))
+      throw std::invalid_argument("the texture must be BGRA or RGBA and at least the picture's size");
+    ComPtr<ID3D11Device> dev;
+    texture->GetDevice(&dev);
+    setup(dev.Get(), w, h, true);
+    checkInputFormat(desc.Format);
+    blt(texture, out);
+  }
+};
 
 BgraToNv12::BgraToNv12() : d_(std::make_unique<Impl>()) {}
 BgraToNv12::~BgraToNv12() = default;
@@ -191,6 +219,79 @@ BgraToNv12::~BgraToNv12() = default;
 void BgraToNv12::convert(void* texture, int width, int height, GpuPicture& out) {
   av_frame_unref(out.frame);
   d_->convert(static_cast<ID3D11Texture2D*>(texture), width, height, out.frame);
+}
+
+// ---------------------------------------------------------------- UyvyToNv12
+
+struct UyvyToNv12::Impl {
+  ComPtr<ID3D11Device> device;  // this object's own: the default adapter, with video support
+  ComPtr<ID3D11DeviceContext> context;
+  ComPtr<ID3D11Texture2D> upload;  // DYNAMIC YUY2, what Map writes
+  // A video processor input view needs a DEFAULT texture, so the mapped rows are copied to this one on the GPU.
+  ComPtr<ID3D11Texture2D> yuy2;
+  VideoConverter converter;
+  int width = 0, height = 0;
+
+  void convert(const uint8_t* uyvy, int stride, int w, int h, AVFrame* out) {
+    if (w < 2 || h < 2 || w % 2 || stride < w * 2)
+      throw std::invalid_argument("UYVY needs an even size and a stride of at least width * 2");
+    if (!device) {
+      const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+      const HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                           D3D11_CREATE_DEVICE_VIDEO_SUPPORT, levels, 2, D3D11_SDK_VERSION,
+                                           device.GetAddressOf(), nullptr, context.GetAddressOf());
+      if (FAILED(hr)) {
+        device.Reset();
+        context.Reset();
+        throw std::runtime_error("d3d11: no video device to convert UYVY");
+      }
+    }
+    if (!upload || w != width || h != height) {
+      D3D11_TEXTURE2D_DESC d = {};
+      d.Width = static_cast<UINT>(w);
+      d.Height = static_cast<UINT>(h);
+      d.MipLevels = d.ArraySize = 1;
+      d.Format = DXGI_FORMAT_YUY2;
+      d.SampleDesc.Count = 1;
+      d.Usage = D3D11_USAGE_DYNAMIC;
+      d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+      d.BindFlags = D3D11_BIND_SHADER_RESOURCE;  // YUY2 needs a bind flag to exist at all
+      upload.Reset();
+      check(device->CreateTexture2D(&d, nullptr, &upload), "the YUY2 upload texture");
+      d.Usage = D3D11_USAGE_DEFAULT;
+      d.CPUAccessFlags = 0;
+      d.BindFlags = D3D11_BIND_DECODER;  // the bind flag the video processor accepts on an input surface
+      yuy2.Reset();
+      check(device->CreateTexture2D(&d, nullptr, &yuy2), "the YUY2 texture");
+      width = w;
+      height = h;
+    }
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    check(context->Map(upload.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m), "Map of the YUY2 texture");
+    for (int r = 0; r < h; ++r) {
+      const uint8_t* s = uyvy + static_cast<size_t>(r) * stride;
+      auto* d = static_cast<uint8_t*>(m.pData) + static_cast<size_t>(r) * m.RowPitch;
+      for (int x = 0; x < w * 2; x += 4) {  // U Y0 V Y1 -> Y0 U Y1 V, expanded to the full range
+        d[x] = kLumaToFull[s[x + 1]];
+        d[x + 1] = kChromaToFull[s[x]];
+        d[x + 2] = kLumaToFull[s[x + 3]];
+        d[x + 3] = kChromaToFull[s[x + 2]];
+      }
+    }
+    context->Unmap(upload.Get(), 0);
+    context->CopyResource(yuy2.Get(), upload.Get());
+    converter.setup(device.Get(), w, h, false);
+    converter.checkInputFormat(DXGI_FORMAT_YUY2);
+    converter.blt(yuy2.Get(), out);
+  }
+};
+
+UyvyToNv12::UyvyToNv12() : d_(std::make_unique<Impl>()) {}
+UyvyToNv12::~UyvyToNv12() = default;
+
+void UyvyToNv12::convert(const uint8_t* uyvy, int stride, int width, int height, GpuPicture& out) {
+  av_frame_unref(out.frame);
+  d_->convert(uyvy, stride, width, height, out.frame);
 }
 
 // ---------------------------------------------------------------- Readback
@@ -484,6 +585,12 @@ struct BgraToNv12::Impl {};
 BgraToNv12::BgraToNv12() = default;
 BgraToNv12::~BgraToNv12() = default;
 void BgraToNv12::convert(void*, int, int, GpuPicture&) {
+  throw std::runtime_error("D3D11 textures are Windows only");
+}
+struct UyvyToNv12::Impl {};
+UyvyToNv12::UyvyToNv12() = default;
+UyvyToNv12::~UyvyToNv12() = default;
+void UyvyToNv12::convert(const uint8_t*, int, int, int, GpuPicture&) {
   throw std::runtime_error("D3D11 textures are Windows only");
 }
 struct Readback::Impl {};

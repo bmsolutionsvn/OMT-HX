@@ -874,6 +874,125 @@ TEST_CASE("sendVideoD3D11 takes an RGBA texture") {
   CHECK(red[1] < 20);
   CHECK(red[2] > 235);
 }
+
+namespace {
+// A still UYVY picture: neutral chroma, luma 126 (limited range; 128 once expanded to full).
+std::vector<uint8_t> uyvyGrey(int w, int h) {
+  std::vector<uint8_t> p(static_cast<size_t>(w) * h * 2);
+  for (size_t i = 0; i < p.size(); i += 2) {
+    p[i] = 128;
+    p[i + 1] = 126;
+  }
+  return p;
+}
+
+// Pumps the picture at 60 fps until the receiver hands one back or the frames run out, and returns whether it did.
+bool sendUyvyUntilReceived(Sender& sender, Receiver& receiver, const VideoFormat& f, const std::vector<uint8_t>& pic,
+                           VideoFrame& frame, int frames = 300) {
+  auto next = Clock::now();
+  for (int i = 0; i < frames; ++i) {
+    sender.sendVideoUyvy(f, pic.data(), f.width * 2, nullptr, 0, false, 1'000'000 + i * kFrame);
+    if (receiver.receiveVideo(frame, 0)) return true;
+    next += std::chrono::microseconds(16'667);
+    std::this_thread::sleep_until(next);
+  }
+  return false;
+}
+}  // namespace
+
+TEST_CASE("sendVideoUyvy on an HX sender encodes from video memory") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{1280, 720, 60, 1, false};
+  const std::vector<uint8_t> pic = uyvyGrey(f.width, f.height);
+  Sender sender("omthx-test-uyvy-gpu", Mode::Hx, Quality::Medium);
+  Receiver receiver(sender.address(), PixelFormat::Nv12);
+  VideoFrame frame;
+  bool got = false;
+  auto next = Clock::now();
+  const auto until = Clock::now() + std::chrono::seconds(1);
+  for (int i = 0; Clock::now() < until; ++i) {
+    sender.sendVideoUyvy(f, pic.data(), f.width * 2, nullptr, 0, false, 1'000'000 + i * kFrame);
+    if (receiver.receiveVideo(frame, 0)) got = true;
+    next += std::chrono::microseconds(16'667);
+    std::this_thread::sleep_until(next);
+  }
+  REQUIRE(got);
+  MESSAGE("encoded by " << sender.stats().encoder);
+  CHECK(sender.stats().encoder.ends_with(" (d3d11)"));  // no copy through memory
+  REQUIRE(frame.nv12Y != nullptr);
+  const int y = frame.nv12Y[static_cast<size_t>(f.height / 2) * f.width + f.width / 2];
+  MESSAGE("centre luma " << y << " for a limited-range 126");
+  CHECK(std::abs(y - 128) <= 4);
+}
+
+TEST_CASE("sendVideoUyvy keeps working after a size change") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat fmtSmall{640, 360, 60, 1, false}, fmtBig{1280, 720, 60, 1, false};
+  Sender sender("omthx-test-uyvy-resize", Mode::Hx, Quality::Medium);
+  Receiver receiver(sender.address(), PixelFormat::Nv12);
+  VideoFrame frame;
+  bool sawSmall = false, sawLarge = false;
+  const auto deadline = Clock::now() + std::chrono::seconds(15);
+  for (int i = 0; Clock::now() < deadline && !sawLarge; ++i) {
+    const VideoFormat& f = sawSmall ? fmtBig : fmtSmall;
+    const std::vector<uint8_t> pic = uyvyGrey(f.width, f.height);
+    sender.sendVideoUyvy(f, pic.data(), f.width * 2, nullptr, 0, false, 1'000'000 + i * kFrame);
+    if (receiver.receiveVideo(frame, 16)) {
+      if (frame.format == fmtSmall) sawSmall = true;
+      if (frame.format == fmtBig) sawLarge = true;
+    }
+  }
+  CHECK(sawSmall);
+  CHECK(sawLarge);
+}
+
+TEST_CASE("OMTHX_NO_GPU_UYVY keeps the CPU path") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{640, 360, 60, 1, false};
+  const std::vector<uint8_t> pic = uyvyGrey(f.width, f.height);
+  _putenv_s("OMTHX_NO_GPU_UYVY", "1");
+  Sender sender("omthx-test-uyvy-switch", Mode::Hx, Quality::Medium);
+  Receiver receiver(sender.address(), PixelFormat::Nv12);
+  VideoFrame frame;
+  const bool got = sendUyvyUntilReceived(sender, receiver, f, pic, frame);
+  _putenv_s("OMTHX_NO_GPU_UYVY", "");
+  REQUIRE(got);
+  MESSAGE("encoded by " << sender.stats().encoder);
+  CHECK(sender.stats().encoder.find("(d3d11)") == std::string::npos);
+  CHECK(sender.stats().encoder.rfind(codecName(Codec::Hevc), 0) == 0);
+}
+
+TEST_CASE("sendVideoUyvy on the GPU costs less CPU than the pack") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{1920, 1080, 60, 1, false};
+  const std::vector<uint8_t> pic = uyvyGrey(f.width, f.height);
+  const auto cpuSeconds = [&](bool gpu) {
+    _putenv_s("OMTHX_NO_GPU_UYVY", gpu ? "" : "1");
+    Sender sender(gpu ? "omthx-test-uyvy-cost-gpu" : "omthx-test-uyvy-cost-pack", Mode::Hx, Quality::Medium);
+    Receiver receiver(sender.address(), PixelFormat::Nv12);
+    VideoFrame frame;
+    FILETIME idle{}, kernel{}, user{}, exit{};
+    auto time = [](const FILETIME& k, const FILETIME& u) {
+      return (static_cast<uint64_t>(k.dwHighDateTime) << 32 | k.dwLowDateTime) +
+             (static_cast<uint64_t>(u.dwHighDateTime) << 32 | u.dwLowDateTime);
+    };
+    GetProcessTimes(GetCurrentProcess(), &idle, &kernel, &user, &exit);
+    const uint64_t before = time(kernel, user);
+    auto next = Clock::now();
+    for (int i = 0; i < 300; ++i) {
+      sender.sendVideoUyvy(f, pic.data(), f.width * 2, nullptr, 0, false, 1'000'000 + i * kFrame);
+      receiver.receiveVideo(frame, 0);
+      next += std::chrono::microseconds(16'667);
+      std::this_thread::sleep_until(next);
+    }
+    GetProcessTimes(GetCurrentProcess(), &idle, &kernel, &user, &exit);
+    _putenv_s("OMTHX_NO_GPU_UYVY", "");
+    return static_cast<double>(time(kernel, user) - before) / 10'000'000.0;  // FILETIME: 100 ns
+  };
+  const double gpu = cpuSeconds(true), pack = cpuSeconds(false);
+  MESSAGE("CPU seconds for 300 pictures at 1920x1080: GPU path " << gpu << ", pack " << pack);
+  CHECK(gpu < pack);
+}
 #endif
 
 TEST_CASE("an HX sender with no receiver codes nothing") {

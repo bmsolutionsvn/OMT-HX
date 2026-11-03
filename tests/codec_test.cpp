@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <memory>
 #include <stdexcept>
@@ -218,6 +219,79 @@ TEST_CASE("Decoder: garbage is an error, not a crash, and a keyframe decodes aft
   CHECK(picture);
   CHECK(out.width == 1280);
   CHECK(out.height == 720);
+}
+
+namespace {
+// Black, white, grey and red vertical bars, 16 pixels each, in limited-range BT.709 UYVY. The space between rows is
+// filled with a byte no bar uses: a converter that reads it shows up in the comparison.
+std::vector<uint8_t> uyvyBars(int width, int height, int stride) {
+  struct Bar {
+    uint8_t y, u, v;
+  };
+  const Bar bars[4] = {{16, 128, 128}, {235, 128, 128}, {126, 128, 128}, {63, 102, 240}};
+  std::vector<uint8_t> p(static_cast<size_t>(stride) * height, 0x5A);
+  for (int r = 0; r < height; ++r) {
+    uint8_t* row = p.data() + static_cast<size_t>(r) * stride;
+    for (int x = 0; x < width; x += 2) {
+      const Bar& b = bars[x / (width / 4)];
+      row[2 * x] = b.u;
+      row[2 * x + 1] = b.y;
+      row[2 * x + 2] = b.v;
+      row[2 * x + 3] = b.y;
+    }
+  }
+  return p;
+}
+
+// Every Y, U and V sample of the GPU picture within 2 of packUyvy's.
+void checkSamePicture(const Nv12& gpu, const Nv12& cpu) {
+  REQUIRE(gpu.y.size() == cpu.y.size());
+  REQUIRE(gpu.uv.size() == cpu.uv.size());
+  int worstY = 0, worstUV = 0;
+  for (size_t i = 0; i < gpu.y.size(); ++i) worstY = std::max(worstY, std::abs(gpu.y[i] - cpu.y[i]));
+  for (size_t i = 0; i < gpu.uv.size(); ++i) worstUV = std::max(worstUV, std::abs(gpu.uv[i] - cpu.uv[i]));
+  MESSAGE("worst difference: Y " << worstY << ", UV " << worstUV);
+  for (size_t i = 0; i < gpu.y.size(); ++i) CHECK(std::abs(gpu.y[i] - cpu.y[i]) <= 2);
+  for (size_t i = 0; i < gpu.uv.size(); ++i) CHECK(std::abs(gpu.uv[i] - cpu.uv[i]) <= 2);
+}
+}  // namespace
+
+TEST_CASE("UyvyToNv12 matches packUyvy") {
+  const int w = 64, h = 16;
+  const VideoFormat f{w, h, 60, 1, false};
+  const std::vector<uint8_t> uyvy = uyvyBars(w, h, w * 2);
+  Nv12 cpu;
+  packUyvy(f, uyvy.data(), w * 2, nullptr, 0, false, cpu);
+  UyvyToNv12 converter;
+  GpuPicture gpu;
+  try {
+    converter.convert(uyvy.data(), w * 2, w, h, gpu);
+  } catch (const std::runtime_error& e) {
+    MESSAGE("SKIPPED, no D3D11 device to convert UYVY on this PC: " << e.what());
+    return;
+  }
+  Nv12 got;
+  REQUIRE(downloadNv12(gpu.frame, got));
+  checkSamePicture(got, cpu);
+}
+
+TEST_CASE("UyvyToNv12 reads padded rows") {
+  const int w = 64, h = 16, stride = w * 2 + 64;
+  const VideoFormat f{w, h, 60, 1, false};
+  const std::vector<uint8_t> uyvy = uyvyBars(w, h, stride);
+  Nv12 cpu;
+  packUyvy(f, uyvy.data(), stride, nullptr, 0, false, cpu);
+  UyvyToNv12 converter;
+  GpuPicture gpu;
+  try {
+    converter.convert(uyvy.data(), stride, w, h, gpu);
+  } catch (const std::runtime_error& e) {
+    MESSAGE("SKIPPED, no D3D11 device to convert UYVY on this PC: " << e.what());
+    return;
+  }
+  Nv12 got;
+  REQUIRE(downloadNv12(gpu.frame, got));
+  checkSamePicture(got, cpu);
 }
 
 TEST_CASE("Decoder: a stream of the other codec never becomes a picture") {
