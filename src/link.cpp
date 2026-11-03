@@ -1225,7 +1225,11 @@ bool FrameDecoder::decode(const CodedFrame& c, VideoFrame& out) {
   }
 
   // Hx: the same decode and alpha handling as Receiver::receiveVideo.
-  if (c.alphaBytes >= c.data.size()) return false;
+  if (c.alphaBytes >= c.data.size()) {  // no room for the fill: the stream is broken
+    d_->waiting = true;
+    d_->hx.pendingAlpha.clear();
+    return false;
+  }
   const std::span<const uint8_t> data(c.data);
   const std::span<const uint8_t> fill = data.first(data.size() - c.alphaBytes);
   const std::span<const uint8_t> vmx = data.subspan(data.size() - c.alphaBytes);

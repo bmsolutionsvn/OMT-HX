@@ -1083,3 +1083,39 @@ TEST_CASE("FrameDecoder starts at a keyframe after reset") {
 TEST_CASE("FrameDecoder rejects pixel formats it does not offer") {
   CHECK_THROWS_AS((void)FrameDecoder(PixelFormat::Gpu), std::invalid_argument);
 }
+
+TEST_CASE("FrameDecoder restarts at a keyframe after a frame it cannot split") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{640, 360, 60, 1, false};
+  Sender sender("omthx-test-framedecoder-bad", Mode::Hx, Quality::Medium, Codec::Hevc);
+  Receiver coded(sender.address(), PixelFormat::Coded);
+  Pump pump(sender, f);
+
+  FrameDecoder decoder;
+  CodedFrame c;
+  VideoFrame out;
+  bool picture = false;
+  for (const auto deadline = Clock::now() + std::chrono::seconds(10); !picture && Clock::now() < deadline;) {
+    if (coded.receiveCoded(c, 50)) picture = decoder.decode(c, out);
+  }
+  REQUIRE(picture);
+
+  // A frame whose alpha leaves no room for the fill is a broken stream, not just a bad frame.
+  bool fed = false;
+  for (const auto deadline = Clock::now() + std::chrono::seconds(2); !fed && Clock::now() < deadline;) {
+    if (!coded.receiveCoded(c, 50) || c.keyframe) continue;
+    CodedFrame bad = c;
+    bad.alphaBytes = bad.data.size();
+    CHECK_FALSE(decoder.decode(bad, out));
+    fed = true;
+  }
+  REQUIRE(fed);
+
+  int nonKey = 0;  // the stream is broken: nothing decodes until a keyframe
+  for (const auto until = Clock::now() + std::chrono::seconds(2); nonKey < 5 && Clock::now() < until;) {
+    if (!coded.receiveCoded(c, 50) || c.keyframe) continue;
+    ++nonKey;
+    CHECK_FALSE(decoder.decode(c, out));
+  }
+  CHECK(nonKey == 5);
+}
