@@ -308,6 +308,7 @@ class Readback {
   void push(const AVFrame* frame, const VideoFormat& format, int64_t timestamp, bool bgra);
   bool take(bool wait, Nv12& nv12, std::vector<uint8_t>& bgra, Picture& out);  // throws std::runtime_error
   bool pending() const;
+  void nap();  // about 200 us, for a caller polling take
 
  private:
   struct Impl;

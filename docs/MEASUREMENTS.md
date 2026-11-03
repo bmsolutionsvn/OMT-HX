@@ -1,7 +1,7 @@
 # OMT-HX measurements
 
-The first section below is two PCs over a real network (`scripts\measure-two-pc.ps1`): use it for what
-a link does. The sections after it were measured with `omthx-send` and `omthx-recv`, driven by
+The 2026-11-03 section and the two-PC part of 2026-11-04 are two PCs over a real network
+(`scripts\measure-two-pc.ps1`): use them for what a link does. The other sections were measured with `omthx-send` and `omthx-recv`, driven by
 `scripts\measure.ps1`, on one PC over `localhost`, test picture with grain. One PC means no network in
 the path: those are codec and library figures, not link figures. It also means sender and receiver
 share one CPU and one GPU, so each runs slower than it would alone. Each row is the median of a 20 s run
@@ -10,6 +10,48 @@ after a 2 s warm-up.
 Since 2026-10-20 the GPU codes the fill alone and alpha goes by VMX on the CPU, not stacked under the
 fill. The current alpha figures are in the two-PC table and the 2026-10-20 table; the tables after
 those keep the stacked-alpha numbers they were measured with.
+
+## 2026-11-04: the receiver's copy catches up
+
+The overlapped copy to memory of 2026-11-03 cost a frame of delay up to 1440p: a receiver whose copy
+once missed the half-frame wait handed out each picture a frame late from then on. Now a copy left over
+from the last call goes out as soon as it is done, unless the next frame comes first (then the copies
+overlap, which 4K needs on a GTX 1650), and every wait polls the copy instead of a blocking `Map`.
+
+Waiting for each copy before handing the picture out (no overlap) was tried and dropped: on the
+GTX 1650 it held 4K to 46 to 48 fps to NV12 and 20 to 24 to BGRA, polled or not.
+
+**One PC** (`measure.ps1 -Seconds 15`, the delay on one clock, so to the millisecond), delay avg ms:
+
+| Case | 2026-10-19 | Overlap only (two runs) | Now |
+|------|-----------|-------------------------|-----|
+| hx 720p60 | 9.7 | 9.1 / 10.1 | 8.5 |
+| hx 1080p60 | 15.4 | 16.4 / 35.5 | 15.3 |
+| hx 1080p60 low | 14.9 | 25.4 / 28.0 | 14.2 |
+| hx 1080p60 high | 17.0 | 26.4 / 33.8 | 15.9 |
+| hx 1080p30 | 15.0 | 42.2 / 16.9 | 14.6 |
+| hx 1080p120 | 15.7 | 24.8 / 468 (117 fps) | 22.5 |
+| hx 1440p60 | 26.0 | 42.1 / 66.2 | 31.6 |
+| h264 1080p60 low | 15.4 | 27.8 / 13.5 | 13.5 |
+| h264 720p60 | 9.1 | 22.2 / 10.1 | 8.6 |
+| hx 2160p60 fps | 43 / 42 | 47 / 47 | 49 / 49 |
+
+The same overlap-only build landed on either figure from run to run; its delay max reached 106 to
+123 ms in the rows that fell behind. The rows with alpha and the full rows do not use the copy and did
+not change. 1440p moved between 21 and 36 ms over today's runs, the alpha rows by a similar amount.
+
+**Two PCs** (`measure-two-pc.ps1`, as 2026-11-03 below): every case except 1080p120 holds its rate,
+and every 4K60 path holds 60 / 60. Round trip ms, 2026-11-03 then now:
+
+- hx 1080p60 high 51.4 -> 35.0, hx 1080p120 42.6 -> 34.9 (104 fps received, was 115).
+- hx 1080p60 51.2 -> 50.4, hx 1440p60 52.4 -> 52.1, h264 1080p60 51.2 -> 51.2: the round trip steps a
+  whole frame (35, 52 ms), so a picture a few ms over the step reads the same as one a frame late; the
+  one-PC figures above are the finer measure.
+- 4K60: 50.2 (gpu>gpu) to 72.9 (mem>bgra), within a step of 2026-11-03 on every path; mem>bgra 77.7 ->
+  72.7.
+- One run had the sender stall for up to 2.8 s per frame in h264 1080p60 (25 fps) and briefly in two
+  4K cases, one of them to a `gpu` receiver, which does not use the copy. Rerun, h264 1080p60 held
+  60 / 60 at 51.2 ms.
 
 ## 2026-11-03: two PCs
 
@@ -97,8 +139,7 @@ those keep the stacked-alpha numbers they were measured with.
 - **1080p60 to memory is a frame slower than it needs to be**: 51 ms round trip against 36 ms with
   alpha, which takes the path without the overlapped copy, and 35 ms at `low`. The likely cause, not
   yet confirmed: the receiver falls a frame behind when one copy misses its half-frame wait, and once
-  behind it stays behind until the stream pauses (the `ponytail:` note in `Readback::take`). Catching
-  up would bring it to about 35 ms.
+  behind it stays behind until the stream pauses. Confirmed and fixed on 2026-11-04 (above).
 - **1080p120** receives 115 of 120 fps: the last case that does not hold its rate.
 - The round trip does not include the receiving app's own work (OBS adds one full-size copy per frame,
   about 5 to 10 ms at 4K).
