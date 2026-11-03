@@ -99,6 +99,9 @@ if(OMTHX_BUILD_TESTS)
     omthx_copy_runtime(omthx-${tool})
   endforeach()
   if(WIN32)
-    target_link_libraries(omthx-send PRIVATE winmm)
+    target_link_libraries(omthx-send PRIVATE winmm d3d11)  # d3d11: --gpu makes its own device
+    # How fast each GPU brings a 4K picture to memory (link-check's companion; needs nothing but D3D11).
+    add_executable(readback-bench tools/readback_bench.cpp)
+    target_link_libraries(readback-bench PRIVATE d3d11 dxgi)
   endif()
 endif()

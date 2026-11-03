@@ -17,6 +17,9 @@ namespace {
 [[noreturn]] void usage() {
   std::puts("omthx-recv --list\n"
             "omthx-recv --source \"HOST (Name)\" [--seconds N] [--dump FILE.bmp] [--tally program|preview] [--preview]\n"
+            "           [--pixels bgra|nv12|gpu]\n"
+            "--pixels: bgra (default) brings the picture to memory as BGRA; nv12 brings the decoder's NV12 with no\n"
+            "conversion; gpu keeps an HX picture in video memory, as an app that draws it on the GPU would.\n"
             "Delay is only meaningful when omthx-send runs on this PC, or both PCs share a synchronised clock.");
   std::exit(2);
 }
@@ -45,6 +48,7 @@ int main(int argc, char** argv) {
   std::string source, dump, tally;
   bool list = false, preview = false;
   int seconds = 0;
+  PixelFormat pixels = PixelFormat::Bgra;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto value = [&]() -> std::string {
@@ -57,7 +61,13 @@ int main(int argc, char** argv) {
     else if (a == "--dump") dump = value();
     else if (a == "--tally") tally = value();
     else if (a == "--preview") preview = true;  // the small picture, as NDI's lowest bandwidth
-    else usage();
+    else if (a == "--pixels") {
+      const std::string p = value();
+      if (p == "bgra") pixels = PixelFormat::Bgra;
+      else if (p == "nv12") pixels = PixelFormat::Nv12;
+      else if (p == "gpu") pixels = PixelFormat::Gpu;
+      else usage();
+    } else usage();
   }
 
   try {
@@ -69,7 +79,11 @@ int main(int argc, char** argv) {
     }
     if (source.empty()) usage();
 
-    Receiver receiver(source, PixelFormat::Bgra, preview);
+    if (!dump.empty() && pixels == PixelFormat::Nv12) {
+      std::fputs("omthx-recv: --dump needs --pixels bgra or gpu\n", stderr);
+      return 2;
+    }
+    Receiver receiver(source, pixels, preview);
     if (!tally.empty()) receiver.setTally(Tally{tally == "preview", tally == "program"});
     using Clock = std::chrono::steady_clock;
     const auto end = Clock::now() + std::chrono::seconds(seconds);
@@ -88,7 +102,9 @@ int main(int argc, char** argv) {
         delayMax = std::max(delayMax, delay);
         ++delays;
         if (!dump.empty()) {
-          if (writeBmp(dump, frame)) {
+          // A Gpu picture comes to memory only for the dump; a plain OMT source already filled uyvy, not bgra.
+          if (pixels == PixelFormat::Gpu && frame.gpu) download(frame, PixelFormat::Bgra);
+          if (!frame.bgra.empty() && writeBmp(dump, frame)) {
             std::printf("wrote %s\n", dump.c_str());
           } else {
             std::fprintf(stderr, "omthx-recv: cannot write %s\n", dump.c_str());
@@ -103,7 +119,7 @@ int main(int argc, char** argv) {
                     "delay avg %6.2f max %6.2f ms  %dx%d%s  src %s\n",
                     s.mode == Mode::Hx ? "HX" : "Full", s.decoder.c_str(),
                     static_cast<unsigned long long>(s.framesReceived - last.framesReceived),
-                    (s.bytesReceived - last.bytesReceived) * 8 / 1e6, s.lastDecodeMs,
+                    (s.bytesReceived >= last.bytesReceived ? s.bytesReceived - last.bytesReceived : s.bytesReceived) * 8 / 1e6, s.lastDecodeMs,  // the count restarts with a new connection
                     static_cast<unsigned long long>(s.framesDiscarded), delays ? delaySum / delays : 0.0, delayMax,
                     frame.format.width, frame.format.height, frame.format.alpha ? " +alpha" : "",
                     s.encoder.empty() ? "-" : s.encoder.c_str());
