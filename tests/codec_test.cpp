@@ -294,6 +294,50 @@ TEST_CASE("UyvyToNv12 reads padded rows") {
   checkSamePicture(got, cpu);
 }
 
+namespace {
+// Chroma that changes down the rows, which is where the video processor merges 4:2:2 into 4:2:0: the left half
+// alternates red and blue every row (a point sample of one row shows), the right half in two-row blocks (a
+// half-line vertical shift shows). Luma is flat, so only the merge is under test.
+std::vector<uint8_t> uyvyChromaRows(int width, int height) {
+  struct Chroma {
+    uint8_t u, v;
+  };
+  const Chroma red{102, 240}, blue{240, 118};
+  std::vector<uint8_t> p(static_cast<size_t>(width) * height * 2);
+  for (int r = 0; r < height; ++r) {
+    uint8_t* row = p.data() + static_cast<size_t>(r) * width * 2;
+    for (int x = 0; x < width; x += 2) {
+      const bool left = x < width / 2;
+      const Chroma& c = (left ? r % 2 == 0 : (r / 2) % 2 == 0) ? red : blue;
+      row[2 * x] = c.u;
+      row[2 * x + 1] = 126;
+      row[2 * x + 2] = c.v;
+      row[2 * x + 3] = 126;
+    }
+  }
+  return p;
+}
+}  // namespace
+
+TEST_CASE("UyvyToNv12 merges chroma rows like packUyvy") {
+  const int w = 64, h = 16;
+  const VideoFormat f{w, h, 60, 1, false};
+  const std::vector<uint8_t> uyvy = uyvyChromaRows(w, h);
+  Nv12 cpu;
+  packUyvy(f, uyvy.data(), w * 2, nullptr, 0, false, cpu);
+  UyvyToNv12 converter;
+  GpuPicture gpu;
+  try {
+    converter.convert(uyvy.data(), w * 2, w, h, gpu);
+  } catch (const std::runtime_error& e) {
+    MESSAGE("SKIPPED, no D3D11 device to convert UYVY on this PC: " << e.what());
+    return;
+  }
+  Nv12 got;
+  REQUIRE(downloadNv12(gpu.frame, got));
+  checkSamePicture(got, cpu);
+}
+
 TEST_CASE("Decoder: a stream of the other codec never becomes a picture") {
   Codec stream = Codec::Hevc;
   SUBCASE("hevc stream, h264 decoder") { stream = Codec::Hevc; }
