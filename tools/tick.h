@@ -31,7 +31,8 @@ inline int onset(const float* samples, int count) {
   return -1;
 }
 
-// True when a picture is the white flash: the mean of 64 pixels spread over it is near white. `step` is the
+// True when a picture is the white flash: the mean of 64 pixels spread over its central half is near white (the
+// centre, so a phone playing a tick video with black bars or a status bar still counts). `step` is the
 // bytes between pixels in a row (4 for BGRA, 1 for an NV12 Y plane), `stride` the bytes between rows; the
 // value read is the byte at each pixel (BGRA: blue, which is 255 only in white or blue-heavy pictures).
 inline bool isFlash(const uint8_t* picture, int width, int height, int step, int stride) {
@@ -39,7 +40,7 @@ inline bool isFlash(const uint8_t* picture, int width, int height, int step, int
   int sum = 0;
   for (int gy = 0; gy < 8; ++gy) {
     for (int gx = 0; gx < 8; ++gx) {
-      const int x = (2 * gx + 1) * width / 16, y = (2 * gy + 1) * height / 16;
+      const int x = width / 4 + (2 * gx + 1) * width / 32, y = height / 4 + (2 * gy + 1) * height / 32;
       sum += picture[static_cast<size_t>(y) * stride + static_cast<size_t>(x) * step];
     }
   }
