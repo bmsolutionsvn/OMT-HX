@@ -5,11 +5,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <deque>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "omthx/omthx.h"
+#include "tick.h"
 
 using namespace omthx;
 
@@ -17,10 +21,13 @@ namespace {
 [[noreturn]] void usage() {
   std::puts("omthx-recv --list\n"
             "omthx-recv --source \"HOST (Name)\" [--seconds N] [--dump FILE.bmp] [--tally program|preview] [--preview]\n"
-            "           [--pixels bgra|nv12|gpu] [--live-seconds N]\n"
+            "           [--pixels bgra|nv12|gpu] [--live-seconds N] [--tick]\n"
             "--live-seconds N stops after N seconds in which pictures arrived; --seconds then caps the wait.\n"
             "--pixels: bgra (default) brings the picture to memory as BGRA; nv12 brings the decoder's NV12 with no\n"
             "conversion; gpu keeps an HX picture in video memory, as an app that draws it on the GPU would.\n"
+            "--tick (with omthx-send --tick; not with --pixels gpu) finds each second's white picture and beep and\n"
+            "prints their delays and how much later the beep arrives than the picture. That last number needs no\n"
+            "clock sync: it is right across two PCs.\n"
             "Delay is only meaningful when omthx-send runs on this PC, or both PCs share a synchronised clock.");
   std::exit(2);
 }
@@ -43,11 +50,77 @@ bool writeBmp(const std::string& path, const VideoFrame& v) {
   out.write(reinterpret_cast<const char*>(v.bgra.data()), size);
   return out.good();
 }
+
+int64_t wallNow() {  // OMT units (100 ns) on the wall clock, as omthx-send stamps
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+             .count() / 100;
+}
+
+// --tick: pairs each flash with the beep stamped at the same moment and prints both delays.
+class TickMatcher {
+ public:
+  struct Event {
+    int64_t stamp;   // the source's timestamp of the flash or of the beep's first loud sample
+    double delayMs;  // arrival here minus the timestamp of the frame that carried it
+  };
+
+  void add(bool audio, Event e) {
+    std::lock_guard<std::mutex> lock(m_);
+    std::deque<Event>& mine = audio ? audio_ : video_;
+    std::deque<Event>& other = audio ? video_ : audio_;
+    for (auto it = other.begin(); it != other.end(); ++it) {
+      if (std::llabs(it->stamp - e.stamp) < 5'000'000) {  // within 0.5 s of stream time: the same second
+        const Event& v = audio ? *it : e;
+        const Event& a = audio ? e : *it;
+        const double late = a.delayMs - v.delayMs;
+        lates_.push_back(late);
+        videoDelays_.push_back(v.delayMs);
+        audioDelays_.push_back(a.delayMs);
+        std::printf("tick  video delay %7.1f ms  audio delay %7.1f ms  audio later by %+7.1f ms  (stamped %+.1f ms apart)\n",
+                    v.delayMs, a.delayMs, late, (a.stamp - v.stamp) / 10'000.0);
+        other.erase(it);
+        return;
+      }
+    }
+    mine.push_back(e);
+    if (mine.size() > 8) mine.pop_front();  // its partner was lost
+  }
+
+  void summary() {
+    std::lock_guard<std::mutex> lock(m_);
+    if (lates_.empty()) {
+      std::puts("tick summary: no flash and beep pairs. Is the source omthx-send --tick?");
+      return;
+    }
+    std::printf("tick summary: %zu pairs  median video delay %.1f ms  audio delay %.1f ms  audio later by %+.1f ms "
+                "(min %+.1f, max %+.1f)\n",
+                lates_.size(), median(videoDelays_), median(audioDelays_), median(lates_),
+                *std::min_element(lates_.begin(), lates_.end()), *std::max_element(lates_.begin(), lates_.end()));
+  }
+
+ private:
+  static double median(std::vector<double> v) {
+    std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(v.size() / 2), v.end());
+    return v[v.size() / 2];
+  }
+  std::mutex m_;
+  std::deque<Event> video_, audio_;
+  std::vector<double> lates_, videoDelays_, audioDelays_;
+};
+
+// True when a received picture is the white flash, whichever pixels it came as.
+bool flashOf(const VideoFrame& f) {
+  const int w = f.format.width, h = f.format.height;
+  if (!f.bgra.empty()) return tick::isFlash(f.bgra.data(), w, h, 4, w * 4);
+  if (f.nv12Y) return tick::isFlash(f.nv12Y, w, h, 1, w);
+  if (!f.uyvy.empty()) return tick::isFlash(f.uyvy.data() + 1, w, h, 2, w * 2);  // Y is every second byte
+  return false;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
   std::string source, dump, tally;
-  bool list = false, preview = false;
+  bool list = false, preview = false, tick = false;
   int seconds = 0;
   int liveSeconds = 0, live = 0;  // stop after this many seconds with pictures
   PixelFormat pixels = PixelFormat::Bgra;
@@ -64,6 +137,7 @@ int main(int argc, char** argv) {
     else if (a == "--dump") dump = value();
     else if (a == "--tally") tally = value();
     else if (a == "--preview") preview = true;  // the small picture, as NDI's lowest bandwidth
+    else if (a == "--tick") tick = true;
     else if (a == "--pixels") {
       const std::string p = value();
       if (p == "bgra") pixels = PixelFormat::Bgra;
@@ -86,8 +160,29 @@ int main(int argc, char** argv) {
       std::fputs("omthx-recv: --dump needs --pixels bgra or gpu\n", stderr);
       return 2;
     }
+    if (tick && pixels == PixelFormat::Gpu) usage();
     Receiver receiver(source, pixels, preview);
     if (!tally.empty()) receiver.setTally(Tally{tally == "preview", tally == "program"});
+    TickMatcher ticks;
+    // --tick: audio on its own thread, as a player would. Declared after receiver, so it stops before receiver goes.
+    std::jthread audioThread;
+    if (tick) {
+      audioThread = std::jthread([&](std::stop_token stop) {
+        AudioFrame a;
+        bool inBeep = false;  // the beep spans several blocks: only its first loud block counts
+        while (!stop.stop_requested()) {
+          if (!receiver.receiveAudio(a, 100)) continue;
+          const int64_t now = wallNow();
+          const int at = a.planar.empty() || a.sampleRate <= 0 ? -1 : tick::onset(a.planar.data(), a.samples);
+          if (at < 0) {
+            inBeep = false;
+          } else if (!inBeep) {
+            inBeep = true;
+            ticks.add(true, {a.timestamp + at * 10'000'000LL / a.sampleRate, (now - a.timestamp) / 10'000.0});
+          }
+        }
+      });
+    }
     using Clock = std::chrono::steady_clock;
     const auto end = Clock::now() + std::chrono::seconds(seconds);
     auto report = Clock::now() + std::chrono::seconds(1);
@@ -97,10 +192,8 @@ int main(int argc, char** argv) {
     int delays = 0;
     while (seconds == 0 || Clock::now() < end) {
       if (receiver.receiveVideo(frame, 100)) {
-        const int64_t now =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
-                .count() / 100;
-        const double delay = (now - frame.timestamp) / 10'000.0;  // ms
+        const double delay = (wallNow() - frame.timestamp) / 10'000.0;  // ms
+        if (tick && flashOf(frame)) ticks.add(false, {frame.timestamp, delay});
         delaySum += delay;
         delayMax = std::max(delayMax, delay);
         ++delays;
@@ -132,6 +225,11 @@ int main(int argc, char** argv) {
         delays = 0;
         if (arrived && liveSeconds > 0 && ++live >= liveSeconds) break;
       }
+    }
+    if (tick) {
+      audioThread.request_stop();
+      audioThread.join();
+      ticks.summary();
     }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "omthx-recv: %s\n", e.what());

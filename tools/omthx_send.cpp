@@ -19,16 +19,19 @@
 
 #include "omthx/omthx.h"
 #include "pattern.h"
+#include "tick.h"
 
 using namespace omthx;
 
 namespace {
 [[noreturn]] void usage() {
   std::puts("omthx-send [--name TEXT] [--mode hx|full] [--codec hevc|h264] [--quality low|medium|high]\n"
-            "           [--size WxH] [--fps N] [--alpha] [--tone] [--gpu] [--seconds N]\n"
+            "           [--size WxH] [--fps N] [--alpha] [--tone] [--tick] [--gpu] [--seconds N]\n"
             "Defaults: --name \"OMT-HX Test\" --mode hx --codec hevc --quality medium --size 1920x1080 --fps 60,\n"
             "runs until Ctrl+C. --codec is ignored with --mode full.\n"
             "--tone adds a 1 kHz tone at -20 dBFS, stereo, 48 kHz.\n"
+            "--tick sends a white picture and a 50 ms beep at the start of each second, stamped alike, for\n"
+            "omthx-recv --tick to measure audio and video delay and how far apart they arrive.\n"
             "--gpu (Windows, no --alpha) sends D3D11 textures with sendVideoD3D11, as BreadCamera and desktop\n"
             "capture do: the picture never comes to memory.\n"
             "--uyvy (no --alpha, not with --gpu) sends UYVY pictures from memory with sendVideoUyvy, as an SDI or\n"
@@ -68,6 +71,7 @@ int main(int argc, char** argv) {
   VideoFormat f{1920, 1080, 60, 1, false};
   int seconds = 0;
   bool tone = false;
+  bool tick = false;
   bool gpu = false;
   bool uyvy = false;
   int untilWatched = 0;  // stop after this many seconds with a receiver connected
@@ -98,6 +102,8 @@ int main(int argc, char** argv) {
       seconds = std::atoi(value().c_str());
     } else if (a == "--tone") {
       tone = true;
+    } else if (a == "--tick") {
+      tick = true;
     } else if (a == "--until-watched") {
       untilWatched = std::atoi(value().c_str());
     } else if (a == "--gpu") {
@@ -119,6 +125,7 @@ int main(int argc, char** argv) {
     // Sixteen pictures drawn once and looped: drawing 1080p in real time would cost more than sending it.
     std::vector<std::vector<uint8_t>> loop(16);
     for (int i = 0; i < 16; ++i) drawPattern(loop[i], f.width, f.height, i * 4, f.alpha);
+    if (tick) loop.emplace_back(static_cast<size_t>(f.width) * f.height * 4, uint8_t{255});  // [16]: the flash
     if (uyvy)
       for (auto& pic : loop) pic = toUyvy(pic, f.width, f.height);
 
@@ -160,25 +167,29 @@ int main(int argc, char** argv) {
     const int64_t total = static_cast<int64_t>(seconds) * f.fpsN / f.fpsD;
     for (int64_t i = 0; seconds == 0 || i < total; ++i) {
       const int64_t ts = epoch + i * 10'000'000LL * f.fpsD / f.fpsN;
+      const size_t pic = tick && tick::flashFrame(i, f.fpsN, f.fpsD) ? 16 : static_cast<size_t>(i % 16);
 #ifdef _WIN32
       if (gpu) {
-        sender.sendVideoD3D11(f, textures[static_cast<size_t>(i % 16)].Get(), ts);
+        sender.sendVideoD3D11(f, textures[pic].Get(), ts);
       } else
 #endif
       if (uyvy) {
-        sender.sendVideoUyvy(f, loop[static_cast<size_t>(i % 16)].data(), f.width * 2, nullptr, 0, false, ts);
+        sender.sendVideoUyvy(f, loop[pic].data(), f.width * 2, nullptr, 0, false, ts);
       } else {
-        sender.sendVideo(f, loop[static_cast<size_t>(i % 16)], false, ts);
+        sender.sendVideo(f, loop[pic], false, ts);
       }
-      if (tone) {  // one block per frame, sized so the sample count never drifts from the frame count
+      if (tone || tick) {  // one block per frame, sized so the sample count never drifts from the frame count
         const int64_t first = i * 48000 * f.fpsD / f.fpsN;
         const int64_t samples = (i + 1) * 48000 * f.fpsD / f.fpsN - first;
         const size_t n = samples > 0 ? static_cast<size_t>(samples) : 1;
         block.resize(2 * n);
-        for (size_t k = 0; k < n; ++k)
+        for (size_t k = 0; k < n; ++k) {
+          const int64_t at = first + static_cast<int64_t>(k);
           block[k] = block[n + k] =
-              0.1f * static_cast<float>(std::sin(2 * 3.141592653589793 * 1000 * static_cast<double>(first + static_cast<int64_t>(k)) / 48000));
-        sender.sendAudio(block, 48000, 2, epoch + i * 10'000'000LL * f.fpsD / f.fpsN);
+              tick ? tick::beepSample(at)
+                   : 0.1f * static_cast<float>(std::sin(2 * 3.141592653589793 * 1000 * static_cast<double>(at) / 48000));
+        }
+        sender.sendAudio(block, 48000, 2, ts);
       }
       std::this_thread::sleep_until(t0 + std::chrono::nanoseconds((i + 1) * 1'000'000'000LL * f.fpsD / f.fpsN));
       if (Clock::now() >= report) {

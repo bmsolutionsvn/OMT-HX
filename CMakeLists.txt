@@ -82,6 +82,7 @@ if(OMTHX_BUILD_TESTS)
     tests/codec_test.cpp
     tests/link_test.cpp
     tests/capi_test.cpp
+    tests/tick_test.cpp
   )
   target_include_directories(omthx_tests PRIVATE src tools)
   target_link_libraries(omthx_tests PRIVATE omthx doctest::doctest)
