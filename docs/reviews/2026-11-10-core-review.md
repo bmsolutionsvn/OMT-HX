@@ -93,7 +93,8 @@ that flag (`libavcodec/pthread.c`, FFmpeg n9.0.2). `thread_count = 4` then gives
 help only streams coded in several slices or, for HEVC, with WPP. The software decoder, old and new, may
 therefore decode a single-slice hardware stream on one thread. The code comment about "four frame threads"
 is likely wrong. Needs a measurement; the real choice is frame threads (several frames of delay) against
-low delay.
+low delay. Decided: the software decoder drops `LOW_DELAY` and runs four frame threads (commit `2b8d06e`);
+the hardware decoder keeps it. The extra delay and the throughput are not measured yet.
 
 ## 7. Fallbacks are silent and permanent
 
