@@ -169,6 +169,10 @@ struct Sender::Impl {
                    bool urgent, const AVFrame* gpu);
   // The Hx send of a Gpu picture. The caller has gated the frame; t0 is when it was handed over, before any conversion.
   void sendGpu(const VideoFrame& frame, Clock::time_point t0);
+  // The Full sends of UYVY rows and of a Gpu picture. The caller has gated the frame.
+  void sendFullUyvy(const VideoFormat& fmt, const uint8_t* uyvy, int stride, const uint8_t* alpha, int alphaStride,
+                    bool premultiplied, int64_t timestamp);
+  void sendFullGpu(const VideoFrame& frame);
   void fellBack(std::string_view path, const char* what) {
     std::lock_guard lock(statsMutex);
     stats.lastFallback = std::string(path) + ": " + what;
@@ -237,11 +241,12 @@ bool Sender::Impl::hasReceivers() {
   const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
   std::lock_guard lock(receiversMutex);
   if (receiversCheckedMs >= 0 && nowMs - receiversCheckedMs < 100) return receivers > 0;
-  const int count = omt_send_connections(tx);
-  if (count > receivers) joined = true;
-  receivers = count;
-  previewReceivers = omt_send_previewconnections(tx);
-  fullReceivers = omt_send_fullconnections(tx);
+  receivers = omt_send_connections(tx);
+  // Video receivers only: a receiver's audio connection may land in a later refresh, and is no new viewer.
+  const int preview = omt_send_previewconnections(tx), full = omt_send_fullconnections(tx);
+  if (preview + full > previewReceivers + fullReceivers) joined = true;
+  previewReceivers = preview;
+  fullReceivers = full;
   receiversCheckedMs = nowMs;
   return receivers > 0;
 }
@@ -452,6 +457,44 @@ void Sender::Impl::sendGpu(const VideoFrame& frame, Clock::time_point t0) {
   }
 }
 
+void Sender::Impl::sendFullUyvy(const VideoFormat& fmt, const uint8_t* uyvy, int stride, const uint8_t* alpha,
+                                int alphaStride, bool premultiplied, int64_t timestamp) {
+  OMTMediaFrame f = videoHeader(fmt, timestamp);
+  const size_t plane = static_cast<size_t>(stride) * fmt.height;
+  f.Flags = alphaFlags(fmt, premultiplied);
+  f.Codec = fmt.alpha ? OMTCodec_UYVA : OMTCodec_UYVY;
+  f.Stride = stride;
+  f.Data = const_cast<uint8_t*>(uyvy);
+  f.DataLength = static_cast<int>(plane);
+  if (fmt.alpha) {
+    // libvmx reads the alpha plane from Data + Stride * Height, rows Stride / 2 apart.
+    if (alpha != uyvy + plane || stride % 2 || alphaStride != stride / 2) {
+      const size_t row = static_cast<size_t>(fmt.width) * 2;
+      uyva.resize(row * fmt.height * 3 / 2);
+      for (int r = 0; r < fmt.height; ++r) {
+        std::memcpy(uyva.data() + r * row, uyvy + static_cast<size_t>(r) * stride, row);
+        std::memcpy(uyva.data() + row * fmt.height + r * row / 2, alpha + static_cast<size_t>(r) * alphaStride,
+                    row / 2);
+      }
+      f.Stride = static_cast<int>(row);
+      f.Data = uyva.data();
+    }
+    f.DataLength = f.Stride * fmt.height * 3 / 2;
+  }
+  sendFull(f);
+}
+
+void Sender::Impl::sendFullGpu(const VideoFrame& frame) {
+  const VideoFormat& fmt = frame.format;
+  const size_t w = static_cast<size_t>(fmt.width), h = static_cast<size_t>(fmt.height);
+  const std::vector<uint8_t>* alpha = fmt.alpha ? frame.gpu->alpha.get() : nullptr;
+  if (!downloadNv12(frame.gpu->frame, picture)) throw std::runtime_error("cannot copy the picture from video memory");
+  unpackUyvy(fmt, picture, gpuUyva, alpha ? alpha->data() : nullptr);
+  const uint8_t* p = gpuUyva.data();
+  sendFullUyvy(fmt, p, fmt.width * 2, fmt.alpha ? p + w * 2 * h : nullptr, fmt.width, frame.premultiplied,
+               frame.timestamp);
+}
+
 Sender::Sender(const std::string& name, Mode mode, Quality quality, Codec codec) : d_(std::make_unique<Impl>()) {
   static constexpr OMTQuality kOmtQuality[] = {OMTQuality_Low, OMTQuality_Medium, OMTQuality_High};
   d_->mode = mode;
@@ -533,33 +576,11 @@ void Sender::sendVideoUyvy(const VideoFormat& fmt, const uint8_t* uyvy, int stri
       (fmt.alpha && (!alpha || alphaStride < fmt.width)))
     throw std::invalid_argument("uyvy needs an even width and a stride of at least width * 2, and alpha a plane");
   if (d_->skipVideo()) return;
-  OMTMediaFrame f = videoHeader(fmt, timestamp);
-
   if (d_->mode == Mode::Full) {
-    const size_t plane = static_cast<size_t>(stride) * fmt.height;
-    f.Flags = alphaFlags(fmt, premultiplied);
-    f.Codec = fmt.alpha ? OMTCodec_UYVA : OMTCodec_UYVY;
-    f.Stride = stride;
-    f.Data = const_cast<uint8_t*>(uyvy);
-    f.DataLength = static_cast<int>(plane);
-    if (fmt.alpha) {
-      // libvmx reads the alpha plane from Data + Stride * Height, rows Stride / 2 apart.
-      if (alpha != uyvy + plane || stride % 2 || alphaStride != stride / 2) {
-        const size_t row = static_cast<size_t>(fmt.width) * 2;
-        d_->uyva.resize(row * fmt.height * 3 / 2);
-        for (int r = 0; r < fmt.height; ++r) {
-          std::memcpy(d_->uyva.data() + r * row, uyvy + static_cast<size_t>(r) * stride, row);
-          std::memcpy(d_->uyva.data() + row * fmt.height + r * row / 2, alpha + static_cast<size_t>(r) * alphaStride,
-                      row / 2);
-        }
-        f.Stride = static_cast<int>(row);
-        f.Data = d_->uyva.data();
-      }
-      f.DataLength = f.Stride * fmt.height * 3 / 2;
-    }
-    d_->sendFull(f);
+    d_->sendFullUyvy(fmt, uyvy, stride, alpha, alphaStride, premultiplied, timestamp);
     return;
   }
+  OMTMediaFrame f = videoHeader(fmt, timestamp);
 
   // No alpha on an HX sender: the GPU makes the NV12 picture from the UYVY rows, and the encoder codes it there.
   if (!fmt.alpha && !d_->uyvyRefused && d_->uyvyGpu) {
@@ -604,7 +625,7 @@ void Sender::sendVideoD3D11(const VideoFormat& fmt, void* texture, int64_t times
   d_->bgraToNv12->convert(texture, fmt.width, fmt.height, *pic);
   frame.gpu = std::move(pic);
   if (d_->mode == Mode::Hx) d_->sendGpu(frame, t0);  // already gated above
-  else sendVideo(frame);
+  else d_->sendFullGpu(frame);
 }
 
 void Sender::sendVideo(const VideoFrame& frame) {
@@ -618,15 +639,8 @@ void Sender::sendVideo(const VideoFrame& frame) {
         (vmx && alpha->size() != static_cast<size_t>(fmt.width) * fmt.height))
       throw std::invalid_argument("the Gpu picture does not match its format");
     if (d_->skipVideo()) return;
-    if (d_->mode == Mode::Hx) {
-      d_->sendGpu(frame, Clock::now());
-      return;
-    }
-    if (!downloadNv12(pic, d_->picture)) throw std::runtime_error("cannot copy the picture from video memory");
-    unpackUyvy(fmt, d_->picture, d_->gpuUyva, vmx ? alpha->data() : nullptr);
-    const uint8_t* p = d_->gpuUyva.data();
-    sendVideoUyvy(fmt, p, fmt.width * 2, fmt.alpha ? p + w * 2 * h : nullptr, fmt.width, frame.premultiplied,
-                  frame.timestamp);
+    if (d_->mode == Mode::Hx) d_->sendGpu(frame, Clock::now());
+    else d_->sendFullGpu(frame);
     return;
   }
   if (!frame.uyvy.empty()) {

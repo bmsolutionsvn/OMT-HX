@@ -716,10 +716,13 @@ TEST_CASE("a coded stream that starts mid-GOP shows nothing until its next keyfr
       if (coded.receiveCoded(c, 20)) rec.push_back(c);
     }
   }
-  size_t key = 0;  // the second keyframe
-  for (size_t i = 1; i < rec.size() && !key; ++i)
+  // The keyframe asked for at 800 ms is the last one recorded. The ones before it depend on when the receiver
+  // subscribed: the source's first, and one coded for the receiver on joining, which may come after it.
+  size_t key = 0;
+  for (size_t i = 1; i < rec.size(); ++i)
     if (rec[i].keyframe) key = i;
   REQUIRE(key >= 20);
+  for (size_t i = key - 20; i < key; ++i) REQUIRE_FALSE(rec[i].keyframe);  // the replay starts mid-GOP
 
   // Replay from 20 frames before it, to a receiver that is already watching.
   Sender relay("omthx-test-midgop-out", Mode::Hx, Quality::Medium);
