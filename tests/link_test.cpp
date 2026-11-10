@@ -1094,20 +1094,19 @@ TEST_CASE("sendVideoUyvy on an HX sender encodes from video memory") {
   Sender sender("omthx-test-uyvy-gpu", Mode::Hx, Quality::Medium);
   Receiver receiver(sender.address(), PixelFormat::Nv12);
   VideoFrame frame;
-  bool got = false;
+  int y = -1;  // read when the picture arrives: its NV12 planes are valid for that call only
   auto next = Clock::now();
   const auto until = Clock::now() + std::chrono::seconds(1);
   for (int i = 0; Clock::now() < until; ++i) {
     sender.sendVideoUyvy(f, pic.data(), f.width * 2, nullptr, 0, false, 1'000'000 + i * kFrame);
-    if (receiver.receiveVideo(frame, 0)) got = true;
+    if (receiver.receiveVideo(frame, 0) && frame.nv12Y)
+      y = frame.nv12Y[static_cast<size_t>(f.height / 2) * f.width + f.width / 2];
     next += std::chrono::microseconds(16'667);
     std::this_thread::sleep_until(next);
   }
-  REQUIRE(got);
+  REQUIRE(y >= 0);
   MESSAGE("encoded by " << sender.stats().encoder);
   CHECK(sender.stats().encoder.ends_with(" (d3d11)"));  // no copy through memory
-  REQUIRE(frame.nv12Y != nullptr);
-  const int y = frame.nv12Y[static_cast<size_t>(f.height / 2) * f.width + f.width / 2];
   MESSAGE("centre luma " << y << " for a limited-range 126");
   CHECK(std::abs(y - 128) <= 4);
 }
