@@ -265,6 +265,63 @@ TEST_CASE("KeyframePolicy: a join or the app gets a keyframe within 200 ms durin
   CHECK(p.next(5400, dropped, false, true));          // the app asked: 200 ms
 }
 
+TEST_CASE("RetryGate: a new gate is open, and one failure closes it for 30 s") {
+  RetryGate g;
+  CHECK_FALSE(g.closed(0));
+  CHECK_FALSE(g.closed(1'000'000));  // open until something fails
+  g.fail(5'000);
+  CHECK(g.closed(5'000));
+  CHECK(g.closed(34'999));
+  CHECK_FALSE(g.closed(35'000));  // at exactly the delay it is open again
+}
+
+TEST_CASE("RetryGate: every failure in a row doubles the delay, up to 10 min") {
+  RetryGate g;
+  g.fail(0);
+  CHECK(g.closed(29'999));            // 30 s
+  CHECK_FALSE(g.closed(30'000));
+  g.fail(30'000);
+  CHECK(g.closed(89'999));            // 60 s
+  CHECK_FALSE(g.closed(90'000));
+  g.fail(90'000);
+  CHECK(g.closed(209'999));           // 120 s
+  CHECK_FALSE(g.closed(210'000));
+  g.fail(210'000);
+  CHECK(g.closed(449'999));           // 240 s
+  CHECK_FALSE(g.closed(450'000));
+  g.fail(450'000);
+  CHECK(g.closed(929'999));           // 480 s
+  CHECK_FALSE(g.closed(930'000));
+  g.fail(930'000);
+  CHECK(g.closed(1'529'999));         // 10 min, the cap
+  CHECK_FALSE(g.closed(1'530'000));
+  g.fail(1'530'000);
+  CHECK(g.closed(2'129'999));         // still 10 min
+  CHECK_FALSE(g.closed(2'130'000));
+}
+
+TEST_CASE("RetryGate: a success puts the delay back to 30 s") {
+  RetryGate g;
+  g.fail(0);
+  g.fail(30'000);  // the delay is now 120 s
+  g.succeed();
+  g.fail(100'000);
+  CHECK(g.closed(129'999));
+  CHECK_FALSE(g.closed(130'000));  // 30 s again
+  g.fail(130'000);
+  CHECK(g.closed(189'999));
+  CHECK_FALSE(g.closed(190'000));  // and it doubles from there
+}
+
+TEST_CASE("RetryGate: a latched gate never opens again") {
+  RetryGate g;
+  g.latch();
+  CHECK(g.closed(0));
+  CHECK(g.closed(1'000'000'000'000));
+  g.succeed();
+  CHECK(g.closed(1'000'000'000'000));  // a success does not undo the latch
+}
+
 TEST_CASE("BitrateGovernor: the first call only records the drop count") {
   BitrateGovernor g;
   CHECK_FALSE(g.next(0, 7));
