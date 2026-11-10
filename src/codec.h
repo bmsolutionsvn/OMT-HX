@@ -89,6 +89,31 @@ class KeyframePolicy {
   int64_t gapMs_ = kMinGapMs;
 };
 
+// Lowers an Hx sender's bitrate while libomt keeps dropping frames, and raises it again once they stop.
+// Drops must go on for kTroubleMs before the first step, so a single burst changes nothing; after that the bitrate
+// steps down at most once per kStepMs to kFloorPercent. kQuietMs without a rise ends the spell; kRecoverMs with no
+// rise and no change steps it back up. A drop count that goes down is a new baseline.
+class BitrateGovernor {
+ public:
+  static constexpr int kFloorPercent = 40;
+  static constexpr int64_t kTroubleMs = 1'000;   // drops must go on this long before the first step down
+  static constexpr int64_t kStepMs = 1'000;      // at most one step down per second
+  static constexpr int64_t kQuietMs = 2'000;     // no drops this long ends a spell of trouble
+  static constexpr int64_t kRecoverMs = 10'000;  // no drops and no change this long: one step up
+  // Call once per coded frame with libomt's cumulative drop count. True when percent() changed.
+  bool next(int64_t nowMs, uint64_t dropped);
+  int percent() const { return percent_; }
+
+ private:
+  bool first_ = true;
+  bool inTrouble_ = false;
+  uint64_t dropped_ = 0;
+  int percent_ = 100;
+  int64_t troubleStartMs_ = 0;
+  int64_t lastRiseMs_ = 0;
+  int64_t lastChangeMs_ = 0;
+};
+
 // Whether a sender codes this video frame: only while a receiver is connected (encode on demand).
 class IdleGate {
  public:

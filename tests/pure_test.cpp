@@ -265,6 +265,76 @@ TEST_CASE("KeyframePolicy: a join or the app gets a keyframe within 200 ms durin
   CHECK(p.next(5400, dropped, false, true));          // the app asked: 200 ms
 }
 
+TEST_CASE("BitrateGovernor: the first call only records the drop count") {
+  BitrateGovernor g;
+  CHECK_FALSE(g.next(0, 7));
+  CHECK(g.percent() == 100);
+  CHECK_FALSE(g.next(16, 7));
+  CHECK(g.percent() == 100);
+}
+
+TEST_CASE("BitrateGovernor: a burst of drops shorter than 1 s changes nothing") {
+  BitrateGovernor g;
+  CHECK_FALSE(g.next(0, 0));
+  for (int64_t t = 100; t <= 900; t += 100) CHECK_FALSE(g.next(t, static_cast<uint64_t>(t / 100)));
+  CHECK(g.percent() == 100);           // drops rose for 800 ms: the spell never reached 1 s
+  CHECK_FALSE(g.next(1'000, 9));       // the burst stopped: no step down this call either
+  CHECK(g.percent() == 100);
+}
+
+TEST_CASE("BitrateGovernor: sustained trouble steps down once a second to the floor") {
+  BitrateGovernor g;
+  CHECK_FALSE(g.next(0, 0));
+  std::vector<int64_t> steps;
+  for (int64_t t = 100; t <= 10'000; t += 100) {
+    if (g.next(t, static_cast<uint64_t>(t / 100))) steps.push_back(t);
+  }
+  CHECK(steps == std::vector<int64_t>{1'100, 2'100, 3'100, 4'100});  // one per kStepMs
+  CHECK(g.percent() == 40);             // 100, 75, 56, 42, then the floor
+}
+
+TEST_CASE("BitrateGovernor: 2 s without a rise ends the spell and the next one starts afresh") {
+  BitrateGovernor g;
+  CHECK_FALSE(g.next(0, 0));
+  CHECK_FALSE(g.next(100, 1));          // the spell starts here
+  CHECK(g.next(1'100, 2));              // 1 s of trouble: one step down
+  CHECK(g.percent() == 75);
+  CHECK_FALSE(g.next(3'100, 2));        // 2 s without a rise: the spell has ended, and no step up yet
+  CHECK_FALSE(g.next(3'200, 3));        // a new spell, less than 1 s old: no step
+  CHECK(g.percent() == 75);
+  CHECK(g.next(4'200, 4));              // the new spell is 1 s old
+  CHECK(g.percent() == 56);
+}
+
+TEST_CASE("BitrateGovernor: 10 s of quiet and no change steps the bitrate up to 100") {
+  BitrateGovernor g;
+  CHECK_FALSE(g.next(0, 0));
+  for (int64_t t = 100; t <= 5'000; t += 100) g.next(t, static_cast<uint64_t>(t / 100));
+  REQUIRE(g.percent() == 40);
+  CHECK_FALSE(g.next(14'999, 50));      // 9 999 ms since the last rise and the last change
+  CHECK(g.next(15'000, 50));            // step up
+  CHECK(g.percent() == 60);
+  CHECK(g.next(25'000, 50));
+  CHECK(g.percent() == 80);
+  CHECK(g.next(35'000, 50));
+  CHECK(g.percent() == 100);
+  CHECK_FALSE(g.next(45'000, 50));      // already at 100
+}
+
+TEST_CASE("BitrateGovernor: a drop count that goes down is the new baseline, with no step") {
+  BitrateGovernor g;
+  CHECK_FALSE(g.next(0, 0));
+  CHECK_FALSE(g.next(100, 500));        // the spell starts
+  CHECK(g.next(1'100, 501));            // one step down
+  CHECK(g.percent() == 75);
+  CHECK_FALSE(g.next(1'200, 2));        // libomt restarted its count: baseline only
+  CHECK(g.percent() == 75);
+  CHECK_FALSE(g.next(1'300, 3));        // rising from the new baseline, too soon to step again
+  CHECK(g.percent() == 75);
+  CHECK(g.next(2'200, 4));
+  CHECK(g.percent() == 56);
+}
+
 TEST_CASE("IdleGate: sends while a receiver is connected") {
   IdleGate g;
   CHECK(g.next(0, true) == IdleGate::Step::Send);
