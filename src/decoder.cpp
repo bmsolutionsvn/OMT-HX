@@ -86,6 +86,9 @@ Decoder::Decoder(Codec codec, bool software) : codec_(codec) {
   } else {
     // ponytail: four frame threads keep 1080p60 in real time but add three frames of delay.
     // Hardware decoding is the real path; this is the fallback for a PC without it.
+    // LOW_DELAY turns frame threads off (libavcodec/pthread.c), leaving slice threads, which a single-slice
+    // hardware-coded stream cannot use: the software decoder trades it for the threads.
+    ctx_->flags &= ~AV_CODEC_FLAG_LOW_DELAY;
     ctx_->thread_count = 4;
     name_ = base + " (software)";
   }
