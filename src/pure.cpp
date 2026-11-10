@@ -164,6 +164,33 @@ bool KeyframePolicy::next(int64_t nowMs, uint64_t dropped, bool requested, bool 
   return key;
 }
 
+bool BitrateGovernor::next(int64_t nowMs, uint64_t dropped) {
+  if (first_) {
+    first_ = false;
+    dropped_ = dropped;
+    lastRiseMs_ = lastChangeMs_ = nowMs;
+    return false;
+  }
+  if (inTrouble_ && nowMs - lastRiseMs_ >= kQuietMs) inTrouble_ = false;  // the spell ended
+  const bool rose = dropped > dropped_;
+  dropped_ = dropped;  // a count that went down is the new baseline, with no step
+  if (rose) {
+    if (!inTrouble_) {
+      inTrouble_ = true;
+      troubleStartMs_ = nowMs;
+    }
+    lastRiseMs_ = nowMs;
+  }
+  const int before = percent_;
+  if (rose && nowMs - troubleStartMs_ >= kTroubleMs && nowMs - lastChangeMs_ >= kStepMs) {
+    percent_ = std::max(kFloorPercent, percent_ * 3 / 4);
+  } else if (!rose && nowMs - lastRiseMs_ >= kRecoverMs && nowMs - lastChangeMs_ >= kRecoverMs) {
+    percent_ = std::min(100, percent_ + 20);
+  }
+  if (percent_ != before) lastChangeMs_ = nowMs;
+  return percent_ != before;
+}
+
 IdleGate::Step IdleGate::next(int64_t nowMs, bool receivers) {
   if (receivers) {
     if (!idle_) return Step::Send;

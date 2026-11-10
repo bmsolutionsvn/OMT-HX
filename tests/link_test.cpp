@@ -1350,6 +1350,18 @@ TEST_CASE("a receiver that comes back to a warm HX sender gets a keyframe at onc
   CHECK(sender.stats().keyframes > before);
 }
 
+TEST_CASE("a healthy HX link leaves the sender's bitrate at 100 %") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{1920, 1080, 60, 1, false};
+  Sender sender("omthx-test-bitrate-ok", Mode::Hx, Quality::Medium, Codec::Hevc);
+  Pump pump(sender, f);
+  Receiver receiver(sender.address());
+  VideoFrame frame;
+  REQUIRE(receiveSome(receiver, frame, 30, 10) == 30);
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+  CHECK(sender.stats().bitratePercent == 100);
+}
+
 TEST_CASE("probe reads an idle HX source") {
   if (!hardware(Codec::Hevc)) return;
   const VideoFormat f{640, 360, 60, 1, false};

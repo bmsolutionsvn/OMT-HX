@@ -11,6 +11,36 @@ Since 2026-10-20 the GPU codes the fill alone and alpha goes by VMX on the CPU, 
 fill. The current alpha figures are in the two-PC table and the 2026-10-20 table; the tables after
 those keep the stacked-alpha numbers they were measured with.
 
+## 2026-11-10: the software decoder
+
+The software `Decoder` (`src/decoder.cpp`, the fallback after `av_hwdevice_ctx_create` fails) drops
+`AV_CODEC_FLAG_LOW_DELAY` and sets `thread_count = 4`, so FFmpeg runs four frame threads. FFmpeg turns
+frame threading off under `LOW_DELAY` (`libavcodec/pthread.c`), so a comparison build that keeps the flag
+has slice threads only. One PC, `omthx-send` and `omthx-recv` with `--tick`, Quality Medium, 25 s each,
+delay is the median of the tick pairs. The software decoder is forced with
+`OMTHX_TEST_GPU_DECODE_REFUSED=1` on the receiver; it falls back at the next keyframe and names itself
+`... (software)`. CPU is `omthx-recv`'s processor time over the run, in cores. AMD RX 6600, Windows.
+
+| Case | Decoder | fps | Median video delay ms | CPU cores | Discarded |
+|------|---------|-----|-----------------------|-----------|-----------|
+| 1080p60 HEVC medium | hevc (d3d11va, RX 6600) | 60 | 14.7 | 0.09 | 0 |
+| 1080p60 HEVC medium | hevc (software) | 60 | 60.7 | 1.57 | 17 |
+| 1080p60 H.264 medium | h264 (d3d11va, RX 6600) | 60 | 14.4 | 0.09 | 0 |
+| 1080p60 H.264 medium | h264 (software) | 60 | 61.0 | 1.16 | 16 |
+| 2160p30 HEVC medium | hevc (software) | 30 (24 to 31) | 163.0 | 3.54 | 8 |
+| 2160p60 HEVC medium | hevc (software) | 4 (0 to 5) | 1845.2 | 1.12 | 1209 |
+| 1080p60 HEVC medium, comparison build keeping `LOW_DELAY` | hevc (software) | 6 (5 to 7) | not meaningful (1 pair) | 1.02 | 117 |
+
+The frame threads are what makes the software decoder keep up: with `LOW_DELAY` kept, slice threads only,
+the same 1080p60 HEVC stream decodes at 6 to 7 fps and 117 pictures are thrown away; four frame threads
+hold 60 fps. The price is three frames of delay, about 46 ms: 14.7 ms to 60.7 ms at 1080p60. So the
+choice made in `2b8d06e` is right and the decoder is left alone; the old comment about slice threads
+alone holding one thread was wrong.
+
+The software path holds 1080p60 (HEVC and H.264, about 1.2 to 1.6 cores) and 2160p30 HEVC (3.5 cores);
+it collapses at 2160p60, about 4 fps and over a second of delay. The 16 or 17 discarded pictures are
+the fallback's wait for the next keyframe, counted once at the start.
+
 ## 2026-11-04: the receiver's copy catches up
 
 The overlapped copy to memory of 2026-11-03 cost a frame of delay up to 1440p: a receiver whose copy

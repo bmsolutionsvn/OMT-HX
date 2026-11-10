@@ -107,6 +107,8 @@ struct Sender::Impl {
   std::vector<uint8_t> uyva;  // Full: a UYVA picture whose alpha plane did not follow its UYVY plane
   std::vector<uint8_t> gpuUyva;  // Full: a Gpu picture copied to memory
   KeyframePolicy policy;
+  // Lowers the full stream's bitrate while libomt keeps dropping frames, then raises it again (reopens the encoder).
+  BitrateGovernor governor;
   IdleGate gate;  // send only while a receiver is connected
   std::atomic<bool> appKeyframe{false};
   std::atomic<bool> forward{false};  // sendCoded: a receiver asked for a keyframe
@@ -209,9 +211,9 @@ void Sender::Impl::openEncoder(const VideoFormat& fmt, bool vmx, AVBufferRef* gp
   lastCoded.reset();
   vmxAlpha = sep;  // the picture is packed by it even without an encoder, for the preview stream
   if (unwanted) return;
+  const int64_t bitrate = sep ? fillBitrate(fmt, quality, codec) : targetBitrate(fmt, quality, codec);
   auto fill = std::make_unique<Encoder>(codec, fmt.width, sep ? fmt.height : codedHeight(fmt), fmt.fpsN, fmt.fpsD,
-                                        sep ? fillBitrate(fmt, quality, codec) : targetBitrate(fmt, quality, codec),
-                                        gpuFrames);
+                                        bitrate * governor.percent() / 100, gpuFrames);
   // Alpha quality is not a setting: the plane is small, so it always codes at High.
   if (sep) alphaEncoder = std::make_unique<AlphaEncoder>(fmt.width, fmt.height, Quality::High);
   encoder = std::move(fill);
@@ -266,6 +268,11 @@ bool Sender::Impl::skipVideo() {
       // A fresh policy codes a keyframe at once, past the 200 ms limit; a relay asks its source for one.
       policy = KeyframePolicy();
       previewPolicy = KeyframePolicy();
+      governor = BitrateGovernor();  // the bitrate starts at full again
+      {
+        std::lock_guard lock(statsMutex);
+        stats.bitratePercent = governor.percent();
+      }
       forward = true;
       return false;
     case IdleGate::Step::SkipAndClose:
@@ -295,6 +302,18 @@ void Sender::Impl::sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock:
   omt_send_getvideostatistics(tx, &omt);
   const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
   if (!encoder) {  // preview receivers only (openEncoder): the full stream would go to nobody
+    sendPreview(fmt, timestamp, nowMs, static_cast<uint64_t>(omt.FramesDropped), requested, urgent, gpu);
+    return;
+  }
+  // A bitrate step reopens the encoder on the next frame, at the new bitrate and with a keyframe the slow receiver
+  // needs anyway. This frame goes uncoded rather than reopening mid-send.
+  if (governor.next(nowMs, static_cast<uint64_t>(omt.FramesDropped))) {
+    encoder.reset();
+    alphaEncoder.reset();
+    {
+      std::lock_guard lock(statsMutex);
+      stats.bitratePercent = governor.percent();
+    }
     sendPreview(fmt, timestamp, nowMs, static_cast<uint64_t>(omt.FramesDropped), requested, urgent, gpu);
     return;
   }

@@ -14,8 +14,8 @@ a reading of the code, not a reproduced failure.
 | 2 | The full stream is coded when every receiver is a preview receiver | Wasted work | Medium (touches the libomtnet fork) | Fixed: `omt_send_fullconnections`; the full encoder closes while only preview receivers watch |
 | 3 | A preview receiver forces a full-size readback of GPU pictures | Wasted work | Medium | Fixed, uncommitted: shrunk by the D3D11 video processor and coded in video memory; 4K send 9.5 to 5.5 ms on the RX 6600 |
 | 4 | `Packer` builds both converters, 8 swscale threads each | Wasted work | Small | Fixed on `fix/core-review-1-4`, uncommitted; full suite passed (98 test cases) |
-| 5 | One slow receiver forces keyframes for every receiver | Behaviour under load | Small (back-off) to large (bitrate) | Back-off done (200 ms doubling to 2 s, joins and app requests exempt), uncommitted; bitrate half open |
-| 6 | Software decode is single-threaded when a GPU exists but cannot decode the codec | Behaviour under load | Small to medium | Fallback to a software `Decoder` done, uncommitted; may not add threads, see note in section 6 |
+| 5 | One slow receiver forces keyframes for every receiver | Behaviour under load | Small (back-off) to large (bitrate) | Back-off done (200 ms doubling to 2 s, joins and app requests exempt), uncommitted; and a `BitrateGovernor` steps the full stream down to 40 % under sustained drops and back up, see section 5 |
+| 6 | Software decode is single-threaded when a GPU exists but cannot decode the codec | Behaviour under load | Small to medium | Fallback to a software `Decoder` done, uncommitted; measured: four frame threads hold 1080p60 at 60 fps and 2160p30 at 30 fps, three frames (46 ms) of extra delay; `LOW_DELAY` kept gives 6 fps, see section 6 and `docs/MEASUREMENTS.md` |
 | 7 | Fallbacks are silent and permanent | Operability | Small | Reason now in `lastFallback` (`fix/core-review-1-4`, uncommitted); flags still latch, no retry |
 | 8 | The UYVY GPU path uses the default adapter, the decoder the high-performance one | Operability | Small | Fixed (high-performance adapter, default as fallback); not verified on a hybrid-GPU PC |
 | 9 | Smaller points (stats, double gate call, preview switching, audio) | Minor | Small each | Timing stats fixed; the gate steps once per frame on every path; `Receiver::setPreview` / `omthx_c_receiver_preview` switch without reconnecting; compressed audio dropped (OMT defines FPA1 only, so plain receivers would break) |
@@ -102,6 +102,20 @@ and reset the interval after a quiet spell. Receiver requests keep the 200 ms li
 Fix, larger: treat repeated drops as congestion and reopen the encoder at a lower bitrate, recovering
 slowly. This is a design change and needs measurements.
 
+Done (`opencode/core-review-remaining`): `BitrateGovernor` (`src/codec.h`, `src/pure.cpp`) takes libomt's
+cumulative `FramesDropped` once per coded frame while the full encoder is open. A single burst changes
+nothing: drops must go on for a second before the first step. It then steps the bitrate down by a
+quarter, at most once a second, to 40 %, and reopens the encoder on the next frame at the new rate; the
+reopen starts with a keyframe, which the slow receiver needs anyway. Two seconds without a drop end the
+spell, and ten seconds with no drop and no change step the bitrate back up by 20 %. A drop count that
+goes down is a new baseline. `SenderStats::bitratePercent` reports the current percentage as its last
+field; a resumed sender starts at 100 % again. The preview encoder and the VMX alpha encoder are not
+changed. Six pure tests (`tests/pure_test.cpp`) cover the rules. Only a healthy link is checked
+end-to-end (`tests/link_test.cpp`, `bitratePercent` stays 100 over 2 s): a receiver that connects and
+never calls `receiveVideo` makes libomt count no send-side drops, 0 after 20 s, because its receive
+thread keeps draining the socket, and the drops it counts are the receiver's own statistics. So the
+reopen-under-drops path has no end-to-end test.
+
 ## 6. Single-threaded software decode on a GPU without the codec
 
 `Decoder::Decoder` (`src/decoder.cpp:77-88`) sets `thread_count = 4` only when no D3D11 device can be
@@ -117,7 +131,16 @@ help only streams coded in several slices or, for HEVC, with WPP. The software d
 therefore decode a single-slice hardware stream on one thread. The code comment about "four frame threads"
 is likely wrong. Needs a measurement; the real choice is frame threads (several frames of delay) against
 low delay. Decided: the software decoder drops `LOW_DELAY` and runs four frame threads (commit `2b8d06e`);
-the hardware decoder keeps it. The extra delay and the throughput are not measured yet.
+the hardware decoder keeps it.
+
+Measured (`docs/MEASUREMENTS.md`, 2026-11-10, one PC, RX 6600, 25 s runs): the hardware decoder gives a
+median video delay of 14.7 ms at 1080p60 HEVC; the software decoder with four frame threads gives 60.7 ms
+and holds 60 fps (1.6 cores). Keeping `LOW_DELAY` instead, slice threads only, drops the same stream to
+6 to 7 fps with 117 pictures discarded: the AMF stream is single-slice, so slice threads cannot help, and
+the "four frame threads" comment was indeed wrong about the mechanism but right about the need. The frame
+threads cost three frames, about 46 ms, and are the only setting that keeps up, so the decoder is left
+alone. The software path also holds 2160p30 HEVC (30 fps, 163 ms, 3.5 cores) and collapses at 2160p60
+(4 fps, 1845 ms).
 
 ## 7. Fallbacks are silent and permanent
 
