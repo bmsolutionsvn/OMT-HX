@@ -130,11 +130,11 @@ class Packer {
               const uint8_t* alpha = nullptr);  // premultiplied when alpha
 
  private:
-  void ensure(int width, int height);
+  void ensure(bool toNv12, int width, int height);  // the converter for one direction, rebuilt on a size change
   SwsContext* toNv12_ = nullptr;
   SwsContext* toBgra_ = nullptr;
-  int width_ = 0;
-  int height_ = 0;
+  int nv12Size_[2] = {};  // width and height of toNv12_
+  int bgraSize_[2] = {};  // width and height of toBgra_
   std::vector<uint8_t> scratch_;
 };
 
@@ -315,6 +315,7 @@ class Readback {
     VideoFormat format;
     int64_t timestamp = 0;
     bool bgra = false;  // true: the picture is in take's bgra, else in its nv12
+    std::chrono::steady_clock::time_point started{};  // when its decode began, for the decode time
   };
   Readback();
   ~Readback();
@@ -322,7 +323,8 @@ class Readback {
   Readback& operator=(const Readback&) = delete;
   static bool accepts(const AVFrame* frame);  // an NV12 frame in video memory
   // Throws std::runtime_error when the GPU refuses: no video processor for BGRA, or a failed copy.
-  void push(const AVFrame* frame, const VideoFormat& format, int64_t timestamp, bool bgra);
+  void push(const AVFrame* frame, const VideoFormat& format, int64_t timestamp, bool bgra,
+            std::chrono::steady_clock::time_point started);
   bool take(bool wait, Nv12& nv12, std::vector<uint8_t>& bgra, Picture& out);  // throws std::runtime_error
   bool pending() const;
   void nap();  // about 200 us, for a caller polling take

@@ -1030,6 +1030,7 @@ TEST_CASE("UYVY keeps sending when the encoder refuses D3D11 frames") {
   MESSAGE("encoded by " << sender.stats().encoder << ", " << got << " pictures");
   CHECK(got > 10);  // the frame that met the refusal goes through memory; the later ones through packUyvy
   CHECK(sender.stats().encoder.find("(d3d11)") == std::string::npos);
+  CHECK(!sender.stats().lastFallback.empty());  // the hook sets it in the constructor, as a real refusal would later
 }
 
 TEST_CASE("sendVideoUyvy on the GPU costs less CPU than the pack") {

@@ -151,6 +151,12 @@ struct Sender::Impl {
   // The same picture to the preview stream, when a receiver wants it. Its failure never stops the full stream.
   void sendPreview(const VideoFormat& fmt, int64_t timestamp, int64_t nowMs, uint64_t dropped, bool requested,
                    const AVFrame* gpu);
+  // The Hx send of a Gpu picture. The caller has gated the frame; t0 is when it was handed over, before any conversion.
+  void sendGpu(const VideoFrame& frame, Clock::time_point t0);
+  void fellBack(std::string_view path, const char* what) {
+    std::lock_guard lock(statsMutex);
+    stats.lastFallback = std::string(path) + ": " + what;
+  }
   void sendFull(OMTMediaFrame& f) {  // libomt encodes VMX itself
     lastFrameCoded = false;
     askedForKeyframe();  // VMX frames are all keyframes: this only reads the receivers' echoes
@@ -284,7 +290,13 @@ void Sender::Impl::sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock:
       throw;
     }
   } else {
-    packets = gpu ? encoder->encodeGpu(gpu, key) : encoder->encode(picture, key);
+    try {
+      packets = gpu ? encoder->encodeGpu(gpu, key) : encoder->encode(picture, key);
+    } catch (...) {
+      // A packet taken before the failed send is lost, so the stream must start over.
+      encoder.reset();
+      throw;
+    }
   }
   stamps.push_back(timestamp);  // after encode, so a throw leaves the deques unchanged
   if (alphaEncoder) alphas.push_back(std::move(alpha));
@@ -374,10 +386,40 @@ void Sender::Impl::sendPreview(const VideoFormat& fmt, int64_t timestamp, int64_
       f.FrameMetadataLength = static_cast<int>(previewMeta.size() + 1);
       omt_send(tx, &f);
     }
-  } catch (const std::exception&) {
+  } catch (const std::exception& e) {
     previewEncoder.reset();
     previewStamps.clear();
     previewRefused = true;
+    fellBack("preview", e.what());
+  }
+}
+
+void Sender::Impl::sendGpu(const VideoFrame& frame, Clock::time_point t0) {
+  const VideoFormat& fmt = frame.format;
+  const AVFrame* pic = frame.gpu->frame;
+  const std::vector<uint8_t>* alpha = fmt.alpha ? frame.gpu->alpha.get() : nullptr;
+  const bool vmx = alpha != nullptr;  // otherwise alpha, if any, is stacked under the fill
+  // Alpha is coded the way the picture holds it, by VMX or stacked, so nothing is re-packed.
+  OMTMediaFrame f = videoHeader(fmt, frame.timestamp);
+  bool sent = false;
+  if (frame.gpu->inVideoMemory() && !gpuRefused) {
+    try {
+      openEncoder(fmt, vmx, pic->hw_frames_ctx);
+    } catch (const std::runtime_error& e) {
+      gpuRefused = true;  // no GPU encoder takes D3D11 pictures: from now on, through memory
+      fellBack("d3d11 encode", e.what());
+    }
+    if (!gpuRefused) {
+      if (vmxAlpha) alphaPlane.assign(alpha->begin(), alpha->end());
+      sendPicture(fmt, frame.timestamp, t0, f, pic);
+      sent = true;
+    }
+  }
+  if (!sent) {  // through memory; the picture is already packed as the encoder wants it, premultiplied
+    if (!downloadNv12(pic, picture)) throw std::runtime_error("cannot copy the picture from video memory");
+    openEncoder(fmt, vmx);
+    if (vmxAlpha) alphaPlane.assign(alpha->begin(), alpha->end());
+    sendPicture(fmt, frame.timestamp, t0, f);
   }
 }
 
@@ -392,7 +434,10 @@ Sender::Sender(const std::string& name, Mode mode, Quality quality, Codec codec)
   d_->uyvyGpu = !(noGpuUyvy && *noGpuUyvy);
   // Test hook: stands in for an encoder the default adapter cannot feed, which no test PC can provide for real.
   const char* pretendRefused = std::getenv("OMTHX_TEST_GPU_REFUSED");
-  if (pretendRefused && *pretendRefused) d_->gpuRefused = true;
+  if (pretendRefused && *pretendRefused) {
+    d_->gpuRefused = true;
+    d_->stats.lastFallback = "d3d11 encode: OMTHX_TEST_GPU_REFUSED is set";
+  }
   if (mode == Mode::Full) d_->stats.encoder = "vmx";
 }
 
@@ -497,15 +542,17 @@ void Sender::sendVideoUyvy(const VideoFormat& fmt, const uint8_t* uyvy, int stri
     frame.timestamp = timestamp;
     frame.premultiplied = premultiplied;
     auto pic = std::make_shared<GpuPicture>();
+    const auto t0 = Clock::now();  // the conversion counts in the encode time and the round trip
     try {
       d_->uyvyToNv12->convert(uyvy, stride, fmt.width, fmt.height, *pic);
-    } catch (const std::runtime_error&) {
+    } catch (const std::runtime_error& e) {
       d_->uyvyRefused = true;  // no device, or no YUY2 input: from now on, packUyvy
       d_->uyvyToNv12.reset();
+      d_->fellBack("uyvy on the gpu", e.what());
     }
     if (!d_->uyvyRefused) {
       frame.gpu = std::move(pic);
-      sendVideo(frame);
+      d_->sendGpu(frame, t0);  // already gated above
       if (d_->gpuRefused) d_->uyvyRefused = true;  // the encoder took no D3D11 pictures: packUyvy from now on
       return;
     }
@@ -526,9 +573,11 @@ void Sender::sendVideoD3D11(const VideoFormat& fmt, void* texture, int64_t times
   frame.format = fmt;
   frame.timestamp = timestamp;
   auto pic = std::make_shared<GpuPicture>();
+  const auto t0 = Clock::now();  // the conversion counts in the encode time and the round trip
   d_->bgraToNv12->convert(texture, fmt.width, fmt.height, *pic);
   frame.gpu = std::move(pic);
-  sendVideo(frame);
+  if (d_->mode == Mode::Hx) d_->sendGpu(frame, t0);  // already gated above
+  else sendVideo(frame);
 }
 
 void Sender::sendVideo(const VideoFrame& frame) {
@@ -542,35 +591,11 @@ void Sender::sendVideo(const VideoFrame& frame) {
         (vmx && alpha->size() != static_cast<size_t>(fmt.width) * fmt.height))
       throw std::invalid_argument("the Gpu picture does not match its format");
     if (d_->skipVideo()) return;
-    auto toMemory = [&] {
-      if (!downloadNv12(pic, d_->picture)) throw std::runtime_error("cannot copy the picture from video memory");
-    };
     if (d_->mode == Mode::Hx) {
-      // Alpha is coded the way the picture holds it, by VMX or stacked, so nothing is re-packed.
-      OMTMediaFrame f = videoHeader(fmt, frame.timestamp);
-      const auto t0 = Clock::now();
-      bool sent = false;
-      if (frame.gpu->inVideoMemory() && !d_->gpuRefused) {
-        try {
-          d_->openEncoder(fmt, vmx, pic->hw_frames_ctx);
-        } catch (const std::runtime_error&) {
-          d_->gpuRefused = true;  // no GPU encoder takes D3D11 pictures: from now on, through memory
-        }
-        if (!d_->gpuRefused) {
-          if (d_->vmxAlpha) d_->alphaPlane.assign(alpha->begin(), alpha->end());
-          d_->sendPicture(fmt, frame.timestamp, t0, f, pic);
-          sent = true;
-        }
-      }
-      if (!sent) {  // through memory; the picture is already packed as the encoder wants it, premultiplied
-        toMemory();
-        d_->openEncoder(fmt, vmx);
-        if (d_->vmxAlpha) d_->alphaPlane.assign(alpha->begin(), alpha->end());
-        d_->sendPicture(fmt, frame.timestamp, t0, f);
-      }
+      d_->sendGpu(frame, Clock::now());
       return;
     }
-    toMemory();
+    if (!downloadNv12(pic, d_->picture)) throw std::runtime_error("cannot copy the picture from video memory");
     unpackUyvy(fmt, d_->picture, d_->gpuUyva, vmx ? alpha->data() : nullptr);
     const uint8_t* p = d_->gpuUyva.data();
     sendVideoUyvy(fmt, p, fmt.width * 2, fmt.alpha ? p + w * 2 * h : nullptr, fmt.width, frame.premultiplied,
@@ -751,13 +776,19 @@ struct Receiver::Impl {
   std::mutex statsMutex;
   ReceiverStats stats;
 
+  void fellBack(std::string_view path, const char* what) {
+    std::lock_guard lock(statsMutex);
+    stats.lastFallback = std::string(path) + ": " + what;
+  }
+
   // Hands out the picture Readback has ready (or, with wait, the newest one in flight) in the pixels asked for.
-  bool deliver(VideoFrame& out, bool wait, Clock::time_point t0) {
+  bool deliver(VideoFrame& out, bool wait) {
     Readback::Picture p;
     try {
       if (!readback.take(wait, picture, out.bgra, p)) return false;
-    } catch (const std::runtime_error&) {
+    } catch (const std::runtime_error& e) {
       readbackFailed = true;
+      fellBack("gpu readback", e.what());
       return false;
     }
     // A picture that does not match its header is treated like a decode error, as on the path without Readback.
@@ -787,7 +818,7 @@ struct Receiver::Impl {
     out.premultiplied = false;
     out.timestamp = p.timestamp;
     std::lock_guard lock(statsMutex);
-    stats.lastDecodeMs = msSince(t0);
+    stats.lastDecodeMs = msSince(p.started);  // from the decode, though the picture may go out a call late
     ++stats.framesReceived;
     return true;
   }
@@ -882,14 +913,14 @@ bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
   // the copies overlap, as a 4K stream needs on a GTX 1650). Waiting for the next frame instead kept a receiver
   // that once missed the half-frame wait a frame behind: 1080p60 at 25 ms against 15.
   while (!d_->stash && d_->readback.pending() && !d_->readbackFailed) {
-    if (d_->deliver(out, false, Clock::now())) return true;
+    if (d_->deliver(out, false)) return true;
     if ((d_->stash = omt_receive(d_->rx, OMTFrameType_Video, 0))) break;
     d_->readback.nap();
   }
   // A stashed frame is still valid: libomt keeps a frame until the next omt_receive for video.
   OMTMediaFrame* f = d_->stash ? std::exchange(d_->stash, nullptr) : omt_receive(d_->rx, OMTFrameType_Video, timeoutMs);
   // No newer frame came: hand out the one whose copy is still waiting for a successor.
-  if (!f) return d_->readback.pending() && d_->deliver(out, true, Clock::now());
+  if (!f) return d_->readback.pending() && d_->deliver(out, true);
   VideoFormat fmt = formatOf(f);
 
   Codec codec = Codec::Hevc;
@@ -1025,18 +1056,20 @@ bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
       bool queued = false;
       const bool bgra = d_->pixels == PixelFormat::Bgra && !d_->gpuBgraFailed;
       try {
-        d_->readback.push(decoded->frame, fmt, timestamp, bgra);
+        d_->readback.push(decoded->frame, fmt, timestamp, bgra, t0);
         queued = true;
-      } catch (const std::runtime_error&) {
+      } catch (const std::runtime_error& e) {
         if (bgra) d_->gpuBgraFailed = true;
         else d_->readbackFailed = true;
+        d_->fellBack(bgra ? "bgra on the gpu" : "gpu readback", e.what());
       }
       if (!queued && bgra && !d_->readbackFailed) {
         try {
-          d_->readback.push(decoded->frame, fmt, timestamp, false);
+          d_->readback.push(decoded->frame, fmt, timestamp, false, t0);
           queued = true;
-        } catch (const std::runtime_error&) {
+        } catch (const std::runtime_error& e) {
           d_->readbackFailed = true;
+          d_->fellBack("gpu readback", e.what());
         }
       }
       if (queued) {
@@ -1048,7 +1081,7 @@ bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
           d_->stats.decoder = d_->hx.decoder->name();
           if (!encoder.empty()) d_->stats.encoder = encoder;
         }
-        return d_->deliver(out, false, t0);
+        return d_->deliver(out, false);
       }
     }
     if (!downloadNv12(decoded->frame, d_->picture)) return fail();

@@ -438,7 +438,8 @@ struct Readback::Impl {
     return *oldest;
   }
 
-  void push(const AVFrame* frame, const VideoFormat& format, int64_t timestamp, bool bgra) {
+  void push(const AVFrame* frame, const VideoFormat& format, int64_t timestamp, bool bgra,
+            std::chrono::steady_clock::time_point started) {
     attach(frame);
     auto* texture = reinterpret_cast<ID3D11Texture2D*>(frame->data[0]);
     const UINT index = static_cast<UINT>(reinterpret_cast<intptr_t>(frame->data[1]));
@@ -476,7 +477,7 @@ struct Readback::Impl {
     s.order = ++next;
     s.width = w;
     s.height = h;
-    s.picture = Picture{format, timestamp, bgra};
+    s.picture = Picture{format, timestamp, bgra, started};
     s.queued = std::chrono::steady_clock::now();
   }
 
@@ -560,8 +561,9 @@ bool Readback::accepts(const AVFrame* frame) {
          frame->width % 2 == 0 && frame->height % 2 == 0;
 }
 
-void Readback::push(const AVFrame* frame, const VideoFormat& format, int64_t timestamp, bool bgra) {
-  d_->push(frame, format, timestamp, bgra);
+void Readback::push(const AVFrame* frame, const VideoFormat& format, int64_t timestamp, bool bgra,
+                    std::chrono::steady_clock::time_point started) {
+  d_->push(frame, format, timestamp, bgra, started);
 }
 
 bool Readback::take(bool wait, Nv12& nv12, std::vector<uint8_t>& bgra, Picture& out) {
@@ -597,7 +599,7 @@ struct Readback::Impl {};
 Readback::Readback() = default;
 Readback::~Readback() = default;
 bool Readback::accepts(const AVFrame*) { return false; }
-void Readback::push(const AVFrame*, const VideoFormat&, int64_t, bool) {
+void Readback::push(const AVFrame*, const VideoFormat&, int64_t, bool, std::chrono::steady_clock::time_point) {
   throw std::runtime_error("D3D11 readback is Windows only");
 }
 bool Readback::take(bool, Nv12&, std::vector<uint8_t>&, Picture&) { return false; }

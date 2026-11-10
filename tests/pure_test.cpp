@@ -324,6 +324,29 @@ TEST_CASE("pack without alpha keeps the display size and uses full range") {
   CHECK(back[3] == 255);
 }
 
+TEST_CASE("Packer rebuilds each direction's converter when the size changes") {
+  const VideoFormat big{64, 32, 60, 1, false};
+  const VideoFormat small{32, 16, 60, 1, false};
+  Packer packer;
+  Nv12 pic;
+  std::vector<uint8_t> back;
+  packer.pack(big, flat(64, 32, 200, 100, 50, 255), false, pic);
+  REQUIRE(pic.y.size() == 64u * 32);
+  REQUIRE(pic.uv.size() == 64u * 32 / 2);
+  packer.unpack(big, pic, back);
+  REQUIRE(back.size() == 64u * 32 * 4);
+  packer.pack(small, flat(32, 16, 200, 100, 50, 255), false, pic);
+  REQUIRE(pic.y.size() == 32u * 16);
+  REQUIRE(pic.uv.size() == 32u * 16 / 2);
+  packer.unpack(small, pic, back);
+  REQUIRE(back.size() == 32u * 16 * 4);
+  packer.pack(big, flat(64, 32, 200, 100, 50, 255), false, pic);
+  REQUIRE(pic.y.size() == 64u * 32);
+  packer.unpack(big, pic, back);
+  REQUIRE(back.size() == 64u * 32 * 4);
+  CHECK(near(back[0], 200));
+}
+
 TEST_CASE("pack trusts a premultiplied source and rejects sizes it cannot pack") {
   const VideoFormat f{32, 18, 60, 1, true};
   Packer packer;

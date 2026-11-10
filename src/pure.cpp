@@ -416,15 +416,19 @@ Packer::~Packer() {
   sws_freeContext(toBgra_);
 }
 
-void Packer::ensure(int w, int h) {
-  if (toNv12_ && toBgra_ && w == width_ && h == height_) return;
-  sws_freeContext(toNv12_);
-  sws_freeContext(toBgra_);
-  toNv12_ = toBgra_ = nullptr;
-  toNv12_ = makeConverter(w, h, AV_PIX_FMT_BGRA, AV_PIX_FMT_NV12);
-  toBgra_ = makeConverter(w, h, AV_PIX_FMT_NV12, AV_PIX_FMT_BGRA);
-  width_ = w;
-  height_ = h;
+// Builds only the converter this call needs, and only again when its size changes. A sender never unpacks and
+// a receiver never packs, so the other direction's threads are never started.
+void Packer::ensure(bool toNv12, int w, int h) {
+  SwsContext*& c = toNv12 ? toNv12_ : toBgra_;
+  int* size = toNv12 ? nv12Size_ : bgraSize_;
+  if (c && w == size[0] && h == size[1]) return;
+  sws_freeContext(c);
+  c = nullptr;  // a throw below leaves no context behind, so the next call tries again
+  size[0] = size[1] = 0;
+  c = toNv12 ? makeConverter(w, h, AV_PIX_FMT_BGRA, AV_PIX_FMT_NV12)
+             : makeConverter(w, h, AV_PIX_FMT_NV12, AV_PIX_FMT_BGRA);
+  size[0] = w;
+  size[1] = h;
 }
 
 // ponytail: colour conversion and premultiplying run on the CPU, a few ms per 1080p frame.
@@ -435,7 +439,7 @@ void Packer::pack(const VideoFormat& f, std::span<const uint8_t> bgra, bool prem
   const int w = f.width, h = f.height;
   if (bgra.size() != static_cast<size_t>(w) * h * 4)
     throw std::invalid_argument("bgra must be width * height * 4 bytes");
-  ensure(w, h);
+  ensure(true, w, h);
   sizeFor(f, !alphaOut, out);
 
   const uint8_t* src = bgra.data();
@@ -481,7 +485,7 @@ void Packer::unpack(const VideoFormat& f, const Nv12& in, std::vector<uint8_t>& 
   checkSize(f);
   const int w = f.width, h = f.height;
   const uint8_t* a = checkPictures(f, in, alpha);
-  ensure(w, h);
+  ensure(false, w, h);
   bgra.resize(static_cast<size_t>(w) * h * 4);
   uint8_t* const srcPlanes[2] = {const_cast<uint8_t*>(in.y.data()), const_cast<uint8_t*>(in.uv.data())};
   const int srcStride[2] = {w, w};
