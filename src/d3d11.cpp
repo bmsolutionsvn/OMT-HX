@@ -8,6 +8,7 @@
 
 #ifdef _WIN32
 #include <d3d11_4.h>
+#include <dxgi1_6.h>
 #include <wrl/client.h>
 
 extern "C" {
@@ -46,6 +47,16 @@ const char* formatName(DXGI_FORMAT format) {
     case DXGI_FORMAT_YUY2: return "YUY2";
     default: return "an unknown format";
   }
+}
+
+// The GPU Windows ranks first for performance, the one the decoder picks too (src/decoder.cpp); null when DXGI
+// cannot say. On a laptop with two GPUs the default adapter may be the integrated one, whose encoder is weaker.
+ComPtr<IDXGIAdapter1> highPerformanceAdapter() {
+  ComPtr<IDXGIFactory6> factory;
+  ComPtr<IDXGIAdapter1> best;
+  if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+    factory->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&best));
+  return best;
 }
 
 using RangeTable = std::array<uint8_t, 256>;
@@ -224,7 +235,7 @@ void BgraToNv12::convert(void* texture, int width, int height, GpuPicture& out) 
 // ---------------------------------------------------------------- UyvyToNv12
 
 struct UyvyToNv12::Impl {
-  ComPtr<ID3D11Device> device;  // this object's own: the default adapter, with video support
+  ComPtr<ID3D11Device> device;  // this object's own: the high-performance adapter, with video support
   ComPtr<ID3D11DeviceContext> context;
   ComPtr<ID3D11Texture2D> upload;  // DYNAMIC YUY2, what Map writes
   // A video processor input view needs a DEFAULT texture, so the mapped rows are copied to this one on the GPU.
@@ -237,9 +248,14 @@ struct UyvyToNv12::Impl {
       throw std::invalid_argument("UYVY needs an even size and a stride of at least width * 2");
     if (!device) {
       const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-      const HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                                           D3D11_CREATE_DEVICE_VIDEO_SUPPORT, levels, 2, D3D11_SDK_VERSION,
-                                           device.GetAddressOf(), nullptr, context.GetAddressOf());
+      auto create = [&](IDXGIAdapter* adapter) {  // a named adapter needs the UNKNOWN driver type
+        return D3D11CreateDevice(adapter, adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                 D3D11_CREATE_DEVICE_VIDEO_SUPPORT, levels, 2, D3D11_SDK_VERSION,
+                                 device.ReleaseAndGetAddressOf(), nullptr, context.ReleaseAndGetAddressOf());
+      };
+      const ComPtr<IDXGIAdapter1> adapter = highPerformanceAdapter();
+      HRESULT hr = create(adapter.Get());
+      if (FAILED(hr) && adapter) hr = create(nullptr);  // that GPU refused: the default adapter, as before
       if (FAILED(hr)) {
         device.Reset();
         context.Reset();

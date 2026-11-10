@@ -17,7 +17,7 @@ a reading of the code, not a reproduced failure.
 | 5 | One slow receiver forces keyframes for every receiver | Behaviour under load | Small (back-off) to large (bitrate) | Back-off done (200 ms doubling to 2 s, joins and app requests exempt), uncommitted; bitrate half open |
 | 6 | Software decode is single-threaded when a GPU exists but cannot decode the codec | Behaviour under load | Small to medium | Fallback to a software `Decoder` done, uncommitted; may not add threads, see note in section 6 |
 | 7 | Fallbacks are silent and permanent | Operability | Small | Reason now in `lastFallback` (`fix/core-review-1-4`, uncommitted); flags still latch, no retry |
-| 8 | The UYVY GPU path uses the default adapter, the decoder the high-performance one | Operability | Small | Open, not verified on a hybrid-GPU PC |
+| 8 | The UYVY GPU path uses the default adapter, the decoder the high-performance one | Operability | Small | Fixed (high-performance adapter, default as fallback); not verified on a hybrid-GPU PC |
 | 9 | Smaller points (stats, double gate call, preview switching, audio) | Minor | Small each | Timing stats fixed; gate steps once on Hx paths, still twice on two Full paths; preview switching and audio open |
 
 ## 1. A failed encode leaves the stream out of step (bug)
