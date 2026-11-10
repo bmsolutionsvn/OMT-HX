@@ -164,6 +164,23 @@ bool KeyframePolicy::next(int64_t nowMs, uint64_t dropped, bool requested, bool 
   return key;
 }
 
+bool RetryGate::closed(int64_t nowMs) const {
+  return latched_ || nowMs < openMs_;
+}
+
+void RetryGate::fail(int64_t nowMs) {
+  openMs_ = nowMs + delayMs_;
+  delayMs_ = std::min(2 * delayMs_, kMaxMs);
+}
+
+void RetryGate::succeed() {
+  delayMs_ = kFirstMs;
+}
+
+void RetryGate::latch() {
+  latched_ = true;
+}
+
 bool BitrateGovernor::next(int64_t nowMs, uint64_t dropped) {
   if (first_) {
     first_ = false;

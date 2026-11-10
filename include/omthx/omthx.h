@@ -61,7 +61,8 @@ struct SenderStats {
   double roundTripMs = -1;
   // Video frames not coded or sent because nobody was connected (kept last: earlier fields keep their offsets).
   uint64_t framesIdle = 0;
-  // The latest path this sender gave up on and why, e.g. "d3d11 encode: <reason>"; empty when none (kept last).
+  // The latest path this sender gave up on and why, e.g. "d3d11 encode: <reason>"; that path is retried later, after
+  // a delay that doubles from 30 s to 10 min; empty when none (kept last).
   std::string lastFallback;
   // Hx only: the full stream's bitrate as a percentage of the one asked for, lowered while receivers keep dropping
   // frames and raised again once they stop. 100 when at full rate (kept last).
@@ -218,7 +219,8 @@ struct ReceiverStats {
   uint64_t framesDiscarded = 0;  // Hx frames dropped while waiting for a keyframe
   uint64_t bytesReceived = 0;    // wire bytes
   double lastDecodeMs = 0;       // Hx only: decode and unpack of the last frame
-  // The latest path this receiver gave up on and why, e.g. "gpu readback: <reason>"; empty when none (kept last).
+  // The latest path this receiver gave up on and why, e.g. "gpu readback: <reason>"; that path is retried later,
+  // after a delay that doubles from 30 s to 10 min; empty when none (kept last).
   std::string lastFallback;
 };
 

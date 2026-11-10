@@ -89,6 +89,22 @@ class KeyframePolicy {
   int64_t gapMs_ = kMinGapMs;
 };
 
+// A fast path that failed is tried again after a delay, which doubles with each failure in a row.
+class RetryGate {
+ public:
+  static constexpr int64_t kFirstMs = 30'000;
+  static constexpr int64_t kMaxMs = 600'000;
+  bool closed(int64_t nowMs) const;  // true while the fast path must not be tried
+  void fail(int64_t nowMs);          // the path failed: closed for the current delay, and the delay doubles
+  void succeed();                    // the path worked: the delay goes back to kFirstMs
+  void latch();                      // closed for good (test hooks)
+
+ private:
+  bool latched_ = false;
+  int64_t openMs_ = 0;  // closed while nowMs < openMs_
+  int64_t delayMs_ = kFirstMs;
+};
+
 // Lowers an Hx sender's bitrate while libomt keeps dropping frames, and raises it again once they stop.
 // Drops must go on for kTroubleMs before the first step, so a single burst changes nothing; after that the bitrate
 // steps down at most once per kStepMs to kFloorPercent. kQuietMs without a rise ends the spell; kRecoverMs with no

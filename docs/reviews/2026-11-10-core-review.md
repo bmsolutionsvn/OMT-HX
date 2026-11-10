@@ -16,7 +16,7 @@ a reading of the code, not a reproduced failure.
 | 4 | `Packer` builds both converters, 8 swscale threads each | Wasted work | Small | Fixed on `fix/core-review-1-4`; full suite passed (98 test cases) |
 | 5 | One slow receiver forces keyframes for every receiver | Behaviour under load | Small (back-off) to large (bitrate) | Back-off done (200 ms doubling to 2 s, joins and app requests exempt); and a `BitrateGovernor` steps the full stream down to 40 % under sustained drops and back up, see section 5 |
 | 6 | Software decode is single-threaded when a GPU exists but cannot decode the codec | Behaviour under load | Small to medium | Fallback to a software `Decoder` done; measured: four frame threads hold 1080p60 at 60 fps and 2160p30 at 30 fps, three frames (46 ms) of extra delay; `LOW_DELAY` kept gives 6 fps, see section 6 and `docs/MEASUREMENTS.md` |
-| 7 | Fallbacks are silent and permanent | Operability | Small | Reason now in `lastFallback` (`fix/core-review-1-4`); flags still latch, no retry |
+| 7 | Fallbacks are silent and permanent | Operability | Small | Reason now in `lastFallback` (`fix/core-review-1-4`); each path is retried later, after a 30 s delay that doubles to 10 min (`opencode/fallback-retry`). A real recovery is untested |
 | 8 | The UYVY GPU path uses the default adapter, the decoder the high-performance one | Operability | Small | Fixed (high-performance adapter, default as fallback); not verified on a hybrid-GPU PC |
 | 9 | Smaller points (stats, double gate call, preview switching, audio) | Minor | Small each | Timing stats fixed; the gate steps once per frame on every path; `Receiver::setPreview` / `omthx_c_receiver_preview` switch without reconnecting; compressed audio dropped (OMT defines FPA1 only, so plain receivers would break) |
 
@@ -144,12 +144,17 @@ alone. The software path also holds 2160p30 HEVC (30 fps, 163 ms, 3.5 cores) and
 
 ## 7. Fallbacks are silent and permanent
 
-`gpuRefused`, `uyvyRefused`, `readbackFailed`, `gpuBgraFailed` and `previewRefused` each latch for the
-object's lifetime after one failure. The reason is discarded, including the encoder's `tried` string, which
-names every encoder attempted and why it refused.
+`gpuRefused`, `uyvyRefused`, `previewRefused`, `previewGpuRefused`, `readbackFailed` and `gpuBgraFailed` once each
+latched for the object's lifetime after one failure. The reason is discarded, including the encoder's `tried`
+string, which names every encoder attempted and why it refused.
 
-Fix: a `lastFallback` string in `SenderStats` and `ReceiverStats`, set where each flag is set. Retrying
-after a delay is optional.
+Fix (done): a `lastFallback` string in `SenderStats` and `ReceiverStats`, set where each gate fails. Each fallback
+is also retried: a `RetryGate` (`src/codec.h`) closes the fast path for a delay that starts at 30 s and doubles with
+every failure in a row, up to 10 min, and the delay goes back to 30 s when the path next delivers a frame. The
+fallback still runs in the same frame, so a failed retry loses nothing.
+
+A real recovery is untested: no test PC can make a GPU path fail and then recover, and there is no environment hook
+for it. The gate itself is unit-tested (`tests/pure_test.cpp`), and `OMTHX_TEST_GPU_REFUSED` still latches.
 
 ## 8. Two different GPUs on a hybrid PC
 

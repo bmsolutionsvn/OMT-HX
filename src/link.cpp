@@ -93,8 +93,8 @@ struct Sender::Impl {
   VideoFormat format;          // what the encoder was opened for
   bool vmxAlpha = false;       // with alpha: the GPU codes the fill alone and VMX codes alpha
   const void* gpuKey = nullptr;  // and the D3D11 frames context it takes pictures from, or null
-  bool gpuRefused = false;     // no GPU encoder took D3D11 pictures: they go through memory
-  bool uyvyRefused = false;    // the UYVY conversion or its encoder refused: UYVY goes through packUyvy
+  RetryGate gpuRefused;   // no GPU encoder took D3D11 pictures: they go through memory, retried after a delay
+  RetryGate uyvyRefused;  // the UYVY conversion or its encoder refused: UYVY goes through packUyvy, retried after a delay
   bool uyvyGpu = true;         // read once from OMTHX_NO_GPU_UYVY: when set, UYVY keeps the CPU path
   std::unique_ptr<Encoder> encoder;            // the fill, or the stacked picture
   std::unique_ptr<AlphaEncoder> alphaEncoder;  // VMX alpha, or null
@@ -140,16 +140,16 @@ struct Sender::Impl {
   // Preview: a second, smaller stream, coded only while a receiver asks for it (libomt routes the frames).
   std::unique_ptr<Encoder> previewEncoder;
   VideoFormat previewSource;  // the format it was opened for
-  bool previewRefused = false;  // ponytail: no retry; preview receivers get the full stream instead
+  RetryGate previewRefused;  // preview receivers get the full stream instead, until the path is retried after a delay
   KeyframePolicy previewPolicy;
   Shrinker shrinker;
   Nv12 small, gpuCopy;
   // A GPU picture's preview is shrunk and coded in video memory: copying a 4K picture to memory to shrink it took
-  // about 30 ms on a GTX 1650. Once that fails (previewGpuRefused, latched), the picture is copied whole after all.
+  // about 30 ms on a GTX 1650. Once that fails the picture is copied whole after all, and the path is retried later.
   std::unique_ptr<GpuShrinker> gpuShrinker;
   GpuPicture smallGpu;
   const void* previewKey = nullptr;  // the frames context the preview encoder takes pictures from, or null
-  bool previewGpuRefused = false;
+  RetryGate previewGpuRefused;
   std::unique_ptr<BgraToNv12> bgraToNv12;  // sendVideoD3D11, made on first use
   std::unique_ptr<UyvyToNv12> uyvyToNv12;  // sendVideoUyvy, made on first use
   std::deque<int64_t> previewStamps;
@@ -164,7 +164,8 @@ struct Sender::Impl {
   // True when every video receiver takes the preview stream and it is coded: libomt then sends full HX frames to
   // nobody, so the full stream is not coded either. Not while preview coding fails: those receivers get the full one.
   bool fullUnwanted() const {
-    return mode == Mode::Hx && !previewRefused && previewReceivers > 0 && fullReceivers == 0;
+    const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
+    return mode == Mode::Hx && !previewRefused.closed(nowMs) && previewReceivers > 0 && fullReceivers == 0;
   }
   // True when this video frame is not coded or sent: nobody is connected, or the encoder just closed. Also
   // re-arms the keyframe policies when a receiver comes back, so the next frame is a keyframe.
@@ -408,7 +409,7 @@ void Sender::Impl::sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock:
 
 void Sender::Impl::sendPreview(const VideoFormat& fmt, int64_t timestamp, int64_t nowMs, uint64_t dropped,
                                bool requested, bool urgent, const AVFrame* gpu) {
-  if (previewRefused || previewReceivers <= 0) {
+  if (previewRefused.closed(nowMs) || previewReceivers <= 0) {
     previewEncoder.reset();  // frees its GPU session; the next preview receiver starts a new one, with a keyframe
     previewStamps.clear();
     return;
@@ -428,15 +429,16 @@ void Sender::Impl::sendPreview(const VideoFormat& fmt, int64_t timestamp, int64_
   };
   try {
     std::vector<Packet> packets;
-    bool onGpu = gpu && !previewGpuRefused && Readback::accepts(gpu);
+    bool onGpu = gpu && !previewGpuRefused.closed(nowMs) && Readback::accepts(gpu);
     if (onGpu) {
       try {
         if (!gpuShrinker) gpuShrinker = std::make_unique<GpuShrinker>();
         gpuShrinker->shrink(gpu, fmt.width, fmt.height, pf.width, pf.height, smallGpu);
         open(smallGpu.frame->hw_frames_ctx);
         packets = previewEncoder->encodeGpu(smallGpu.frame, previewPolicy.next(nowMs, dropped, requested, urgent));
+        previewGpuRefused.succeed();
       } catch (const std::exception& e) {
-        previewGpuRefused = true;  // ponytail: no retry, as the other latches
+        previewGpuRefused.fail(nowMs);  // the picture is copied whole and the GPU path is retried later
         onGpu = false;
         gpuShrinker.reset();
         previewEncoder.reset();  // the next one starts with a keyframe
@@ -469,10 +471,11 @@ void Sender::Impl::sendPreview(const VideoFormat& fmt, int64_t timestamp, int64_
       f.FrameMetadataLength = static_cast<int>(previewMeta.size() + 1);
       omt_send(tx, &f);
     }
+    previewRefused.succeed();
   } catch (const std::exception& e) {
     previewEncoder.reset();
     previewStamps.clear();
-    previewRefused = true;
+    previewRefused.fail(nowMs);
     fellBack("preview", e.what());
   }
 }
@@ -480,21 +483,23 @@ void Sender::Impl::sendPreview(const VideoFormat& fmt, int64_t timestamp, int64_
 void Sender::Impl::sendGpu(const VideoFrame& frame, Clock::time_point t0) {
   const VideoFormat& fmt = frame.format;
   const AVFrame* pic = frame.gpu->frame;
+  const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
   const std::vector<uint8_t>* alpha = fmt.alpha ? frame.gpu->alpha.get() : nullptr;
   const bool vmx = alpha != nullptr;  // otherwise alpha, if any, is stacked under the fill
   // Alpha is coded the way the picture holds it, by VMX or stacked, so nothing is re-packed.
   OMTMediaFrame f = videoHeader(fmt, frame.timestamp);
   bool sent = false;
-  if (frame.gpu->inVideoMemory() && !gpuRefused) {
+  if (frame.gpu->inVideoMemory() && !gpuRefused.closed(nowMs)) {
     try {
       openEncoder(fmt, vmx, pic->hw_frames_ctx);
     } catch (const std::runtime_error& e) {
-      gpuRefused = true;  // no GPU encoder takes D3D11 pictures: from now on, through memory
+      gpuRefused.fail(nowMs);  // no GPU encoder takes D3D11 pictures: through memory, retried after a delay
       fellBack("d3d11 encode", e.what());
     }
-    if (!gpuRefused) {
+    if (!gpuRefused.closed(nowMs)) {
       if (vmxAlpha) alphaPlane.assign(alpha->begin(), alpha->end());
       sendPicture(fmt, frame.timestamp, t0, f, pic);
+      gpuRefused.succeed();
       sent = true;
     }
   }
@@ -554,7 +559,7 @@ Sender::Sender(const std::string& name, Mode mode, Quality quality, Codec codec)
   d_->uyvyGpu = !envSet("OMTHX_NO_GPU_UYVY");
   // Test hook: stands in for an encoder the default adapter cannot feed, which no test PC can provide for real.
   if (envSet("OMTHX_TEST_GPU_REFUSED")) {
-    d_->gpuRefused = true;
+    d_->gpuRefused.latch();
     d_->stats.lastFallback = "d3d11 encode: OMTHX_TEST_GPU_REFUSED is set";
   }
   if (mode == Mode::Full) d_->stats.encoder = "vmx";
@@ -630,9 +635,10 @@ void Sender::sendVideoUyvy(const VideoFormat& fmt, const uint8_t* uyvy, int stri
     return;
   }
   OMTMediaFrame f = videoHeader(fmt, timestamp);
+  const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - d_->start).count();
 
   // No alpha on an HX sender: the GPU makes the NV12 picture from the UYVY rows, and the encoder codes it there.
-  if (!fmt.alpha && !d_->uyvyRefused && d_->uyvyGpu) {
+  if (!fmt.alpha && !d_->uyvyRefused.closed(nowMs) && d_->uyvyGpu) {
     if (!d_->uyvyToNv12) d_->uyvyToNv12 = std::make_unique<UyvyToNv12>();
     VideoFrame frame;
     frame.format = fmt;
@@ -643,14 +649,15 @@ void Sender::sendVideoUyvy(const VideoFormat& fmt, const uint8_t* uyvy, int stri
     try {
       d_->uyvyToNv12->convert(uyvy, stride, fmt.width, fmt.height, *pic);
     } catch (const std::runtime_error& e) {
-      d_->uyvyRefused = true;  // no device, or no YUY2 input: from now on, packUyvy
+      d_->uyvyRefused.fail(nowMs);  // no device, or no YUY2 input: packUyvy, and retried after a delay
       d_->uyvyToNv12.reset();
       d_->fellBack("uyvy on the gpu", e.what());
     }
-    if (!d_->uyvyRefused) {
+    if (!d_->uyvyRefused.closed(nowMs)) {
       frame.gpu = std::move(pic);
       d_->sendGpu(frame, t0);  // already gated above
-      if (d_->gpuRefused) d_->uyvyRefused = true;  // the encoder took no D3D11 pictures: packUyvy from now on
+      d_->uyvyRefused.succeed();
+      if (d_->gpuRefused.closed(nowMs)) d_->uyvyRefused.fail(nowMs);  // the encoder took no D3D11 pictures
       return;
     }
   }
@@ -884,8 +891,9 @@ struct Receiver::Impl {
   int skips = 0;                   // pictures skipped in this receiveVideo call, at most kMaxSkips
   bool lookedBehind = false;       // the last look ahead found a newer frame already waiting
   Readback readback;               // Hx pictures to memory without waiting on each copy (after decoder: goes first)
-  bool readbackFailed = false;     // the GPU refused a copy: the pictures come over as before, one by one
-  bool gpuBgraFailed = false;      // the video processor refused BGRA: copy NV12 and convert on the CPU
+  RetryGate readbackFailed;        // the GPU refused a copy: the pictures come over as before, retried after a delay
+  RetryGate gpuBgraFailed;         // the video processor refused BGRA: copy NV12 and convert on the CPU, retried later
+  Clock::time_point start = Clock::now();  // the clock the retry gates count from
   std::mutex statsMutex;
   ReceiverStats stats;
 
@@ -897,10 +905,12 @@ struct Receiver::Impl {
   // Hands out the picture Readback has ready (or, with wait, the newest one in flight) in the pixels asked for.
   bool deliver(VideoFrame& out, bool wait) {
     Readback::Picture p;
+    const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
     try {
       if (!readback.take(wait, picture, out.bgra, p)) return false;
+      readbackFailed.succeed();
     } catch (const std::runtime_error& e) {
-      readbackFailed = true;
+      readbackFailed.fail(nowMs);
       fellBack("gpu readback", e.what());
       return false;
     }
@@ -1021,11 +1031,12 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
 bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
   if (d_->pixels == PixelFormat::Coded) return false;
   out.nv12Y = out.nv12UV = nullptr;  // set below only for an Nv12 receiver, and only for this call
+  const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - d_->start).count();
   if (d_->askPending.exchange(false)) d_->ask();
   // A copy left over from the last call goes out as soon as it is done, unless the next frame comes first (then
   // the copies overlap, as a 4K stream needs on a GTX 1650). Waiting for the next frame instead kept a receiver
   // that once missed the half-frame wait a frame behind: 1080p60 at 25 ms against 15.
-  while (!d_->stash && d_->readback.pending() && !d_->readbackFailed) {
+  while (!d_->stash && d_->readback.pending() && !d_->readbackFailed.closed(nowMs)) {
     if (d_->deliver(out, false)) return true;
     if ((d_->stash = omt_receive(d_->rx, OMTFrameType_Video, 0))) break;
     d_->readback.nap();
@@ -1161,27 +1172,28 @@ bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
     // In video memory and without alpha: queue this picture's copy (converted to BGRA on the GPU for a Bgra
     // receiver) and hand it out if it is done within half a frame, else on the next call. Waiting for every copy
     // instead held a GTX 1650 to 46 fps at 4K NV12 and 21 at BGRA (2026-11-04).
-    if (!fmt.alpha && !d_->readbackFailed && Readback::accepts(decoded->frame)) {
+    if (!fmt.alpha && !d_->readbackFailed.closed(nowMs) && Readback::accepts(decoded->frame)) {
       if (small) {
         fmt.width = decoded->frame->width;
         fmt.height = decoded->frame->height;
       }
       bool queued = false;
-      const bool bgra = d_->pixels == PixelFormat::Bgra && !d_->gpuBgraFailed;
+      const bool bgra = d_->pixels == PixelFormat::Bgra && !d_->gpuBgraFailed.closed(nowMs);
       try {
         d_->readback.push(decoded->frame, fmt, timestamp, bgra, t0);
         queued = true;
+        if (bgra) d_->gpuBgraFailed.succeed();
       } catch (const std::runtime_error& e) {
-        if (bgra) d_->gpuBgraFailed = true;
-        else d_->readbackFailed = true;
+        if (bgra) d_->gpuBgraFailed.fail(nowMs);
+        else d_->readbackFailed.fail(nowMs);
         d_->fellBack(bgra ? "bgra on the gpu" : "gpu readback", e.what());
       }
-      if (!queued && bgra && !d_->readbackFailed) {
+      if (!queued && bgra && !d_->readbackFailed.closed(nowMs)) {
         try {
           d_->readback.push(decoded->frame, fmt, timestamp, false, t0);
           queued = true;
         } catch (const std::runtime_error& e) {
-          d_->readbackFailed = true;
+          d_->readbackFailed.fail(nowMs);
           d_->fellBack("gpu readback", e.what());
         }
       }
