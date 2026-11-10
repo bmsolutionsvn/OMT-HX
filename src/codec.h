@@ -63,18 +63,30 @@ AlphaPart parseAlpha(std::string_view metadata);           // nothing set for a 
 std::string_view parseEncoder(std::string_view metadata);  // empty when the source does not say
 
 // Decides when the sender must force a keyframe (spec section 8). Time is passed in, so it is testable.
+// Trouble (libomt dropped a frame for a slow receiver, or a receiver asked after losing one) forces a keyframe once
+// a gap has passed since the last. The gap starts at 200 ms and doubles with each keyframe trouble forces, up to
+// 2 s: every keyframe is a quality dip for every receiver, and one slow link keeps causing trouble. The first
+// trouble after 2 s without any (the longest gap, so the link has had time to recover) starts again at 200 ms.
+// urgent (a receiver joined, or the app asked) is served 200 ms after the last keyframe whatever the gap, and
+// leaves the gap as it was.
 class KeyframePolicy {
  public:
-  // A backstop only: receivers ask for a keyframe when they join or lose a frame, within 200 ms. Each periodic
-  // keyframe is a bitrate spike or a quality dip on a two-frame rate buffer, so they are rare.
+  // A backstop only: receivers ask for a keyframe when they join or lose a frame. Each periodic keyframe is a
+  // bitrate spike or a quality dip on a two-frame rate buffer, so they are rare.
   static constexpr int64_t kPeriodicMs = 10'000;
-  bool next(int64_t nowMs, uint64_t dropped, bool requested);
+  static constexpr int64_t kMinGapMs = 200;
+  static constexpr int64_t kMaxGapMs = 2'000;
+  static constexpr int64_t kQuietMs = kMaxGapMs;
+  bool next(int64_t nowMs, uint64_t dropped, bool requested, bool urgent = false);
 
  private:
   bool first_ = true;
-  bool pending_ = false;
+  bool pending_ = false;  // trouble not yet served
+  bool urgent_ = false;
   uint64_t dropped_ = 0;
   int64_t lastKeyMs_ = 0;
+  int64_t troubleMs_ = 0;  // the last trouble
+  int64_t gapMs_ = kMinGapMs;
 };
 
 // Whether a sender codes this video frame: only while a receiver is connected (encode on demand).
@@ -232,7 +244,8 @@ enum class Decoded { Picture, NeedMore, Error };
 // HEVC or H.264 through FFmpeg, D3D11 when the GPU offers it (src/decoder.cpp).
 class Decoder {
  public:
-  explicit Decoder(Codec codec);
+  // software: no D3D11 device, threads instead; for a stream the GPU refused (see refused).
+  explicit Decoder(Codec codec, bool software = false);
   ~Decoder();
   Decoder(const Decoder&) = delete;
   Decoder& operator=(const Decoder&) = delete;
@@ -243,9 +256,14 @@ class Decoder {
   // The same, leaving the picture where the decoder put it: `out` gets a reference to a D3D11 frame, or to a
   // frame in memory when decoding runs in software.
   Decoded decodeFrame(std::span<const uint8_t> accessUnit, int64_t timestamp, AVFrame* out, int64_t& outTimestamp);
+  // True once a decoder with a D3D11 device handed a picture back in memory: the GPU does not decode this stream,
+  // and FFmpeg went on in software in the same context, on one thread (its default thread_count is 1). A
+  // Decoder(codec, true) decodes it with threads.
+  bool refused() const { return refused_; }
 
  private:
   Codec codec_ = Codec::Hevc;
+  bool refused_ = false;
   AVCodecContext* ctx_ = nullptr;
   AVBufferRef* hw_ = nullptr;
   AVFrame* frame_ = nullptr;

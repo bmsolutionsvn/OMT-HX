@@ -26,6 +26,11 @@ using Clock = std::chrono::steady_clock;
 
 double msSince(Clock::time_point t0) { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); }
 
+bool envSet(const char* name) {  // set and not empty
+  const char* value = std::getenv(name);
+  return value && *value;
+}
+
 void checkBgra(const VideoFormat& f, std::span<const uint8_t> bgra) {
   if (f.width <= 0 || f.height <= 0 || bgra.size() != static_cast<size_t>(f.width) * f.height * 4)
     throw std::invalid_argument("bgra must be width * height * 4 bytes");
@@ -118,7 +123,11 @@ struct Sender::Impl {
   // omt_send_connections, cached: the gate asks every frame, and the count costs a lock in libomt.
   std::mutex receiversMutex;                     // one refresh at a time, so a stale count cannot outlive a fresh one
   int64_t receiversCheckedMs = -1;               // -1: never read, so the first call always counts
-  bool receivers = false;
+  int receivers = 0;
+  // The count went up: a new receiver waits for its first keyframe, which no back-off may hold up.
+  // ponytail: a leave and a join inside one 100 ms refresh cancel out; that receiver's asks then wait on the
+  // back-off, 2 s at most. Upgrade path: count connections by address.
+  std::atomic<bool> joined{false};
   // When the app handed this frame over, before any packing or encoding: the round trip covers the whole path.
   void noteSent(int64_t timestamp, Clock::time_point handedOver = Clock::now()) {
     sentAt.emplace_back(timestamp, handedOver);
@@ -150,7 +159,7 @@ struct Sender::Impl {
                    const AVFrame* gpu = nullptr);
   // The same picture to the preview stream, when a receiver wants it. Its failure never stops the full stream.
   void sendPreview(const VideoFormat& fmt, int64_t timestamp, int64_t nowMs, uint64_t dropped, bool requested,
-                   const AVFrame* gpu);
+                   bool urgent, const AVFrame* gpu);
   // The Hx send of a Gpu picture. The caller has gated the frame; t0 is when it was handed over, before any conversion.
   void sendGpu(const VideoFrame& frame, Clock::time_point t0);
   void fellBack(std::string_view path, const char* what) {
@@ -216,10 +225,12 @@ bool Sender::Impl::askedForKeyframe() {
 bool Sender::Impl::hasReceivers() {
   const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
   std::lock_guard lock(receiversMutex);
-  if (receiversCheckedMs >= 0 && nowMs - receiversCheckedMs < 100) return receivers;
-  receivers = omt_send_connections(tx) > 0;
+  if (receiversCheckedMs >= 0 && nowMs - receiversCheckedMs < 100) return receivers > 0;
+  const int count = omt_send_connections(tx);
+  if (count > receivers) joined = true;
+  receivers = count;
   receiversCheckedMs = nowMs;
-  return receivers;
+  return receivers > 0;
 }
 
 bool Sender::Impl::skipVideo() {
@@ -253,12 +264,13 @@ void Sender::Impl::sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock:
     policy = KeyframePolicy();
     lastFrameCoded = false;
   }
-  const bool requested = appKeyframe.exchange(false) | askedForKeyframe();
+  const bool requested = askedForKeyframe();
+  const bool urgent = appKeyframe.exchange(false) | joined.exchange(false);  // not held up by the back-off
   noteSent(timestamp, t0);  // t0: when sendVideo* was called, before the pack
   OMTStatistics omt = {};
   omt_send_getvideostatistics(tx, &omt);
   const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
-  const bool key = policy.next(nowMs, static_cast<uint64_t>(omt.FramesDropped), requested);
+  const bool key = policy.next(nowMs, static_cast<uint64_t>(omt.FramesDropped), requested, urgent);
 
   std::vector<Packet> packets;
   PendingAlpha alpha;
@@ -344,11 +356,11 @@ void Sender::Impl::sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock:
     stats.keyframes += keyframes;
     stats.lastEncodeMs = encodeMs;
   }
-  sendPreview(fmt, timestamp, nowMs, static_cast<uint64_t>(omt.FramesDropped), requested, gpu);
+  sendPreview(fmt, timestamp, nowMs, static_cast<uint64_t>(omt.FramesDropped), requested, urgent, gpu);
 }
 
 void Sender::Impl::sendPreview(const VideoFormat& fmt, int64_t timestamp, int64_t nowMs, uint64_t dropped,
-                               bool requested, const AVFrame* gpu) {
+                               bool requested, bool urgent, const AVFrame* gpu) {
   if (previewRefused || omt_send_previewconnections(tx) <= 0) {
     previewEncoder.reset();  // frees its GPU session; the next preview receiver starts a new one, with a keyframe
     previewStamps.clear();
@@ -366,7 +378,7 @@ void Sender::Impl::sendPreview(const VideoFormat& fmt, int64_t timestamp, int64_
     }
     if (gpu && !downloadNv12(gpu, gpuCopy)) throw std::runtime_error("cannot copy the picture from video memory");
     shrinker.shrink(gpu ? gpuCopy : picture, fmt.width, fmt.height, pf.width, pf.height, small);
-    std::vector<Packet> packets = previewEncoder->encode(small, previewPolicy.next(nowMs, dropped, requested));
+    std::vector<Packet> packets = previewEncoder->encode(small, previewPolicy.next(nowMs, dropped, requested, urgent));
     previewStamps.push_back(timestamp);
     // Like a VMX preview, the frame carries the source's size and flags with Preview set (libomt routes by it):
     // a probe reads the source from it. The receiver takes the picture's size from the decoder, without alpha.
@@ -430,11 +442,9 @@ Sender::Sender(const std::string& name, Mode mode, Quality quality, Codec codec)
   d_->codec = codec;
   d_->tx = omt_send_create(name.c_str(), kOmtQuality[static_cast<int>(quality)]);
   if (!d_->tx) throw std::runtime_error("cannot create the OMT source \"" + name + "\"");
-  const char* noGpuUyvy = std::getenv("OMTHX_NO_GPU_UYVY");
-  d_->uyvyGpu = !(noGpuUyvy && *noGpuUyvy);
+  d_->uyvyGpu = !envSet("OMTHX_NO_GPU_UYVY");
   // Test hook: stands in for an encoder the default adapter cannot feed, which no test PC can provide for real.
-  const char* pretendRefused = std::getenv("OMTHX_TEST_GPU_REFUSED");
-  if (pretendRefused && *pretendRefused) {
+  if (envSet("OMTHX_TEST_GPU_REFUSED")) {
     d_->gpuRefused = true;
     d_->stats.lastFallback = "d3d11 encode: OMTHX_TEST_GPU_REFUSED is set";
   }
@@ -705,6 +715,29 @@ struct HxStream {
   Codec codec = Codec::Hevc;
   bool haveCodec = false;
   bool haveAlpha = false;
+  bool noGpu[2] = {};           // by codec: the GPU handed back a picture in memory, so that codec decodes in software
+  bool pretendRefused = false;  // test hook, read as each GPU decoder opens
+
+  // Makes the decoder when there is none: in software, with threads, for a codec the GPU refused.
+  void open(Codec c) {
+    if (decoder) return;
+    const bool software = noGpu[static_cast<int>(c)];
+    decoder = std::make_unique<Decoder>(c, software);
+    // Test hook: stands in for a GPU without this codec's decoder, which no test PC has.
+    pretendRefused = !software && envSet("OMTHX_TEST_GPU_DECODE_REFUSED");
+  }
+
+  // After a picture: true when the GPU decoder handed it back in memory, so FFmpeg decodes in software in the
+  // GPU's context, on one thread. The stream restarts in a software decoder from the next keyframe; this picture
+  // is dropped.
+  // ponytail: latched per codec for this object's life, though a GPU may refuse only one profile or size. Upgrade
+  // path: forget it when the stream's size changes.
+  bool gpuRefused() {
+    if (!decoder->refused() && !pretendRefused) return false;
+    noGpu[static_cast<int>(decoder->codec())] = true;
+    restart();
+    return true;
+  }
 
   // True when this frame is of the same stream as the last: same codec, same alpha layout. A change starts a
   // new stream, whose first picture must come from a keyframe.
@@ -1004,7 +1037,7 @@ bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
   const bool vmxAlpha = fmt.alpha && part.any();  // otherwise alpha, if any, is stacked under the fill
   uint64_t seq = 0;
   if (!d_->admit(f, codec, au, vmxAlpha, seq)) return false;
-  if (!d_->hx.decoder) d_->hx.decoder = std::make_unique<Decoder>(codec);
+  d_->hx.open(codec);
   auto fail = [&] {
     d_->waiting = true;
     d_->hx.pendingAlpha.clear();
@@ -1022,7 +1055,7 @@ bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
     d_->waiting = false;
     return false;
   }
-  if (result != Decoded::Picture) return fail();
+  if (result != Decoded::Picture || d_->hx.gpuRefused()) return fail();  // fail asks for the keyframe
   if (!gpu) {
     // Bringing a 4K picture to memory costs far more than decoding it (about 30 ms against 1 ms on a GTX 1650).
     // If the next frame is already queued, this picture is stale: it stays decoded, as the next one refers to it,
@@ -1338,7 +1371,7 @@ bool FrameDecoder::decode(const CodedFrame& c, VideoFrame& out) {
     return false;
   };
   if (d_->waiting && !c.keyframe) return false;
-  if (!d_->hx.decoder) d_->hx.decoder = std::make_unique<Decoder>(c.codec);
+  d_->hx.open(c.codec);
   if (vmxAlpha && !d_->hx.queueAlpha(fmt, part, vmx, c.timestamp)) return fail();
   int64_t timestamp = 0;
   const Decoded result = d_->hx.decoder->decode(fill, c.timestamp, d_->picture, timestamp);
@@ -1346,7 +1379,7 @@ bool FrameDecoder::decode(const CodedFrame& c, VideoFrame& out) {
     d_->waiting = false;
     return false;
   }
-  if (result != Decoded::Picture) return fail();
+  if (result != Decoded::Picture || d_->hx.gpuRefused()) return fail();  // no source to ask: waits for a keyframe
   std::shared_ptr<const std::vector<uint8_t>> alpha;
   if (vmxAlpha) {
     alpha = d_->hx.popAlpha(timestamp);

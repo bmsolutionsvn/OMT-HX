@@ -217,11 +217,52 @@ TEST_CASE("KeyframePolicy: first frame, requests limited to one per 200 ms, new 
   CHECK_FALSE(p.next(100, 0, true));   // asked, but 200 ms have not passed
   CHECK(p.next(200, 0, false));        // the waiting request is served
   CHECK_FALSE(p.next(216, 0, false));
-  CHECK(p.next(400, 1, false));        // libomt dropped a frame
-  CHECK_FALSE(p.next(416, 1, false));  // same drop count: nothing new
-  CHECK_FALSE(p.next(3000, 1, false)); // 2 seconds after the drop: no longer a reason
-  CHECK_FALSE(p.next(10399, 1, false));
-  CHECK(p.next(10400, 1, false));      // 10 seconds since the last keyframe
+  CHECK(p.next(2400, 1, false));        // libomt dropped a frame, 2 s after the last trouble: served at once
+  CHECK_FALSE(p.next(2416, 1, false));  // same drop count: nothing new
+  CHECK_FALSE(p.next(5000, 1, false));  // 2 seconds after the drop: no longer a reason
+  CHECK_FALSE(p.next(12399, 1, false));
+  CHECK(p.next(12400, 1, false));       // 10 seconds since the last keyframe
+}
+
+TEST_CASE("KeyframePolicy: trouble that keeps coming backs off to one keyframe per 2 s") {
+  KeyframePolicy p;
+  CHECK(p.next(0, 0, false));
+  std::vector<int64_t> keys;
+  uint64_t dropped = 0;
+  for (int64_t t = 10; t <= 9000; t += 10) {  // a drop or a request every 10 ms
+    const bool drop = t % 20 == 0;
+    if (p.next(t, dropped += drop, !drop)) keys.push_back(t);
+  }
+  CHECK(keys == std::vector<int64_t>{200, 600, 1400, 3000, 5000, 7000, 9000});  // 200, 400, 800, 1600, then 2 s
+}
+
+TEST_CASE("KeyframePolicy: after 2 s without trouble the gap is 200 ms again") {
+  KeyframePolicy p;
+  CHECK(p.next(0, 0, false));
+  uint64_t dropped = 0;
+  for (int64_t t = 10; t <= 3000; t += 10) p.next(t, ++dropped, false);  // keyframes up to 3000: the gap is 2 s
+  CHECK_FALSE(p.next(3100, ++dropped, false));  // trouble 100 ms after the last: no quiet spell, 2 s gap
+  CHECK_FALSE(p.next(4990, dropped, false));
+  CHECK(p.next(5000, dropped, false));
+  CHECK(p.next(15000, dropped, false));         // periodic; the last trouble was at 3100
+  CHECK_FALSE(p.next(15100, ++dropped, false));
+  CHECK(p.next(15200, dropped, false));         // the quiet spell started the gap at 200 ms again
+}
+
+TEST_CASE("KeyframePolicy: a join or the app gets a keyframe within 200 ms during back-off, and leaves it as it was") {
+  KeyframePolicy p;
+  CHECK(p.next(0, 0, false));
+  uint64_t dropped = 0;
+  int64_t last = 0;
+  for (int64_t t = 10; t <= 3000; t += 10) {
+    if (p.next(t, ++dropped, false)) last = t;
+  }
+  REQUIRE(last == 3000);  // the gap is now 2 s
+  CHECK_FALSE(p.next(3100, ++dropped, false, true));  // a receiver joined, 100 ms after the last keyframe
+  CHECK(p.next(3200, ++dropped, false));              // served at 200 ms, not 2 s
+  CHECK_FALSE(p.next(5190, ++dropped, false));        // the trouble goes on at the 2 s gap
+  CHECK(p.next(5200, ++dropped, false));
+  CHECK(p.next(5400, dropped, false, true));          // the app asked: 200 ms
 }
 
 TEST_CASE("IdleGate: sends while a receiver is connected") {

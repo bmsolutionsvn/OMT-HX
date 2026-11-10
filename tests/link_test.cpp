@@ -1033,6 +1033,24 @@ TEST_CASE("UYVY keeps sending when the encoder refuses D3D11 frames") {
   CHECK(!sender.stats().lastFallback.empty());  // the hook sets it in the constructor, as a real refusal would later
 }
 
+TEST_CASE("a receiver whose GPU hands back pictures in memory goes on in software") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{640, 360, 60, 1, false};
+  // A GPU without this codec's decoder: the hook stands in for FFmpeg's fallback inside the D3D11 context.
+  _putenv_s("OMTHX_TEST_GPU_DECODE_REFUSED", "1");
+  Sender sender("omthx-test-decode-refused", Mode::Hx, Quality::Medium);
+  Receiver receiver(sender.address());
+  Pump pump(sender, f);
+  VideoFrame frame;
+  const int got = receiveSome(receiver, frame, 30, 10);
+  _putenv_s("OMTHX_TEST_GPU_DECODE_REFUSED", "");
+  MESSAGE("decoded by " << receiver.stats().decoder << ", " << got << " pictures");
+  REQUIRE(got == 30);  // the picture that showed the fallback is dropped, the next keyframe starts the software decoder
+  CHECK(receiver.stats().decoder == "hevc (software)");
+  CHECK(frame.format == f);
+  CHECK(frame.bgra.size() == 640u * 360 * 4);
+}
+
 TEST_CASE("sendVideoUyvy on the GPU costs less CPU than the pack") {
   if (!hardware(Codec::Hevc)) return;
   const VideoFormat f{1920, 1080, 60, 1, false};

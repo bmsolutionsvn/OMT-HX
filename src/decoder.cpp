@@ -58,21 +58,24 @@ std::string highPerformanceAdapter(std::string& name) {
 #endif
 }  // namespace
 
-Decoder::Decoder(Codec codec) : codec_(codec) {
+Decoder::Decoder(Codec codec, bool software) : codec_(codec) {
   const std::string base = codecName(codec);
   const AVCodec* av = avcodec_find_decoder(codec == Codec::H264 ? AV_CODEC_ID_H264 : AV_CODEC_ID_HEVC);
   if (!av) throw std::runtime_error("FFmpeg was built without the " + base + " decoder");
   ctx_ = avcodec_alloc_context3(av);
   ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
   std::string gpu, adapter;
+  int rc = -1;
+  if (!software) {
 #ifdef _WIN32
-  adapter = highPerformanceAdapter(gpu);
+    adapter = highPerformanceAdapter(gpu);
 #endif
-  int rc = av_hwdevice_ctx_create(&hw_, AV_HWDEVICE_TYPE_D3D11VA, adapter.empty() ? nullptr : adapter.c_str(),
-                                  nullptr, 0);
-  if (rc < 0 && !adapter.empty()) {  // that GPU refused: FFmpeg's default, as before
-    gpu.clear();
-    rc = av_hwdevice_ctx_create(&hw_, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0);
+    rc = av_hwdevice_ctx_create(&hw_, AV_HWDEVICE_TYPE_D3D11VA, adapter.empty() ? nullptr : adapter.c_str(),
+                                nullptr, 0);
+    if (rc < 0 && !adapter.empty()) {  // that GPU refused: FFmpeg's default, as before
+      gpu.clear();
+      rc = av_hwdevice_ctx_create(&hw_, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0);
+    }
   }
   if (rc >= 0) {
     ctx_->hw_device_ctx = av_buffer_ref(hw_);
@@ -122,7 +125,10 @@ Decoded Decoder::decodeFrame(std::span<const uint8_t> au, int64_t timestamp, AVF
     avcodec_flush_buffers(ctx_);
     return Decoded::Error;
   }
-  if (out->format != AV_PIX_FMT_D3D11) name_ = std::string(codecName(codec_)) + " (software)";
+  if (out->format != AV_PIX_FMT_D3D11 && hw_ && !refused_) {  // FFmpeg fell back to software in the GPU's context
+    refused_ = true;
+    name_ = std::string(codecName(codec_)) + " (software)";
+  }
   outTimestamp = out->pts;
   return Decoded::Picture;
 }

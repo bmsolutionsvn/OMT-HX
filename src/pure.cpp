@@ -143,14 +143,22 @@ std::string_view parseEncoder(std::string_view m) {
   return m.substr(start, end - start);
 }
 
-bool KeyframePolicy::next(int64_t nowMs, uint64_t dropped, bool requested) {
-  if (dropped > dropped_ || requested) pending_ = true;
+bool KeyframePolicy::next(int64_t nowMs, uint64_t dropped, bool requested, bool urgent) {
+  if (dropped > dropped_ || requested) {
+    if (nowMs - troubleMs_ >= kQuietMs) gapMs_ = kMinGapMs;  // the first trouble after a quiet spell
+    troubleMs_ = nowMs;
+    pending_ = true;
+  }
   dropped_ = dropped;
+  urgent_ = urgent_ || urgent;
   const int64_t since = nowMs - lastKeyMs_;
-  const bool key = first_ || since >= kPeriodicMs || (pending_ && since >= 200);
+  const bool key = first_ || since >= kPeriodicMs || (urgent_ && since >= kMinGapMs) || (pending_ && since >= gapMs_);
   if (key) {
+    // Trouble forced this one: should more come, the next waits twice as long.
+    if (pending_ && !urgent_ && !first_) gapMs_ = std::min(2 * gapMs_, kMaxGapMs);
     first_ = false;
     pending_ = false;
+    urgent_ = false;
     lastKeyMs_ = nowMs;
   }
   return key;

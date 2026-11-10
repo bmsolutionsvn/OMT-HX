@@ -14,8 +14,8 @@ a reading of the code, not a reproduced failure.
 | 2 | The full stream is coded when every receiver is a preview receiver | Wasted work | Medium (touches the libomtnet fork) | Open |
 | 3 | A preview receiver forces a full-size readback of GPU pictures | Wasted work | Medium | Open |
 | 4 | `Packer` builds both converters, 8 swscale threads each | Wasted work | Small | Fixed on `fix/core-review-1-4`, uncommitted; full suite passed (98 test cases) |
-| 5 | One slow receiver forces keyframes for every receiver | Behaviour under load | Small (back-off) to large (bitrate) | Open |
-| 6 | Software decode is single-threaded when a GPU exists but cannot decode the codec | Behaviour under load | Small to medium | Open |
+| 5 | One slow receiver forces keyframes for every receiver | Behaviour under load | Small (back-off) to large (bitrate) | Back-off done (200 ms doubling to 2 s, joins and app requests exempt), uncommitted; bitrate half open |
+| 6 | Software decode is single-threaded when a GPU exists but cannot decode the codec | Behaviour under load | Small to medium | Fallback to a software `Decoder` done, uncommitted; may not add threads, see note in section 6 |
 | 7 | Fallbacks are silent and permanent | Operability | Small | Reason now in `lastFallback` (`fix/core-review-1-4`, uncommitted); flags still latch, no retry |
 | 8 | The UYVY GPU path uses the default adapter, the decoder the high-performance one | Operability | Small | Open, not verified on a hybrid-GPU PC |
 | 9 | Smaller points (stats, double gate call, preview switching, audio) | Minor | Small each | Timing stats fixed; gate steps once on Hx paths, still twice on two Full paths; preview switching and audio open |
@@ -87,6 +87,13 @@ the same context with the default thread count, which is unlikely to hold 1080p6
 
 Fix: when the first picture is not `AV_PIX_FMT_D3D11`, reopen the decoder as software with threads and wait
 for the next keyframe.
+
+Note after the fix: `Decoder` sets `AV_CODEC_FLAG_LOW_DELAY`, and FFmpeg turns frame threading off under
+that flag (`libavcodec/pthread.c`, FFmpeg n9.0.2). `thread_count = 4` then gives only slice threads, which
+help only streams coded in several slices or, for HEVC, with WPP. The software decoder, old and new, may
+therefore decode a single-slice hardware stream on one thread. The code comment about "four frame threads"
+is likely wrong. Needs a measurement; the real choice is frame threads (several frames of delay) against
+low delay.
 
 ## 7. Fallbacks are silent and permanent
 
