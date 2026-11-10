@@ -135,7 +135,10 @@ int main(int argc, char** argv) {
     else if (a == "--seconds") seconds = std::atoi(value().c_str());
     else if (a == "--live-seconds") liveSeconds = std::atoi(value().c_str());
     else if (a == "--dump") dump = value();
-    else if (a == "--tally") tally = value();
+    else if (a == "--tally") {
+      tally = value();
+      if (tally != "program" && tally != "preview") usage();
+    }
     else if (a == "--preview") preview = true;  // the small picture, as NDI's lowest bandwidth
     else if (a == "--tick") tick = true;
     else if (a == "--pixels") {
@@ -219,6 +222,7 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(s.framesDiscarded), delays ? delaySum / delays : 0.0, delayMax,
                     frame.format.width, frame.format.height, frame.format.alpha ? " +alpha" : "",
                     s.encoder.empty() ? "-" : s.encoder.c_str());
+        if (s.lastFallback != last.lastFallback) std::printf("fallback: %s\n",s.lastFallback.c_str());
         const bool arrived = s.framesReceived > last.framesReceived;
         last = s;
         delaySum = delayMax = 0;

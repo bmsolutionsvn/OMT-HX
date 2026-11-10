@@ -40,14 +40,14 @@ static void bench(IDXGIAdapter1* adapter, DXGI_FORMAT format, const char* name, 
   ComPtr<ID3D11Texture2D> gpu, staging;
   if (FAILED(dev->CreateTexture2D(&d, nullptr, &gpu))) { std::printf("    %s: no texture\n", name); return; }
   d.BindFlags = 0; d.Usage = D3D11_USAGE_STAGING; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-  dev->CreateTexture2D(&d, nullptr, &staging);
+  if (FAILED(dev->CreateTexture2D(&d, nullptr, &staging))) { std::printf("    %s: no staging texture\n",name); return; }
   std::vector<uint8_t> out(size_t(bytesPerRow) * rows);
   const int N = 40; double copyMs = 0, readMs = 0, streamMs = 0;
   for (int i = 0; i < N + 5; ++i) {
     auto t0 = Clock::now();
     ctx->CopyResource(staging.Get(), gpu.Get());
     D3D11_MAPPED_SUBRESOURCE m{};
-    ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m);  // waits for the GPU copy
+    if (FAILED(ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m))) { std::printf("    %s: cannot map\n",name); return; }  // waits for the GPU copy
     auto t1 = Clock::now();
     for (UINT r = 0; r < rows; ++r) std::memcpy(out.data() + size_t(r) * bytesPerRow, (uint8_t*)m.pData + size_t(r) * m.RowPitch, bytesPerRow);
     auto t2 = Clock::now();
@@ -63,7 +63,7 @@ static void bench(IDXGIAdapter1* adapter, DXGI_FORMAT format, const char* name, 
 
 int main() {
   ComPtr<IDXGIFactory1> f;
-  CreateDXGIFactory1(IID_PPV_ARGS(&f));
+  if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&f)))) { std::puts("no DXGI factory"); return 1; }
   ComPtr<IDXGIAdapter1> a;
   for (UINT i = 0; f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; ++i) {
     DXGI_ADAPTER_DESC1 desc; a->GetDesc1(&desc);

@@ -151,7 +151,8 @@ string, which names every encoder attempted and why it refused.
 Fix (done): a `lastFallback` string in `SenderStats` and `ReceiverStats`, set where each gate fails. Each fallback
 is also retried: a `RetryGate` (`src/codec.h`) closes the fast path for a delay that starts at 30 s and doubles with
 every failure in a row, up to 10 min, and the delay goes back to 30 s when the path next delivers a frame. The
-fallback still runs in the same frame, so a failed retry loses nothing.
+fallback still runs in the same frame, so a failed retry loses nothing, with one exception: while every receiver
+is a preview receiver, a failed preview retry drops one frame, as the full encoder was closed for it.
 
 A real recovery is untested: no test PC can make a GPU path fail and then recover, and there is no environment hook
 for it. The gate itself is unit-tested (`tests/pure_test.cpp`), and `OMTHX_TEST_GPU_REFUSED` still latches.

@@ -656,8 +656,8 @@ void Sender::sendVideoUyvy(const VideoFormat& fmt, const uint8_t* uyvy, int stri
     if (!d_->uyvyRefused.closed(nowMs)) {
       frame.gpu = std::move(pic);
       d_->sendGpu(frame, t0);  // already gated above
-      d_->uyvyRefused.succeed();
       if (d_->gpuRefused.closed(nowMs)) d_->uyvyRefused.fail(nowMs);  // the encoder took no D3D11 pictures
+      else d_->uyvyRefused.succeed();
       return;
     }
   }

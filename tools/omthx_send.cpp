@@ -26,7 +26,8 @@ using namespace omthx;
 namespace {
 [[noreturn]] void usage() {
   std::puts("omthx-send [--name TEXT] [--mode hx|full] [--codec hevc|h264] [--quality low|medium|high]\n"
-            "           [--size WxH] [--fps N] [--alpha] [--tone] [--tick] [--gpu] [--seconds N]\n"
+            "           [--size WxH] [--fps N] [--alpha] [--tone] [--tick] [--gpu | --uyvy] [--seconds N]\n"
+            "           [--until-watched N]\n"
             "Defaults: --name \"OMT-HX Test\" --mode hx --codec hevc --quality medium --size 1920x1080 --fps 60,\n"
             "runs until Ctrl+C. --codec is ignored with --mode full.\n"
             "--tone adds a 1 kHz tone at -20 dBFS, stereo, 48 kHz.\n"
@@ -86,11 +87,16 @@ int main(int argc, char** argv) {
     if (a == "--name") {
       name = value();
     } else if (a == "--mode") {
-      mode = value() == "full" ? Mode::Full : Mode::Hx;
+      const std::string m = value();
+      if (m != "hx" && m != "full") usage();
+      mode = m == "full" ? Mode::Full : Mode::Hx;
     } else if (a == "--codec") {
-      codec = value() == "h264" ? Codec::H264 : Codec::Hevc;
+      const std::string c = value();
+      if (c != "hevc" && c != "h264") usage();
+      codec = c == "h264" ? Codec::H264 : Codec::Hevc;
     } else if (a == "--quality") {
       const std::string q = value();
+      if (q != "low" && q != "medium" && q != "high") usage();
       quality = q == "low" ? Quality::Low : q == "high" ? Quality::High : Quality::Medium;
     } else if (a == "--size") {
       if (std::sscanf(value().c_str(), "%dx%d", &f.width, &f.height) != 2) usage();
@@ -199,11 +205,12 @@ int main(int argc, char** argv) {
         char rtt[32] = "-";  // no receiver has replied (yet)
         if (s.connections > 0 && s.roundTripMs >= 0) std::snprintf(rtt, sizeof(rtt), "%.1f ms", s.roundTripMs);
         std::printf("%-11s %3llu fps  %7.2f Mbps  encode %5.2f ms  keyframes %llu  dropped %llu  connections %d  "
-                    "round trip %s  tally %s%s\n",
+                    "round trip %s  bitrate %d%%  tally %s%s\n",
                     s.encoder.c_str(), static_cast<unsigned long long>(s.framesSent - last.framesSent),
                     (s.bytesSent >= last.bytesSent ? s.bytesSent - last.bytesSent : s.bytesSent) * 8 / 1e6, s.lastEncodeMs,  // the count restarts with a new connection
                     static_cast<unsigned long long>(s.keyframes), static_cast<unsigned long long>(s.framesDropped),
-                    s.connections, rtt, t.program ? "PGM " : "", t.preview ? "PVW" : "");
+                    s.connections, rtt, s.bitratePercent, t.program ? "PGM " : "", t.preview ? "PVW" : "");
+        if (s.lastFallback != last.lastFallback) std::printf("fallback: %s\n",s.lastFallback.c_str());
         last = s;
         if (s.connections > 0) {
           ++watched;
@@ -215,7 +222,7 @@ int main(int argc, char** argv) {
         if (untilWatched > 0 && (watched >= untilWatched || gone >= 3)) break;
       }
     }
-    #ifdef _WIN32
+#ifdef _WIN32
     timeEndPeriod(1);
 #endif
   } catch (const std::exception& e) {
