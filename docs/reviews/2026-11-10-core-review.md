@@ -11,7 +11,7 @@ a reading of the code, not a reproduced failure.
 | # | Finding | Kind | Size of fix | Status |
 |---|---------|------|-------------|--------|
 | 1 | A failed encode leaves timestamps and frame numbers out of step (no-alpha path) | Bug | Small | Fixed on `fix/core-review-1-4`, uncommitted; no test (needs a failing encoder) |
-| 2 | The full stream is coded when every receiver is a preview receiver | Wasted work | Medium (touches the libomtnet fork) | Open |
+| 2 | The full stream is coded when every receiver is a preview receiver | Wasted work | Medium (touches the libomtnet fork) | Fixed: `omt_send_fullconnections`; the full encoder closes while only preview receivers watch |
 | 3 | A preview receiver forces a full-size readback of GPU pictures | Wasted work | Medium | Open |
 | 4 | `Packer` builds both converters, 8 swscale threads each | Wasted work | Small | Fixed on `fix/core-review-1-4`, uncommitted; full suite passed (98 test cases) |
 | 5 | One slow receiver forces keyframes for every receiver | Behaviour under load | Small (back-off) to large (bitrate) | Back-off done (200 ms doubling to 2 s, joins and app requests exempt), uncommitted; bitrate half open |

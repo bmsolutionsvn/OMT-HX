@@ -124,6 +124,8 @@ struct Sender::Impl {
   std::mutex receiversMutex;                     // one refresh at a time, so a stale count cannot outlive a fresh one
   int64_t receiversCheckedMs = -1;               // -1: never read, so the first call always counts
   int receivers = 0;
+  // Video receivers of the preview stream and of the full one, refreshed with `receivers`.
+  std::atomic<int> previewReceivers{0}, fullReceivers{0};
   // The count went up: a new receiver waits for its first keyframe, which no back-off may hold up.
   // ponytail: a leave and a join inside one 100 ms refresh cancel out; that receiver's asks then wait on the
   // back-off, 2 s at most. Upgrade path: count connections by address.
@@ -151,6 +153,11 @@ struct Sender::Impl {
   bool askedForKeyframe();
   // True while omt_send_connections is above zero, refreshed at most every 100 ms. Any connection counts.
   bool hasReceivers();
+  // True when every video receiver takes the preview stream and it is coded: libomt then sends full HX frames to
+  // nobody, so the full stream is not coded either. Not while preview coding fails: those receivers get the full one.
+  bool fullUnwanted() const {
+    return mode == Mode::Hx && !previewRefused && previewReceivers > 0 && fullReceivers == 0;
+  }
   // True when this video frame is not coded or sent: nobody is connected, or the encoder just closed. Also
   // re-arms the keyframe policies when a receiver comes back, so the next frame is a keyframe.
   bool skipVideo();
@@ -180,13 +187,18 @@ struct Sender::Impl {
 void Sender::Impl::openEncoder(const VideoFormat& fmt, bool vmx, AVBufferRef* gpuFrames) {
   const bool sep = fmt.alpha && vmx && vmxAlphaFits(fmt);
   const void* key = gpuFrames ? gpuFrames->data : nullptr;
-  if (encoder && fmt == format && sep == vmxAlpha && key == gpuKey) return;
+  // Preview receivers only: no encoder, so its GPU session is free at once. The next full receiver opens a new one,
+  // which starts with a keyframe. ponytail: a full receiver that comes and goes costs an encoder open each time.
+  const bool unwanted = fullUnwanted();
+  if (encoder && fmt == format && sep == vmxAlpha && key == gpuKey && !unwanted) return;
   encoder.reset();  // the old session closes first: a GPU runs only a few at a time
   alphaEncoder.reset();
   stamps.clear();  // the new encoder owes nothing the old one held
   alphas.clear();
   lastAlpha.clear();
   lastCoded.reset();
+  vmxAlpha = sep;  // the picture is packed by it even without an encoder, for the preview stream
+  if (unwanted) return;
   auto fill = std::make_unique<Encoder>(codec, fmt.width, sep ? fmt.height : codedHeight(fmt), fmt.fpsN, fmt.fpsD,
                                         sep ? fillBitrate(fmt, quality, codec) : targetBitrate(fmt, quality, codec),
                                         gpuFrames);
@@ -194,7 +206,6 @@ void Sender::Impl::openEncoder(const VideoFormat& fmt, bool vmx, AVBufferRef* gp
   if (sep) alphaEncoder = std::make_unique<AlphaEncoder>(fmt.width, fmt.height, Quality::High);
   encoder = std::move(fill);
   format = fmt;
-  vmxAlpha = sep;
   gpuKey = key;
   policy = KeyframePolicy();  // a new encoder starts with a keyframe
 }
@@ -229,6 +240,8 @@ bool Sender::Impl::hasReceivers() {
   const int count = omt_send_connections(tx);
   if (count > receivers) joined = true;
   receivers = count;
+  previewReceivers = omt_send_previewconnections(tx);
+  fullReceivers = omt_send_fullconnections(tx);
   receiversCheckedMs = nowMs;
   return receivers > 0;
 }
@@ -270,6 +283,10 @@ void Sender::Impl::sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock:
   OMTStatistics omt = {};
   omt_send_getvideostatistics(tx, &omt);
   const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
+  if (!encoder) {  // preview receivers only (openEncoder): the full stream would go to nobody
+    sendPreview(fmt, timestamp, nowMs, static_cast<uint64_t>(omt.FramesDropped), requested, urgent, gpu);
+    return;
+  }
   const bool key = policy.next(nowMs, static_cast<uint64_t>(omt.FramesDropped), requested, urgent);
 
   std::vector<Packet> packets;
@@ -361,7 +378,7 @@ void Sender::Impl::sendPicture(const VideoFormat& fmt, int64_t timestamp, Clock:
 
 void Sender::Impl::sendPreview(const VideoFormat& fmt, int64_t timestamp, int64_t nowMs, uint64_t dropped,
                                bool requested, bool urgent, const AVFrame* gpu) {
-  if (previewRefused || omt_send_previewconnections(tx) <= 0) {
+  if (previewRefused || previewReceivers <= 0) {
     previewEncoder.reset();  // frees its GPU session; the next preview receiver starts a new one, with a keyframe
     previewStamps.clear();
     return;

@@ -413,6 +413,27 @@ TEST_CASE("a preview receiver of an HX source gets the small stream, beside a fu
   CHECK(info.format == f);
 }
 
+TEST_CASE("an HX source codes no full stream while only preview receivers watch") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{1280, 720, 60, 1, false};
+  Sender sender("omthx-test-preview-only", Mode::Hx, Quality::Medium);
+  Receiver small(sender.address(), PixelFormat::Bgra, true);
+  Pump pump(sender, f);
+
+  VideoFrame a, b;
+  REQUIRE(receiveSome(small, b, 30, 10) == 30);  // settled: the receiver's preview request has arrived
+  const uint64_t sent = sender.stats().framesSent;  // full frames only; preview frames are not counted
+  REQUIRE(receiveSome(small, b, 30, 10) == 30);
+  CHECK(sender.stats().framesSent == sent);
+  CHECK(b.format.width == 640);
+
+  Receiver full(sender.address());
+  REQUIRE(receiveSome(full, a, 1, 5) == 1);
+  CHECK(a.format == f);
+  CHECK(full.stats().framesDiscarded == 0);  // its first frame was a keyframe
+  CHECK(sender.stats().framesSent > sent);
+}
+
 TEST_CASE("a preview receiver of a plain OMT source gets the VMX preview") {
   const VideoFormat f{1280, 720, 60, 1, false};
   Sender sender("omthx-test-preview-full", Mode::Full, Quality::Medium);
