@@ -1284,6 +1284,12 @@ bool Receiver::receiveAudio(AudioFrame& out, int timeoutMs) {
   return true;
 }
 
+void Receiver::setPreview(bool preview) {
+  if (d_->pixels == PixelFormat::Coded) return;
+  omt_receive_setflags(d_->rx, preview ? OMTReceiveFlags_Preview : OMTReceiveFlags_None);
+  d_->askPending = true;  // the other stream's first frame may not be a keyframe
+}
+
 void Receiver::setTally(Tally tally) {
   OMTTally t = {tally.preview ? 1 : 0, tally.program ? 1 : 0};
   omt_receive_settally(d_->rx, &t);

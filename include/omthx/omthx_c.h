@@ -111,6 +111,8 @@ OMTHX_C_API int omthx_c_receiver_audio(omthx_c_receiver* receiver, int timeout_m
                                        int* sample_rate, int* channels, int* samples_per_channel, int64_t* timestamp);
 OMTHX_C_API void omthx_c_receiver_tally(omthx_c_receiver* receiver, int preview, int program);
 OMTHX_C_API void omthx_c_receiver_keyframe(omthx_c_receiver* receiver);
+// 1: the preview picture, 0: the full one, without reconnecting.
+OMTHX_C_API void omthx_c_receiver_preview(omthx_c_receiver* receiver, int preview);
 // What the source is sending: OMTHX_C_MODE_* and OMTHX_C_CODEC_*.
 OMTHX_C_API int omthx_c_receiver_mode(omthx_c_receiver* receiver);
 OMTHX_C_API int omthx_c_receiver_codec(omthx_c_receiver* receiver);

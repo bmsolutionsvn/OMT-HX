@@ -394,6 +394,27 @@ TEST_CASE("probe names an HX source's codec") {
   CHECK(info.format == f);
 }
 
+TEST_CASE("an HX receiver switches between preview and full without reconnecting") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{1280, 720, 60, 1, false};
+  const VideoFormat small{640, 360, 60, 1, false};
+  Sender sender("omthx-test-preview-switch", Mode::Hx, Quality::Medium);
+  Receiver rx(sender.address(), PixelFormat::Bgra, true);
+  Pump pump(sender, f);
+  // The pictures of the old stream still queued may come first: wait for the new size.
+  auto until = [&](const VideoFormat& want) {
+    VideoFrame v;
+    for (const auto end = Clock::now() + std::chrono::seconds(3); Clock::now() < end;)
+      if (rx.receiveVideo(v, 50) && v.format == want) return true;
+    return false;
+  };
+  CHECK(until(small));
+  rx.setPreview(false);
+  CHECK(until(f));
+  rx.setPreview(true);
+  CHECK(until(small));
+}
+
 TEST_CASE("a preview receiver of an HX source gets the small stream, beside a full receiver") {
   if (!hardware(Codec::Hevc)) return;
   const VideoFormat f{1280, 720, 60, 1, true};

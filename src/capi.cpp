@@ -319,6 +319,15 @@ void omthx_c_receiver_tally(omthx_c_receiver* receiver, int preview, int program
   }
 }
 
+void omthx_c_receiver_preview(omthx_c_receiver* receiver, int preview) {
+  if (!receiver) return;
+  try {
+    receiver->receiver->setPreview(preview != 0);
+  } catch (const std::exception& e) {
+    fail(e);
+  }
+}
+
 void omthx_c_receiver_keyframe(omthx_c_receiver* receiver) {
   if (!receiver) return;
   try {

@@ -240,6 +240,9 @@ class OMTHX_API Receiver {
   bool receiveCoded(CodedFrame& out, int timeoutMs);
   bool receiveAudio(AudioFrame& out, int timeoutMs);
   void requestKeyframe();  // asks an Hx source for a keyframe, at most once per 200 ms
+  // Switches between the preview and the full picture without reconnecting, as a multiview tile going to program.
+  // An Hx stream restarts at its next keyframe, which the switch asks for. Coded receivers ignore it.
+  void setPreview(bool preview);
   void setTally(Tally tally);
   ReceiverStats stats();
 
