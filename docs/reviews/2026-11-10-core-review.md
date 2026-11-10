@@ -12,7 +12,7 @@ a reading of the code, not a reproduced failure.
 |---|---------|------|-------------|--------|
 | 1 | A failed encode leaves timestamps and frame numbers out of step (no-alpha path) | Bug | Small | Fixed on `fix/core-review-1-4`, uncommitted; no test (needs a failing encoder) |
 | 2 | The full stream is coded when every receiver is a preview receiver | Wasted work | Medium (touches the libomtnet fork) | Fixed: `omt_send_fullconnections`; the full encoder closes while only preview receivers watch |
-| 3 | A preview receiver forces a full-size readback of GPU pictures | Wasted work | Medium | Open |
+| 3 | A preview receiver forces a full-size readback of GPU pictures | Wasted work | Medium | Fixed, uncommitted: shrunk by the D3D11 video processor and coded in video memory; 4K send 9.5 to 5.5 ms on the RX 6600 |
 | 4 | `Packer` builds both converters, 8 swscale threads each | Wasted work | Small | Fixed on `fix/core-review-1-4`, uncommitted; full suite passed (98 test cases) |
 | 5 | One slow receiver forces keyframes for every receiver | Behaviour under load | Small (back-off) to large (bitrate) | Back-off done (200 ms doubling to 2 s, joins and app requests exempt), uncommitted; bitrate half open |
 | 6 | Software decode is single-threaded when a GPU exists but cannot decode the codec | Behaviour under load | Small to medium | Fallback to a software `Decoder` done, uncommitted; may not add threads, see note in section 6 |
@@ -57,6 +57,29 @@ on the GTX 1650, so one multiview viewer can take a 4K `sendVideoD3D11` or relay
 
 Fix: let the D3D11 video processor write a second, 640-wide NV12 target. It scales in the same blit, and
 only the small picture is read back, or it is coded where it is.
+
+Done (`fix/core-review-1-4`, uncommitted), coded where it is:
+
+- `GpuShrinker` (`src/d3d11.cpp`, declared in `src/codec.h`) scales the top-left fill of an NV12 D3D11 frame
+  (a decoder's array slice, or a `BgraToNv12` / `UyvyToNv12` frame) to the preview size into an NV12 frame
+  pool on the same FFmpeg device, so it takes that device's lock, the one the decoder and encoders take. It
+  reuses `VideoConverter`, which now takes an output size, an input array slice and an optional shared FFmpeg
+  device; it is rebuilt when the device or either size changes. Both sides are full-range BT.709 YCbCr.
+- `sendPreview` codes that frame with a GPU `Encoder` on the pool (reopened when the pool changes) and names
+  it `<encoder> (d3d11)` in the preview metadata. It works with no full encoder open (preview receivers
+  only). Any failure latches `previewGpuRefused`, sets `lastFallback` to `preview on the gpu: <reason>`, and
+  the frame and later ones take the old path (full readback, `Shrinker`, CPU-memory encoder). A failure there
+  still only stops the preview, as before. No middle path that reads back only the small picture: a GPU
+  whose encoder refuses D3D11 frames already has the picture in memory (`gpuRefused`).
+- Measured on the RX 6600 (hevc_amf), 3840x2160 `sendVideoD3D11` with one preview receiver and no full
+  receiver, 60 frames, three runs each: old path 9.2 to 9.7 ms per call (5 to 6 ms CPU), new path 5.4 to
+  5.7 ms (2.6 to 3.4 ms CPU; thread CPU times are coarse). Most of what remains is the encoder's wait for
+  its own packet. The RX 6600 reads back far faster than the GTX 1650's 30 ms, so the gain there should be
+  larger; not measured on the GTX 1650.
+- Tests (`tests/link_test.cpp`): "a 4K texture's preview is shrunk and coded in video memory" (preview size,
+  `(d3d11)` encoder, no fallback, mean colour error 0.64 of 255 against the gradient) and "a Gpu receiver's
+  pictures get their preview shrunk in video memory" (decoder array slices). The fallback path is not
+  exercised by a test: nothing on this PC makes the video processor or the GPU encoder refuse.
 
 ## 4. `Packer` builds both converters
 

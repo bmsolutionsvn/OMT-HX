@@ -73,11 +73,12 @@ RangeTable rangeTable(int offsetIn, int num, int den, int offsetOut) {
 const RangeTable kLumaToFull = rangeTable(16, 255, 219, 0);
 const RangeTable kChromaToFull = rangeTable(128, 255, 224, 128);
 
-// The video processor and the NV12 frame pool it writes, on one device at one size: what BgraToNv12 and
-// UyvyToNv12 share.
+// The video processor and the NV12 frame pool it writes, on one device, from one size to another (it scales in the
+// same blit): what BgraToNv12, UyvyToNv12 and GpuShrinker share.
 struct VideoConverter {
   ID3D11Device* device = nullptr;  // not owned: identifies the device the objects below belong to
-  int width = 0, height = 0;
+  int width = 0, height = 0;        // the picture read: the input's top-left corner
+  int outWidth = 0, outHeight = 0;  // the frames written
   bool rgbStream = false;  // the stream is full-range RGB, else full-range BT.709 YCbCr
   ComPtr<ID3D11VideoDevice> video;
   ComPtr<ID3D11VideoContext> context;
@@ -100,9 +101,12 @@ struct VideoConverter {
     device = nullptr;
   }
 
-  // The video processor and the NV12 frame pool for this device, size and stream colour, made once.
-  void setup(ID3D11Device* dev, int w, int h, bool rgb) {
-    if (dev == device && w == width && h == height && rgb == rgbStream) return;
+  // The video processor and the NV12 frame pool for this device, sizes and stream colour, made once. shared: the
+  // FFmpeg device of the input's frames, whose lock guards the context; null wraps `dev` in a device of its own.
+  void setup(ID3D11Device* dev, int w, int h, int ow, int oh, bool rgb, AVBufferRef* shared = nullptr) {
+    if (dev == device && w == width && h == height && ow == outWidth && oh == outHeight && rgb == rgbStream &&
+        (!shared || shared->data == hwDevice->data))
+      return;
     reset();
     check(dev->QueryInterface(IID_PPV_ARGS(&video)), "the device's video interface");
     ComPtr<ID3D11DeviceContext> immediate;
@@ -118,8 +122,8 @@ struct VideoConverter {
     content.InputWidth = static_cast<UINT>(w);
     content.InputHeight = static_cast<UINT>(h);
     content.OutputFrameRate = {60, 1};
-    content.OutputWidth = static_cast<UINT>(w);
-    content.OutputHeight = static_cast<UINT>(h);
+    content.OutputWidth = static_cast<UINT>(ow);
+    content.OutputHeight = static_cast<UINT>(oh);
     content.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
     check(video->CreateVideoProcessorEnumerator(&content, &enumerator), "CreateVideoProcessorEnumerator");
     check(video->CreateVideoProcessor(enumerator.Get(), 0, &processor), "CreateVideoProcessor");
@@ -141,24 +145,30 @@ struct VideoConverter {
     context->VideoProcessorSetStreamFrameFormat(processor.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
     context->VideoProcessorSetStreamAutoProcessingMode(processor.Get(), 0, FALSE);
     const RECT rect{0, 0, w, h};  // the texture may be larger: only its top-left corner is the picture
+    const RECT out{0, 0, ow, oh};
     context->VideoProcessorSetStreamSourceRect(processor.Get(), 0, TRUE, &rect);
-    context->VideoProcessorSetStreamDestRect(processor.Get(), 0, TRUE, &rect);
-    context->VideoProcessorSetOutputTargetRect(processor.Get(), TRUE, &rect);
+    context->VideoProcessorSetStreamDestRect(processor.Get(), 0, TRUE, &out);
+    context->VideoProcessorSetOutputTargetRect(processor.Get(), TRUE, &out);
 
-    hwDevice = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
-    if (!hwDevice) throw std::runtime_error("d3d11: cannot allocate the device context");
-    auto* hw = static_cast<AVD3D11VADeviceContext*>(reinterpret_cast<AVHWDeviceContext*>(hwDevice->data)->hwctx);
-    dev->AddRef();  // FFmpeg releases it with the context
-    hw->device = dev;
-    if (av_hwdevice_ctx_init(hwDevice) < 0) throw std::runtime_error("d3d11: cannot wrap the device for FFmpeg");
+    if (shared) {
+      hwDevice = av_buffer_ref(shared);
+      if (!hwDevice) throw std::runtime_error("d3d11: cannot hold the frames' device");
+    } else {
+      hwDevice = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
+      if (!hwDevice) throw std::runtime_error("d3d11: cannot allocate the device context");
+      auto* hw = static_cast<AVD3D11VADeviceContext*>(reinterpret_cast<AVHWDeviceContext*>(hwDevice->data)->hwctx);
+      dev->AddRef();  // FFmpeg releases it with the context
+      hw->device = dev;
+      if (av_hwdevice_ctx_init(hwDevice) < 0) throw std::runtime_error("d3d11: cannot wrap the device for FFmpeg");
+    }
 
     frames = av_hwframe_ctx_alloc(hwDevice);
     if (!frames) throw std::runtime_error("d3d11: cannot allocate the frame pool");
     auto* fc = reinterpret_cast<AVHWFramesContext*>(frames->data);
     fc->format = AV_PIX_FMT_D3D11;
     fc->sw_format = AV_PIX_FMT_NV12;
-    fc->width = w;
-    fc->height = h;
+    fc->width = ow;
+    fc->height = oh;
     // No initial pool: FFmpeg would make it one texture array, and NV12 render targets cannot be arrays. Single
     // textures are made as the encoder asks and reused through FFmpeg's buffer pool.
     fc->initial_pool_size = 0;
@@ -168,6 +178,8 @@ struct VideoConverter {
     device = dev;
     width = w;
     height = h;
+    outWidth = ow;
+    outHeight = oh;
     rgbStream = rgb;
   }
 
@@ -181,14 +193,15 @@ struct VideoConverter {
     checked = format;
   }
 
-  // The top-left corner set up as the picture, as a new NV12 frame in `out`.
-  void blt(ID3D11Texture2D* texture, AVFrame* out) {
+  // The top-left corner set up as the picture, of the texture or of its array slice, as a new NV12 frame in `out`.
+  void blt(ID3D11Texture2D* texture, AVFrame* out, UINT inSlice = 0) {
     if (av_hwframe_get_buffer(frames, out, 0) < 0) throw std::runtime_error("d3d11: no free NV12 frame in the pool");
     auto* nv12 = reinterpret_cast<ID3D11Texture2D*>(out->data[0]);
     const UINT slice = static_cast<UINT>(reinterpret_cast<intptr_t>(out->data[1]));
 
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC in = {};
     in.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    in.Texture2D.ArraySlice = inSlice;  // a decoder's surfaces are one texture array
     ComPtr<ID3D11VideoProcessorInputView> inView;
     check(video->CreateVideoProcessorInputView(texture, enumerator.Get(), &in, &inView), "the input view");
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC o = {};
@@ -218,7 +231,7 @@ struct BgraToNv12::Impl : VideoConverter {
       throw std::invalid_argument("the texture must be BGRA or RGBA and at least the picture's size");
     ComPtr<ID3D11Device> dev;
     texture->GetDevice(&dev);
-    setup(dev.Get(), w, h, true);
+    setup(dev.Get(), w, h, w, h, true);
     checkInputFormat(desc.Format);
     blt(texture, out);
   }
@@ -296,7 +309,7 @@ struct UyvyToNv12::Impl {
     }
     context->Unmap(upload.Get(), 0);
     context->CopyResource(yuy2.Get(), upload.Get());
-    converter.setup(device.Get(), w, h, false);
+    converter.setup(device.Get(), w, h, w, h, false);
     converter.checkInputFormat(DXGI_FORMAT_YUY2);
     converter.blt(yuy2.Get(), out);
   }
@@ -308,6 +321,25 @@ UyvyToNv12::~UyvyToNv12() = default;
 void UyvyToNv12::convert(const uint8_t* uyvy, int stride, int width, int height, GpuPicture& out) {
   av_frame_unref(out.frame);
   d_->convert(uyvy, stride, width, height, out.frame);
+}
+
+// ---------------------------------------------------------------- GpuShrinker
+
+struct GpuShrinker::Impl : VideoConverter {};
+
+GpuShrinker::GpuShrinker() : d_(std::make_unique<Impl>()) {}
+GpuShrinker::~GpuShrinker() = default;
+
+void GpuShrinker::shrink(const AVFrame* in, int width, int height, int outWidth, int outHeight, GpuPicture& out) {
+  if (!Readback::accepts(in)) throw std::runtime_error("the picture is not an NV12 frame in video memory");
+  auto* fc = reinterpret_cast<AVHWFramesContext*>(in->hw_frames_ctx->data);
+  auto* hw = static_cast<AVD3D11VADeviceContext*>(fc->device_ctx->hwctx);
+  av_frame_unref(out.frame);
+  // Both sides full-range BT.709 YCbCr, so the scale leaves the range alone.
+  d_->setup(hw->device, width, height, outWidth, outHeight, false, fc->device_ref);
+  d_->checkInputFormat(DXGI_FORMAT_NV12);
+  d_->blt(reinterpret_cast<ID3D11Texture2D*>(in->data[0]), out.frame,
+          static_cast<UINT>(reinterpret_cast<intptr_t>(in->data[1])));
 }
 
 // ---------------------------------------------------------------- Readback
@@ -609,6 +641,12 @@ struct UyvyToNv12::Impl {};
 UyvyToNv12::UyvyToNv12() = default;
 UyvyToNv12::~UyvyToNv12() = default;
 void UyvyToNv12::convert(const uint8_t*, int, int, int, GpuPicture&) {
+  throw std::runtime_error("D3D11 textures are Windows only");
+}
+struct GpuShrinker::Impl {};
+GpuShrinker::GpuShrinker() = default;
+GpuShrinker::~GpuShrinker() = default;
+void GpuShrinker::shrink(const AVFrame*, int, int, int, int, GpuPicture&) {
   throw std::runtime_error("D3D11 textures are Windows only");
 }
 struct Readback::Impl {};

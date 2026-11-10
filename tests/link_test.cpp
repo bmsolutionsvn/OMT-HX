@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <map>
 #include <memory>
@@ -944,6 +945,100 @@ TEST_CASE("sendVideoD3D11 takes an RGBA texture") {
   CHECK(red[0] < 20);  // red, so BT.709 full range on both sides, and no green from outside the picture
   CHECK(red[1] < 20);
   CHECK(red[2] > 235);
+}
+
+TEST_CASE("a 4K texture's preview is shrunk and coded in video memory") {
+  if (!hardware(Codec::Hevc)) return;
+  Microsoft::WRL::ComPtr<ID3D11Device> device;
+  const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+  REQUIRE(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                      levels, 2, D3D11_SDK_VERSION, &device, nullptr, nullptr)));
+  // Blue rises across, green down, red stays 128: shrunk, each preview pixel keeps the colour of its place.
+  const VideoFormat f{3840, 2160, 60, 1, false};
+  std::vector<uint8_t> bgra(static_cast<size_t>(f.width) * f.height * 4);
+  for (int r = 0; r < f.height; ++r)
+    for (int x = 0; x < f.width; ++x) {
+      uint8_t* p = &bgra[(static_cast<size_t>(r) * f.width + x) * 4];
+      p[0] = static_cast<uint8_t>(x * 255 / (f.width - 1));
+      p[1] = static_cast<uint8_t>(r * 255 / (f.height - 1));
+      p[2] = 128;
+      p[3] = 255;
+    }
+  D3D11_TEXTURE2D_DESC desc = {};
+  desc.Width = f.width;
+  desc.Height = f.height;
+  desc.MipLevels = desc.ArraySize = 1;
+  desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+  const D3D11_SUBRESOURCE_DATA init{bgra.data(), static_cast<UINT>(f.width * 4), 0};
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+  REQUIRE(SUCCEEDED(device->CreateTexture2D(&desc, &init, &texture)));
+
+  Sender sender("omthx-test-d3d11-preview", Mode::Hx, Quality::Medium);
+  Receiver viewer(sender.address(), PixelFormat::Bgra, true);  // the only receiver: no full stream is coded
+  VideoFrame frame;
+  int i = 0;
+  double sendMs = 0, cpuMs = 0;
+  const auto cpuNow = [] {  // this thread's CPU time, ms
+    FILETIME c{}, e{}, k{}, u{};
+    GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u);
+    return static_cast<double>((static_cast<uint64_t>(k.dwHighDateTime) << 32 | k.dwLowDateTime) +
+                               (static_cast<uint64_t>(u.dwHighDateTime) << 32 | u.dwLowDateTime)) / 10'000.0;
+  };
+  // Sends at 60 fps until `wanted` pictures arrive; returns how many did.
+  auto pump = [&](int wanted, int frames) {
+    int got = 0;
+    sendMs = cpuMs = 0;
+    auto next = Clock::now();
+    for (int n = 0; n < frames && got < wanted; ++n, ++i) {
+      const auto t0 = Clock::now();
+      const double c0 = cpuNow();
+      sender.sendVideoD3D11(f, texture.Get(), 1'000'000 + i * kFrame);
+      cpuMs += cpuNow() - c0;
+      sendMs += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+      if (viewer.receiveVideo(frame, 0)) ++got;
+      next += std::chrono::microseconds(16'667);
+      std::this_thread::sleep_until(next);
+    }
+    return got;
+  };
+  REQUIRE(pump(30, 600) == 30);  // settled: the preview request has arrived and the encoders are open
+  REQUIRE(pump(60, 60) > 30);
+  MESSAGE("3840x2160 with one preview receiver: " << sendMs / 60 << " ms per sendVideoD3D11 (" << cpuMs / 60
+                                                  << " ms CPU), preview coded by " << viewer.stats().encoder);
+  CHECK(frame.format == VideoFormat{640, 360, 60, 1, false});
+  CHECK(viewer.stats().encoder.find("(d3d11)") != std::string::npos);  // no full-size copy to memory
+  CHECK(sender.stats().lastFallback.empty());
+  double error = 0;
+  for (int r = 0; r < 360; ++r)
+    for (int x = 0; x < 640; ++x) {
+      const uint8_t* p = &frame.bgra[(static_cast<size_t>(r) * 640 + x) * 4];
+      error += std::abs(p[0] - (x + 0.5) * 255 / 640) + std::abs(p[1] - (r + 0.5) * 255 / 360) + std::abs(p[2] - 128);
+    }
+  error /= 640.0 * 360 * 3;
+  MESSAGE("mean colour error " << error << " (0 to 255)");
+  CHECK(error < 6);
+}
+
+TEST_CASE("a Gpu receiver's pictures get their preview shrunk in video memory") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{1280, 720, 60, 1, false};
+  Sender source("omthx-test-gpu-preview-in", Mode::Hx, Quality::Medium);
+  Receiver gpu(source.address(), PixelFormat::Gpu);
+  Sender recoded("omthx-test-gpu-preview-out", Mode::Hx, Quality::Medium);
+  Receiver viewer(recoded.address(), PixelFormat::Bgra, true);
+  Pump pump(source, f);
+  VideoFrame frame, out;
+  const auto relay = [&] {
+    if (gpu.receiveVideo(frame, 20)) recoded.sendVideo(frame);
+  };
+  REQUIRE(relayed(relay, viewer, out, 30) == 30);  // settled
+  REQUIRE(relayed(relay, viewer, out, 10) == 10);
+  CHECK(out.format == VideoFormat{640, 360, 60, 1, false});
+  MESSAGE("preview coded by " << viewer.stats().encoder);
+  CHECK(viewer.stats().encoder.find("(d3d11)") != std::string::npos);  // the decoder's surfaces, shrunk on the GPU
+  CHECK(recoded.stats().lastFallback.empty());
 }
 
 namespace {

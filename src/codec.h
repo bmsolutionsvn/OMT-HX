@@ -320,6 +320,23 @@ class UyvyToNv12 {
   std::unique_ptr<Impl> d_;
 };
 
+// Scales the top-left width x height of an NV12 frame in video memory (decoded, or made by BgraToNv12 or
+// UyvyToNv12) to an outWidth x outHeight NV12 frame from a pool on the same device, with that device's video
+// processor (src/d3d11.cpp): the preview of a GPU picture without copying the full picture to memory. The
+// GpuPicture owns the frame. Throws std::runtime_error when the device cannot; elsewhere than Windows, always.
+class GpuShrinker {
+ public:
+  GpuShrinker();
+  ~GpuShrinker();
+  GpuShrinker(const GpuShrinker&) = delete;
+  GpuShrinker& operator=(const GpuShrinker&) = delete;
+  void shrink(const AVFrame* in, int width, int height, int outWidth, int outHeight, GpuPicture& out);
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> d_;
+};
+
 // Brings decoded D3D11 pictures to memory without waiting on each copy (src/d3d11.cpp). push queues a picture's
 // copy to a staging texture, converted to BGRA on the GPU when asked. take hands pictures out in order, none
 // skipped: a picture whose copy finishes within half a frame goes out at once (a fast GPU: no added delay), one

@@ -142,6 +142,12 @@ struct Sender::Impl {
   KeyframePolicy previewPolicy;
   Shrinker shrinker;
   Nv12 small, gpuCopy;
+  // A GPU picture's preview is shrunk and coded in video memory: copying a 4K picture to memory to shrink it took
+  // about 30 ms on a GTX 1650. Once that fails (previewGpuRefused, latched), the picture is copied whole after all.
+  std::unique_ptr<GpuShrinker> gpuShrinker;
+  GpuPicture smallGpu;
+  const void* previewKey = nullptr;  // the frames context the preview encoder takes pictures from, or null
+  bool previewGpuRefused = false;
   std::unique_ptr<BgraToNv12> bgraToNv12;  // sendVideoD3D11, made on first use
   std::unique_ptr<UyvyToNv12> uyvyToNv12;  // sendVideoUyvy, made on first use
   std::deque<int64_t> previewStamps;
@@ -389,19 +395,43 @@ void Sender::Impl::sendPreview(const VideoFormat& fmt, int64_t timestamp, int64_
     return;
   }
   const VideoFormat pf = previewFormat(fmt);
+  // The preview encoder for this source, taking pictures from `frames` (null: from memory).
+  auto open = [&](AVBufferRef* frames) {
+    const void* key = frames ? frames->data : nullptr;
+    if (previewEncoder && fmt == previewSource && key == previewKey) return;
+    previewEncoder.reset();
+    previewStamps.clear();
+    previewEncoder = std::make_unique<Encoder>(codec, pf.width, pf.height, pf.fpsN, pf.fpsD,
+                                               targetBitrate(pf, quality, codec), frames);
+    previewSource = fmt;
+    previewKey = key;
+    previewPolicy = KeyframePolicy();
+  };
   try {
-    if (!previewEncoder || !(fmt == previewSource)) {
-      previewEncoder.reset();
-      previewStamps.clear();
-      previewEncoder = std::make_unique<Encoder>(codec, pf.width, pf.height, pf.fpsN, pf.fpsD,
-                                                 targetBitrate(pf, quality, codec));
-      previewSource = fmt;
-      previewPolicy = KeyframePolicy();
+    std::vector<Packet> packets;
+    bool onGpu = gpu && !previewGpuRefused && Readback::accepts(gpu);
+    if (onGpu) {
+      try {
+        if (!gpuShrinker) gpuShrinker = std::make_unique<GpuShrinker>();
+        gpuShrinker->shrink(gpu, fmt.width, fmt.height, pf.width, pf.height, smallGpu);
+        open(smallGpu.frame->hw_frames_ctx);
+        packets = previewEncoder->encodeGpu(smallGpu.frame, previewPolicy.next(nowMs, dropped, requested, urgent));
+      } catch (const std::exception& e) {
+        previewGpuRefused = true;  // ponytail: no retry, as the other latches
+        onGpu = false;
+        gpuShrinker.reset();
+        previewEncoder.reset();  // the next one starts with a keyframe
+        fellBack("preview on the gpu", e.what());
+      }
     }
-    if (gpu && !downloadNv12(gpu, gpuCopy)) throw std::runtime_error("cannot copy the picture from video memory");
-    shrinker.shrink(gpu ? gpuCopy : picture, fmt.width, fmt.height, pf.width, pf.height, small);
-    std::vector<Packet> packets = previewEncoder->encode(small, previewPolicy.next(nowMs, dropped, requested, urgent));
+    if (!onGpu) {
+      open(nullptr);
+      if (gpu && !downloadNv12(gpu, gpuCopy)) throw std::runtime_error("cannot copy the picture from video memory");
+      shrinker.shrink(gpu ? gpuCopy : picture, fmt.width, fmt.height, pf.width, pf.height, small);
+      packets = previewEncoder->encode(small, previewPolicy.next(nowMs, dropped, requested, urgent));
+    }
     previewStamps.push_back(timestamp);
+    const std::string encoderName = previewEncoder->name() + (onGpu ? " (d3d11)" : "");
     // Like a VMX preview, the frame carries the source's size and flags with Preview set (libomt routes by it):
     // a probe reads the source from it. The receiver takes the picture's size from the decoder, without alpha.
     OMTMediaFrame f = videoHeader(fmt, 0);
@@ -415,7 +445,7 @@ void Sender::Impl::sendPreview(const VideoFormat& fmt, int64_t timestamp, int64_
       previewStamps.pop_front();
       f.Data = p.data.data();
       f.DataLength = static_cast<int>(p.data.size());
-      previewMeta = seqMetadata(n, {}, true, previewEncoder->name());
+      previewMeta = seqMetadata(n, {}, true, encoderName);
       f.FrameMetadata = previewMeta.data();
       f.FrameMetadataLength = static_cast<int>(previewMeta.size() + 1);
       omt_send(tx, &f);
