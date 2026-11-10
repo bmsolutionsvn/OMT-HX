@@ -63,6 +63,9 @@ struct SenderStats {
   uint64_t framesIdle = 0;
   // The latest path this sender gave up on and why, e.g. "d3d11 encode: <reason>"; empty when none (kept last).
   std::string lastFallback;
+  // Hx only: the full stream's bitrate as a percentage of the one asked for, lowered while receivers keep dropping
+  // frames and raised again once they stop. 100 when at full rate (kept last).
+  int bitratePercent = 100;
 };
 
 // What a Receiver hands back.
