@@ -370,6 +370,7 @@ struct Readback::Impl {
   ComPtr<ID3D11VideoProcessor> processor;
   ComPtr<ID3D11Texture2D> target;  // the processor's BGRA output, copied to a slot's staging texture
   int vpWidth = 0, vpHeight = 0;
+  bool vpFullRange = true;  // the range the processor was made for
 
   ~Impl() {
     detach();
@@ -384,6 +385,7 @@ struct Readback::Impl {
     vcontext.Reset();
     video.Reset();
     vpWidth = vpHeight = 0;
+    vpFullRange = true;
     hw = nullptr;
     av_buffer_unref(&deviceRef);
   }
@@ -421,10 +423,10 @@ struct Readback::Impl {
     s.format = format;
   }
 
-  // The video processor for NV12 -> BGRA at this size, full-range BT.709 in (as the encoder signals), full-range
-  // RGB out: what Packer::unpack makes on the CPU.
-  void ensureProcessor(int w, int h) {
-    if (processor && w == vpWidth && h == vpHeight) return;
+  // The video processor for NV12 -> BGRA at this size, in the source picture's range (a phone's stream is studio
+  // range, ours full range), full-range RGB out: what Packer::unpack makes on the CPU.
+  void ensureProcessor(int w, int h, bool fullRange) {
+    if (processor && w == vpWidth && h == vpHeight && fullRange == vpFullRange) return;
     processor.Reset();
     enumerator.Reset();
     target.Reset();
@@ -449,12 +451,15 @@ struct Readback::Impl {
     check(video->CreateVideoProcessor(enumerator.Get(), 0, &processor), "CreateVideoProcessor");
     ComPtr<ID3D11VideoContext1> context1;
     if (SUCCEEDED(vcontext.As(&context1))) {
-      context1->VideoProcessorSetStreamColorSpace1(processor.Get(), 0, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709);
+      context1->VideoProcessorSetStreamColorSpace1(
+          processor.Get(), 0, fullRange ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709
+                                        : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
       context1->VideoProcessorSetOutputColorSpace1(processor.Get(), DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
     } else {
       D3D11_VIDEO_PROCESSOR_COLOR_SPACE cs = {};
       cs.YCbCr_Matrix = 1;  // BT.709
-      cs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
+      cs.Nominal_Range = fullRange ? D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255
+                                   : D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
       vcontext->VideoProcessorSetStreamColorSpace(processor.Get(), 0, &cs);
       vcontext->VideoProcessorSetOutputColorSpace(processor.Get(), &cs);
     }
@@ -474,6 +479,7 @@ struct Readback::Impl {
     check(hw->device->CreateTexture2D(&d, nullptr, &target), "the BGRA texture");
     vpWidth = w;
     vpHeight = h;
+    vpFullRange = fullRange;
   }
 
   Slot& freeSlot() {
@@ -494,9 +500,10 @@ struct Readback::Impl {
     D3D11_TEXTURE2D_DESC desc;
     texture->GetDesc(&desc);
     const int w = frame->width, h = frame->height;
+    const bool fullRange = isFullRange(frame);
     Slot& s = freeSlot();
     if (bgra) {
-      ensureProcessor(w, h);
+      ensureProcessor(w, h, fullRange);
       ensureStaging(s, static_cast<UINT>(w), static_cast<UINT>(h), DXGI_FORMAT_B8G8R8A8_UNORM);
       D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC in = {};
       in.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
@@ -525,7 +532,7 @@ struct Readback::Impl {
     s.order = ++next;
     s.width = w;
     s.height = h;
-    s.picture = Picture{format, timestamp, bgra, started};
+    s.picture = Picture{format, timestamp, bgra, fullRange, started};
     s.queued = std::chrono::steady_clock::now();
   }
 
@@ -584,6 +591,7 @@ struct Readback::Impl {
     } else {
       nv12.width = w;
       nv12.height = h;
+      nv12.fullRange = pick->picture.fullRange;
       nv12.y.resize(static_cast<size_t>(w) * h);
       nv12.uv.resize(static_cast<size_t>(w) * h / 2);
       const uint8_t* uv = p + static_cast<size_t>(m.RowPitch) * pick->planeRows;

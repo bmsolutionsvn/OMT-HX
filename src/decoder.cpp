@@ -145,6 +145,8 @@ Decoded Decoder::decode(std::span<const uint8_t> au, int64_t timestamp, Nv12& ou
   return ok ? Decoded::Picture : Decoded::Error;
 }
 
+bool isFullRange(const AVFrame* frame) { return frame && frame->color_range == AVCOL_RANGE_JPEG; }
+
 bool downloadNv12(const AVFrame* frame, Nv12& out) {
   AVFrame* sw = nullptr;
   const AVFrame* f = frame;
@@ -178,6 +180,7 @@ bool downloadNv12(const AVFrame* frame, Nv12& out) {
           copyPlane(out.uv.data(), sw->data[1], sw->linesize[1], w, h / 2);
         }
       }
+      out.fullRange = isFullRange(frame);  // the decoder frame's VUI: the transfer leaves a borrowed frame's range unset
       av_frame_free(&sw);
       return ok;
     }
@@ -212,6 +215,7 @@ bool downloadNv12(const AVFrame* frame, Nv12& out) {
       }
     }
   }
+  out.fullRange = isFullRange(f);
   av_frame_free(&sw);
   return ok;
 }
@@ -220,6 +224,11 @@ bool download(VideoFrame& frame, PixelFormat pixels) {
   if (!frame.gpu || (pixels != PixelFormat::Bgra && pixels != PixelFormat::Uyvy)) return false;
   Nv12 picture;
   if (!downloadNv12(frame.gpu->frame, picture)) return false;
+  Nv12 stretched;
+  if (!frame.fullRange) {  // the picture holds limited-range values: stretch once, before either conversion
+    copyNv12(frame.format, picture.y.data(), picture.width, picture.uv.data(), picture.width, false, stretched);
+    picture = std::move(stretched);
+  }
   const std::vector<uint8_t>* alpha = frame.gpu->alpha.get();
   if (alpha && alpha->size() != static_cast<size_t>(frame.format.width) * frame.format.height) return false;
   try {

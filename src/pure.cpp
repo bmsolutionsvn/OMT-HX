@@ -234,7 +234,7 @@ namespace {
 constexpr int kThreads = 8;  // bands of rows for the CPU passes, and swscale's slice threads
 
 // ponytail: swscale's own slice threads halve the 1080p BGRA <-> NV12 pass (measured 7.1 to 2.7 ms, 8 threads).
-SwsContext* makeConverter(int w, int h, AVPixelFormat from, AVPixelFormat to) {
+SwsContext* makeConverter(int w, int h, AVPixelFormat from, AVPixelFormat to, bool srcFullRange) {
   SwsContext* c = sws_alloc_context();
   if (!c) throw std::runtime_error("cannot create the colour converter");
   av_opt_set_int(c, "srcw", w, 0);
@@ -245,14 +245,14 @@ SwsContext* makeConverter(int w, int h, AVPixelFormat from, AVPixelFormat to) {
   av_opt_set_int(c, "dst_format", to, 0);
   av_opt_set_int(c, "sws_flags", SWS_BILINEAR, 0);
   av_opt_set_int(c, "threads", kThreads, 0);
-  av_opt_set_int(c, "src_range", 1, 0);  // full range on both sides
+  av_opt_set_int(c, "src_range", srcFullRange ? 1 : 0, 0);  // full range out, so only the source's varies
   av_opt_set_int(c, "dst_range", 1, 0);
   if (sws_init_context(c, nullptr, nullptr) < 0) {
     sws_freeContext(c);
     throw std::runtime_error("cannot create the colour converter");
   }
   const int* bt709 = sws_getCoefficients(SWS_CS_ITU709);
-  sws_setColorspaceDetails(c, bt709, 1, bt709, 1, 0, 1 << 16, 1 << 16);
+  sws_setColorspaceDetails(c, bt709, srcFullRange ? 1 : 0, bt709, 1, 0, 1 << 16, 1 << 16);
   return c;
 }
 
@@ -261,7 +261,7 @@ void borrowed(void*, uint8_t*) {}  // the buffer belongs to the caller
 // sws_scale_frame, not sws_scale: only the frame call uses the slice threads. The frames borrow the buffers
 // through references that free nothing; a destination without references would get buffers of its own.
 void convert(SwsContext* c, int w, int h, AVPixelFormat from, uint8_t* const src[2], const int srcStride[2],
-             AVPixelFormat to, uint8_t* const dst[2], const int dstStride[2]) {
+             AVPixelFormat to, uint8_t* const dst[2], const int dstStride[2], bool srcFullRange) {
   AVFrame* in = av_frame_alloc();
   AVFrame* out = av_frame_alloc();
   auto borrow = [&](AVFrame* f, AVPixelFormat format, uint8_t* const data[2], const int stride[2]) {
@@ -277,6 +277,7 @@ void convert(SwsContext* c, int w, int h, AVPixelFormat from, uint8_t* const src
     }
   };
   borrow(in, from, src, srcStride);
+  in->color_range = srcFullRange ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
   borrow(out, to, dst, dstStride);
   const bool wrapped = in->buf[0] && out->buf[0] && (!dst[1] || out->buf[1]) && (!src[1] || in->buf[1]);
   const int rc = wrapped ? sws_scale_frame(c, out, in) : AVERROR(ENOMEM);
@@ -408,6 +409,7 @@ void copyNv12(const VideoFormat& f, const uint8_t* y, int yStride, const uint8_t
   const int w = f.width, h = f.height;
   out.width = w;
   out.height = h;
+  out.fullRange = true;
   out.y.resize(static_cast<size_t>(w) * h);
   out.uv.resize(static_cast<size_t>(w) * h / 2);
   const Table& kLuma = kLumaToFull;
@@ -470,15 +472,16 @@ Packer::~Packer() {
 
 // Builds only the converter this call needs, and only again when its size changes. A sender never unpacks and
 // a receiver never packs, so the other direction's threads are never started.
-void Packer::ensure(bool toNv12, int w, int h) {
+void Packer::ensure(bool toNv12, int w, int h, bool fullRange) {
   SwsContext*& c = toNv12 ? toNv12_ : toBgra_;
   int* size = toNv12 ? nv12Size_ : bgraSize_;
-  if (c && w == size[0] && h == size[1]) return;
+  if (c && w == size[0] && h == size[1] && (toNv12 || fullRange == bgraFullRange_)) return;
   sws_freeContext(c);
   c = nullptr;  // a throw below leaves no context behind, so the next call tries again
   size[0] = size[1] = 0;
-  c = toNv12 ? makeConverter(w, h, AV_PIX_FMT_BGRA, AV_PIX_FMT_NV12)
-             : makeConverter(w, h, AV_PIX_FMT_NV12, AV_PIX_FMT_BGRA);
+  c = toNv12 ? makeConverter(w, h, AV_PIX_FMT_BGRA, AV_PIX_FMT_NV12, true)
+             : makeConverter(w, h, AV_PIX_FMT_NV12, AV_PIX_FMT_BGRA, fullRange);
+  bgraFullRange_ = fullRange;
   size[0] = w;
   size[1] = h;
 }
@@ -525,7 +528,7 @@ void Packer::pack(const VideoFormat& f, std::span<const uint8_t> bgra, bool prem
   const int srcStride[2] = {w * 4, 0};
   uint8_t* const dstPlanes[2] = {out.y.data(), out.uv.data()};
   const int dstStride[2] = {w, w};
-  convert(toNv12_, w, h, AV_PIX_FMT_BGRA, srcPlanes, srcStride, AV_PIX_FMT_NV12, dstPlanes, dstStride);
+  convert(toNv12_, w, h, AV_PIX_FMT_BGRA, srcPlanes, srcStride, AV_PIX_FMT_NV12, dstPlanes, dstStride, true);
   if (f.alpha && alphaOut) {
     separateAlpha(f, src + 3, static_cast<size_t>(w) * 4, 4, *alphaOut);
   } else if (f.alpha) {
@@ -537,13 +540,13 @@ void Packer::unpack(const VideoFormat& f, const Nv12& in, std::vector<uint8_t>& 
   checkSize(f);
   const int w = f.width, h = f.height;
   const uint8_t* a = checkPictures(f, in, alpha);
-  ensure(false, w, h);
+  ensure(false, w, h, in.fullRange);
   bgra.resize(static_cast<size_t>(w) * h * 4);
   uint8_t* const srcPlanes[2] = {const_cast<uint8_t*>(in.y.data()), const_cast<uint8_t*>(in.uv.data())};
   const int srcStride[2] = {w, w};
   uint8_t* const dstPlanes[2] = {bgra.data(), nullptr};
   const int dstStride[2] = {w * 4, 0};
-  convert(toBgra_, w, h, AV_PIX_FMT_NV12, srcPlanes, srcStride, AV_PIX_FMT_BGRA, dstPlanes, dstStride);
+  convert(toBgra_, w, h, AV_PIX_FMT_NV12, srcPlanes, srcStride, AV_PIX_FMT_BGRA, dstPlanes, dstStride, in.fullRange);
   if (!f.alpha) return;  // the converter wrote alpha 255
   for (size_t i = 0, n = static_cast<size_t>(w) * h; i < n; ++i) bgra[i * 4 + 3] = a[i];
 }
@@ -557,6 +560,7 @@ void packUyvy(const VideoFormat& f, const uint8_t* uyvy, int stride, const uint8
   if (!uyvy || stride < w * 2 || (f.alpha && (!alpha || alphaStride < w)))
     throw std::invalid_argument("uyvy needs a stride of at least width * 2, and alpha a plane of at least width");
   sizeFor(f, !alphaOut, out);
+  out.fullRange = true;
   const bool multiply = f.alpha && !premultiplied;
   // Row pair r: luma rows 2r and 2r + 1, and chroma row r, the mean of the two input rows' chroma (4:2:2 to
   // 4:2:0), each premultiplied by the mean alpha of the two pixels it covers.

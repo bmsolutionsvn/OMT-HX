@@ -148,6 +148,9 @@ struct Nv12 {
   int height = 0;
   std::vector<uint8_t> y;   // width * height
   std::vector<uint8_t> uv;  // width * height / 2, U and V interleaved
+  // False when the planes hold limited-range values (luma 16-235), as a phone's HX stream decodes to. A picture
+  // omthx makes for an app is full range.
+  bool fullRange = true;
 };
 
 // A decoded picture handed to an Nv12 receiver must match its frame header: even, and wide and tall enough,
@@ -180,14 +183,16 @@ class Packer {
   void pack(const VideoFormat& format, std::span<const uint8_t> bgra, bool premultiplied, Nv12& out,
             std::vector<uint8_t>* alphaOut = nullptr);
   void unpack(const VideoFormat& format, const Nv12& in, std::vector<uint8_t>& bgra,
-              const uint8_t* alpha = nullptr);  // premultiplied when alpha
+              const uint8_t* alpha = nullptr);  // premultiplied when alpha; a limited-range picture is stretched
 
  private:
-  void ensure(bool toNv12, int width, int height);  // the converter for one direction, rebuilt on a size change
+  void ensure(bool toNv12, int width, int height,
+              bool fullRange = true);  // the converter for one direction, rebuilt on a size or range change
   SwsContext* toNv12_ = nullptr;
   SwsContext* toBgra_ = nullptr;
   int nv12Size_[2] = {};  // width and height of toNv12_
   int bgraSize_[2] = {};  // width and height of toBgra_
+  bool bgraFullRange_ = true;  // the range toBgra_ was made for
   std::vector<uint8_t> scratch_;
 };
 
@@ -218,8 +223,10 @@ struct Packet {
 class Encoder {
  public:
   // gpuFrames: null for NV12 pictures in memory; else a D3D11 frames context, whose pictures encode() then takes
-  // with encodeGpu. Throws std::runtime_error when no hardware encoder of this codec opens.
-  Encoder(Codec codec, int width, int height, int fpsN, int fpsD, int64_t bitrate, AVBufferRef* gpuFrames = nullptr);
+  // with encodeGpu. fullRange: the range the stream signals; false codes limited range, for tests of a phone's
+  // stream. Throws std::runtime_error when no hardware encoder of this codec opens.
+  Encoder(Codec codec, int width, int height, int fpsN, int fpsD, int64_t bitrate, AVBufferRef* gpuFrames = nullptr,
+          bool fullRange = true);
   ~Encoder();
   Encoder(const Encoder&) = delete;
   Encoder& operator=(const Encoder&) = delete;
@@ -245,6 +252,7 @@ class Encoder {
   int64_t owed_ = 0;         // pictures sent whose packet has not come out yet
   int64_t frameUs_ = 16'667;  // one frame time: encode waits half of it for its own packet
   bool planar_ = false;      // libx265 takes YUV420P: NV12's chroma is split before encode
+  bool fullRange_ = true;    // the range the stream signals
   std::vector<uint8_t> u_, v_;
   void* timer_ = nullptr;     // a high-resolution waitable timer for the short waits
 };
@@ -315,6 +323,9 @@ class Decoder {
 // A decoded frame, from video or system memory, copied into an NV12 picture. False for a frame omthx cannot
 // read (10-bit, 4:2:2, odd sizes) or a failed copy from video memory.
 bool downloadNv12(const AVFrame* frame, Nv12& out);
+
+// A decoded picture's range: full only when the stream says so. H.264 and HEVC define unspecified as limited.
+bool isFullRange(const AVFrame* frame);
 
 // What a Gpu receiver hands out: a reference to one decoded frame, freed with the last copy of the pointer.
 struct GpuPicture {
@@ -391,6 +402,7 @@ class Readback {
     VideoFormat format;
     int64_t timestamp = 0;
     bool bgra = false;  // true: the picture is in take's bgra, else in its nv12
+    bool fullRange = true;  // the source picture's range; a bgra picture is always full range
     std::chrono::steady_clock::time_point started{};  // when its decode began, for the decode time
   };
   Readback();
