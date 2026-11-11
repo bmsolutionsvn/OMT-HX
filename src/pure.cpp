@@ -560,6 +560,7 @@ void packUyvy(const VideoFormat& f, const uint8_t* uyvy, int stride, const uint8
   if (!uyvy || stride < w * 2 || (f.alpha && (!alpha || alphaStride < w)))
     throw std::invalid_argument("uyvy needs a stride of at least width * 2, and alpha a plane of at least width");
   sizeFor(f, !alphaOut, out);
+  out.fullRange = true;
   const bool multiply = f.alpha && !premultiplied;
   // Row pair r: luma rows 2r and 2r + 1, and chroma row r, the mean of the two input rows' chroma (4:2:2 to
   // 4:2:0), each premultiplied by the mean alpha of the two pixels it covers.

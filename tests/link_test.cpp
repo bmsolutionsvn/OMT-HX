@@ -33,10 +33,10 @@ bool hardware(Codec codec) {
 }
 
 // A stream flagged limited range, as a phone's encoder sends it; null when no hardware encoder opens.
-std::unique_ptr<Encoder> openLimitedEncoder(Codec codec, const VideoFormat& f) {
+std::unique_ptr<Encoder> openEncoder(Codec codec, const VideoFormat& f, bool fullRange = true) {
   try {
     return std::make_unique<Encoder>(codec, f.width, f.height, f.fpsN, f.fpsD,
-                                     targetBitrate(f, Quality::Medium, codec), nullptr, false);
+                                     targetBitrate(f, Quality::Medium, codec), nullptr, fullRange);
   } catch (const std::runtime_error& e) {
     MESSAGE("SKIPPED, no hardware " << codecName(codec) << " encoder on this PC: " << e.what());
     return nullptr;
@@ -54,6 +54,68 @@ Nv12 flatPicture(int w, int h, uint8_t left, uint8_t right) {
               right);
   p.uv.assign(static_cast<size_t>(w) * h / 2, 128);
   return p;
+}
+
+// The green channel, well inside one half: neutral chroma, so B, G and R agree.
+int bgraGrey(const std::vector<uint8_t>& bgra, int w, int h, bool right) {
+  int worst = right ? 255 : 0;
+  const int x0 = right ? w / 2 + 20 : 20;
+  const int x1 = right ? w - 20 : w / 2 - 20;
+  for (int r = 20; r < h - 20; r += 7)
+    for (int x = x0; x < x1; x += 7) {
+      const int v = bgra[(static_cast<size_t>(r) * w + x) * 4 + 1];
+      worst = right ? std::min(worst, v) : std::max(worst, v);
+    }
+  return worst;
+}
+
+// Sends an encoder's packets through a Sender as coded HX frames, at 60 fps: the wire stream keeps the range the
+// encoder signals.
+class CodedPump {
+ public:
+  CodedPump(Sender& sender, Encoder& enc, const VideoFormat& f, Nv12 picture)
+      : picture_(std::move(picture)),
+        thread_([this, &sender, &enc, f] {
+          auto next = Clock::now();
+          uint64_t seq = 0;
+          for (int i = 0; !stop_; ++i) {
+            for (const Packet& p : enc.encode(picture_, false)) {
+              CodedFrame c;
+              c.mode = Mode::Hx;
+              c.codec = enc.codec();
+              c.format = f;
+              c.keyframe = p.keyframe;
+              c.seq = seq++;
+              c.timestamp = 1'000'000 + i * kFrame;
+              c.data = p.data;
+              try {
+                sender.sendCoded(c);
+              } catch (const std::exception&) {
+                stop_ = true;  // a test thread must not throw
+              }
+            }
+            next += std::chrono::microseconds(16'667);
+            std::this_thread::sleep_until(next);
+          }
+        }) {}
+  ~CodedPump() {
+    stop_ = true;
+    thread_.join();
+  }
+
+ private:
+  std::atomic<bool> stop_{false};  // declared before thread_, which reads it
+  Nv12 picture_;
+  std::thread thread_;
+};
+
+// A receiver only gets a sender's coded frames once libomt has registered the connection.
+bool waitForReceiver(Sender& sender) {
+  for (int i = 0; i < 100; ++i) {
+    if (sender.hasReceivers()) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  return false;
 }
 
 // Sends the test picture and a tone at 60 fps on its own thread until destroyed.
@@ -275,7 +337,7 @@ TEST_CASE("an NV12 receiver gets the decoder's picture without a colour conversi
 TEST_CASE("a limited-range HX stream is stretched to full-range NV12") {
   if (!hardware(Codec::Hevc)) return;
   const VideoFormat f{640, 360, 60, 1, false};
-  auto enc = openLimitedEncoder(Codec::Hevc, f);
+  auto enc = openEncoder(Codec::Hevc, f, false);
   if (!enc) return;
   const Nv12 pic = flatPicture(f.width, f.height, 16, 235);
   FrameDecoder decoder(PixelFormat::Nv12);
@@ -304,6 +366,76 @@ TEST_CASE("a limited-range HX stream is stretched to full-range NV12") {
     }
   }
   REQUIRE(got);
+}
+
+TEST_CASE("a Gpu receiver says a limited-range picture's range, and download stretches it") {
+  if (!hardware(Codec::Hevc)) return;
+  bool full = true;
+  SUBCASE("limited") { full = false; }
+  SUBCASE("full") { full = true; }
+  const VideoFormat f{640, 360, 60, 1, false};
+  auto enc = openEncoder(Codec::Hevc, f, full);
+  if (!enc) return;
+  Sender sender(full ? "omthx-test-gpu-range-full" : "omthx-test-gpu-range-limited", Mode::Hx, Quality::Medium,
+                Codec::Hevc);
+  Receiver gpu(sender.address(), PixelFormat::Gpu);
+  REQUIRE(waitForReceiver(sender));
+  CodedPump pump(sender, *enc, f, flatPicture(f.width, f.height, 16, 235));
+  VideoFrame frame;
+  int got = 0;
+  const auto deadline = Clock::now() + std::chrono::seconds(10);
+  while (got < 10 && Clock::now() < deadline)
+    if (gpu.receiveVideo(frame, 100) && frame.gpu) ++got;
+  REQUIRE(got >= 10);
+  CHECK(frame.fullRange == full);
+  REQUIRE(download(frame, PixelFormat::Bgra));
+  MESSAGE("black " << bgraGrey(frame.bgra, f.width, f.height, false) << ", white "
+                   << bgraGrey(frame.bgra, f.width, f.height, true));
+  if (full) {
+    CHECK(bgraGrey(frame.bgra, f.width, f.height, false) >= 13);
+    CHECK(bgraGrey(frame.bgra, f.width, f.height, false) <= 19);
+    CHECK(bgraGrey(frame.bgra, f.width, f.height, true) >= 232);
+    CHECK(bgraGrey(frame.bgra, f.width, f.height, true) <= 238);
+  } else {
+    CHECK(bgraGrey(frame.bgra, f.width, f.height, false) <= 3);
+    CHECK(bgraGrey(frame.bgra, f.width, f.height, true) >= 252);
+  }
+}
+
+TEST_CASE("the BGRA readback follows a stream that changes its range") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{640, 360, 60, 1, false};
+  auto full = openEncoder(Codec::Hevc, f, true);
+  auto limited = openEncoder(Codec::Hevc, f, false);
+  if (!full || !limited) return;
+  const Nv12 pic = flatPicture(f.width, f.height, 16, 235);
+  Sender sender("omthx-test-bgra-range", Mode::Hx, Quality::Medium, Codec::Hevc);
+  Receiver receiver(sender.address(), PixelFormat::Bgra);
+  REQUIRE(waitForReceiver(sender));
+  VideoFrame frame;
+  auto receive = [&](int wanted) {
+    int got = 0;
+    const auto deadline = Clock::now() + std::chrono::seconds(10);
+    while (got < wanted && Clock::now() < deadline)
+      if (receiver.receiveVideo(frame, 100)) ++got;
+    return got;
+  };
+  {
+    CodedPump pump(sender, *full, f, pic);
+    REQUIRE(receive(10) == 10);
+    MESSAGE("full stream: black " << bgraGrey(frame.bgra, f.width, f.height, false) << ", white "
+                                  << bgraGrey(frame.bgra, f.width, f.height, true));
+    CHECK(bgraGrey(frame.bgra, f.width, f.height, false) >= 13);
+    CHECK(bgraGrey(frame.bgra, f.width, f.height, false) <= 19);
+  }
+  {
+    CodedPump pump(sender, *limited, f, pic);
+    REQUIRE(receive(10) == 10);
+    MESSAGE("limited stream: black " << bgraGrey(frame.bgra, f.width, f.height, false) << ", white "
+                                     << bgraGrey(frame.bgra, f.width, f.height, true));
+    CHECK(bgraGrey(frame.bgra, f.width, f.height, false) <= 3);
+    CHECK(bgraGrey(frame.bgra, f.width, f.height, true) >= 252);
+  }
 }
 
 TEST_CASE("an NV12 receiver drops a frame whose header lies about its size") {

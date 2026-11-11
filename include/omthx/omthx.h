@@ -87,8 +87,9 @@ struct VideoFrame {
   // alpha the width * height alpha plane: OMT's and NDI's UYVA layout.
   std::vector<uint8_t> uyvy;
   // Nv12 receivers: full-range BT.709 planes, valid until the next receiveVideo call. Y is width * height bytes
-  // and UV width * height / 2, both with rows of width bytes. An Hx source's are the decoder's own, with no copy;
-  // a plain OMT source's are packed from libomt's UYVY. No alpha: a source's alpha, if any, is dropped.
+  // and UV width * height / 2, both with rows of width bytes. A limited-range picture is stretched to full; an Hx
+  // source's full-range one is the decoder's own, with no copy; a plain OMT source's are packed from libomt's
+  // UYVY. No alpha: a source's alpha, if any, is dropped.
   // When set, the planes always match format: an even size, Y width * height bytes, UV width * height / 2.
   // A frame whose picture does not match its header is dropped.
   const uint8_t* nv12Y = nullptr;
@@ -96,6 +97,9 @@ struct VideoFrame {
   // Gpu receivers, HX sources: the picture, set; otherwise null. Hold only a few at a time: they are the
   // decoder's own surfaces.
   std::shared_ptr<const GpuPicture> gpu;
+  // A Gpu picture's range: false when it holds limited-range values (a phone's stream), which download() stretches.
+  // Bgra, Uyvy and Nv12 outputs are always full range (kept last).
+  bool fullRange = true;
 };
 
 // One coded video frame as the source sent it, for an app that republishes a source without re-coding it.
@@ -180,7 +184,8 @@ class OMTHX_API Sender {
 };
 
 // Fills frame.bgra or frame.uyvy (pixels Bgra or Uyvy) from frame.gpu, for a Gpu receiver's app that also
-// needs the picture in memory. False when frame.gpu is null or the copy fails.
+// needs the picture in memory. False when frame.gpu is null or the copy fails. A limited-range Gpu picture
+// (frame.fullRange false) is stretched to full, so both targets come out full range.
 OMTHX_API bool download(VideoFrame& frame, PixelFormat pixels);
 
 // Decodes coded frames from a Coded receiver into pictures, as a Receiver of `pixels` would hand them back.

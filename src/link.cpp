@@ -1054,6 +1054,7 @@ bool Receiver::receiveVideo(VideoFrame& out, int timeoutMs) {
 bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
   if (d_->pixels == PixelFormat::Coded) return false;
   out.nv12Y = out.nv12UV = nullptr;  // set below only for an Nv12 receiver, and only for this call
+  out.fullRange = true;              // only a Gpu picture can hold limited-range values
   const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - d_->start).count();
   if (d_->askPending.exchange(false)) d_->ask();
   // A copy left over from the last call goes out as soon as it is done, unless the next frame comes first (then
@@ -1265,6 +1266,7 @@ bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
   }
   if (!ok) return fail();
   d_->waiting = false;
+  out.fullRange = gpu ? isFullRange(picture->frame) : true;
   out.gpu = std::move(picture);
   out.format = fmt;
   out.premultiplied = fmt.alpha;
@@ -1428,6 +1430,7 @@ bool FrameDecoder::decode(const CodedFrame& c, VideoFrame& out) {
   if (c.data.empty() || fmt.width <= 0 || fmt.height <= 0 || c.data.size() > 0x7FFFFFFF) return false;
   out.gpu.reset();
   out.nv12Y = out.nv12UV = nullptr;
+  out.fullRange = true;
   // VMX is intra only: every frame stands alone, so there is no keyframe to wait for.
   if (c.mode == Mode::Full) {
     if (!d_->vmx || fmt.width != d_->width || fmt.height != d_->height) {
