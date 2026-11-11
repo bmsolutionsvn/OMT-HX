@@ -591,6 +591,7 @@ struct Readback::Impl {
     } else {
       nv12.width = w;
       nv12.height = h;
+      nv12.fullRange = pick->picture.fullRange;
       nv12.y.resize(static_cast<size_t>(w) * h);
       nv12.uv.resize(static_cast<size_t>(w) * h / 2);
       const uint8_t* uv = p + static_cast<size_t>(m.RowPitch) * pick->planeRows;

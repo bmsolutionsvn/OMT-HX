@@ -438,6 +438,25 @@ TEST_CASE("the BGRA readback follows a stream that changes its range") {
   }
 }
 
+TEST_CASE("an NV12 receiver stretches a limited-range stream to full range") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{640, 360, 60, 1, false};
+  auto enc = openEncoder(Codec::Hevc, f, false);
+  if (!enc) return;
+  Sender sender("omthx-test-nv12-limited", Mode::Hx, Quality::Medium, Codec::Hevc);
+  Receiver receiver(sender.address(), PixelFormat::Nv12);
+  REQUIRE(waitForReceiver(sender));
+  CodedPump pump(sender, *enc, f, flatPicture(f.width, f.height, 16, 235));
+  VideoFrame frame;
+  REQUIRE(receiveSome(receiver, frame, 10, 10) == 10);
+  REQUIRE(frame.nv12Y != nullptr);
+  const size_t middle = 180u * 640;
+  MESSAGE("left " << static_cast<int>(frame.nv12Y[middle + 100]) << ", right "
+                  << static_cast<int>(frame.nv12Y[middle + 540]));
+  CHECK(frame.nv12Y[middle + 100] <= 3);
+  CHECK(frame.nv12Y[middle + 540] >= 252);
+}
+
 TEST_CASE("an NV12 receiver drops a frame whose header lies about its size") {
   if (!hardware(Codec::Hevc)) return;
   const VideoFormat honest{640, 360, 60, 1, false};
