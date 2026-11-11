@@ -1,6 +1,7 @@
 #include <doctest/doctest.h>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -29,6 +30,30 @@ bool hardware(Codec codec) {
     MESSAGE("SKIPPED, no hardware " << codecName(codec) << " encoder on this PC: " << e.what());
     return false;
   }
+}
+
+// A stream flagged limited range, as a phone's encoder sends it; null when no hardware encoder opens.
+std::unique_ptr<Encoder> openLimitedEncoder(Codec codec, const VideoFormat& f) {
+  try {
+    return std::make_unique<Encoder>(codec, f.width, f.height, f.fpsN, f.fpsD,
+                                     targetBitrate(f, Quality::Medium, codec), nullptr, false);
+  } catch (const std::runtime_error& e) {
+    MESSAGE("SKIPPED, no hardware " << codecName(codec) << " encoder on this PC: " << e.what());
+    return nullptr;
+  }
+}
+
+// Left half luma `left`, right half `right`, neutral chroma.
+Nv12 flatPicture(int w, int h, uint8_t left, uint8_t right) {
+  Nv12 p;
+  p.width = w;
+  p.height = h;
+  p.y.assign(static_cast<size_t>(w) * h, left);
+  for (int r = 0; r < h; ++r)
+    std::fill(p.y.begin() + static_cast<ptrdiff_t>(r) * w + w / 2, p.y.begin() + static_cast<ptrdiff_t>(r + 1) * w,
+              right);
+  p.uv.assign(static_cast<size_t>(w) * h / 2, 128);
+  return p;
 }
 
 // Sends the test picture and a tone at 60 fps on its own thread until destroyed.
@@ -245,6 +270,40 @@ TEST_CASE("an NV12 receiver gets the decoder's picture without a colour conversi
   CHECK(frame.nv12Y[middle + 540] < 40);   // the black half
   CHECK(frame.bgra.empty());               // no BGRA conversion happened
   CHECK(frame.uyvy.empty());
+}
+
+TEST_CASE("a limited-range HX stream is stretched to full-range NV12") {
+  if (!hardware(Codec::Hevc)) return;
+  const VideoFormat f{640, 360, 60, 1, false};
+  auto enc = openLimitedEncoder(Codec::Hevc, f);
+  if (!enc) return;
+  const Nv12 pic = flatPicture(f.width, f.height, 16, 235);
+  FrameDecoder decoder(PixelFormat::Nv12);
+  CodedFrame c;
+  VideoFrame out;
+  bool got = false;
+  uint64_t seq = 0;
+  for (int i = 0; i < 30 && !got; ++i) {
+    for (const Packet& p : enc->encode(pic, i == 0)) {
+      c.mode = Mode::Hx;
+      c.codec = Codec::Hevc;
+      c.format = f;
+      c.keyframe = p.keyframe;
+      c.seq = seq++;
+      c.timestamp = 1'000'000 + i * kFrame;
+      c.data = p.data;
+      if (!decoder.decode(c, out)) continue;
+      got = true;
+      REQUIRE(out.nv12Y != nullptr);
+      const size_t middle = 180u * 640;
+      MESSAGE("left " << static_cast<int>(out.nv12Y[middle + 100]) << ", right "
+                      << static_cast<int>(out.nv12Y[middle + 540]));
+      CHECK(out.nv12Y[middle + 100] <= 3);
+      CHECK(out.nv12Y[middle + 540] >= 252);
+      break;
+    }
+  }
+  REQUIRE(got);
 }
 
 TEST_CASE("an NV12 receiver drops a frame whose header lies about its size") {

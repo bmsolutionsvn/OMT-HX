@@ -75,6 +75,29 @@ bool splitFrame(const OMTMediaFrame* f, std::span<const uint8_t> data, std::span
   vmx = data.last(alpha.bytes);
   return true;
 }
+
+// An app's NV12 output is always full range: a limited-range decoder picture is stretched into `stretched`.
+void fullRangePlanes(const VideoFormat& f, const Nv12& in, Nv12& stretched, const uint8_t*& y, const uint8_t*& uv) {
+  if (in.fullRange) {
+    y = in.y.data();
+    uv = in.uv.data();
+    return;
+  }
+  copyNv12(f, in.y.data(), in.width, in.uv.data(), in.width, false, stretched);
+  y = stretched.y.data();
+  uv = stretched.uv.data();
+}
+
+// unpackUyvy takes full-range NV12, so a limited-range picture is stretched first.
+void unpackUyvyFullRange(const VideoFormat& f, const Nv12& in, Nv12& stretched, std::vector<uint8_t>& uyva,
+                         const uint8_t* alpha) {
+  if (in.fullRange) {
+    unpackUyvy(f, in, uyva, alpha);
+    return;
+  }
+  copyNv12(f, in.y.data(), in.width, in.uv.data(), in.width, false, stretched);
+  unpackUyvy(f, stretched, uyva, alpha);
+}
 }  // namespace
 
 // ---------------------------------------------------------------- Sender
@@ -877,6 +900,7 @@ struct Receiver::Impl {
   HxStream hx;  // Hx sources: the decoder and its VMX alpha
   Packer packer;
   Nv12 picture;
+  Nv12 stretched;  // a limited-range picture stretched to the full range an app's NV12 output promises
   bool waiting = true;  // Hx: discard until a keyframe
   bool haveLast = false;
   int64_t lastTimestamp = 0;
@@ -924,10 +948,9 @@ struct Receiver::Impl {
     try {
       if (pixels == PixelFormat::Nv12) {
         checkNv12Picture(p.format, picture, nullptr);
-        out.nv12Y = picture.y.data();
-        out.nv12UV = picture.uv.data();
+        fullRangePlanes(p.format, picture, stretched, out.nv12Y, out.nv12UV);
       } else if (pixels == PixelFormat::Uyvy) {
-        unpackUyvy(p.format, picture, out.uyvy, nullptr);
+        unpackUyvyFullRange(p.format, picture, stretched, out.uyvy, nullptr);
       } else if (!p.bgra) {
         packer.unpack(p.format, picture, out.bgra, nullptr);
       } else if (out.bgra.size() != static_cast<size_t>(p.format.width) * p.format.height * 4) {
@@ -1228,12 +1251,11 @@ bool Receiver::receiveOne(VideoFrame& out, int timeoutMs) {
   } else {
     try {
       if (d_->pixels == PixelFormat::Nv12) {
-        // No copy: the decoder's own planes, which stay valid until the next receiveVideo call.
+        // The decoder's own planes, or a stretched copy; either stays valid until the next receiveVideo call.
         checkNv12Picture(fmt, d_->picture, alpha ? alpha->data() : nullptr);
-        out.nv12Y = d_->picture.y.data();
-        out.nv12UV = d_->picture.uv.data();
+        fullRangePlanes(fmt, d_->picture, d_->stretched, out.nv12Y, out.nv12UV);
       } else if (d_->pixels == PixelFormat::Uyvy) {
-        unpackUyvy(fmt, d_->picture, out.uyvy, alpha ? alpha->data() : nullptr);
+        unpackUyvyFullRange(fmt, d_->picture, d_->stretched, out.uyvy, alpha ? alpha->data() : nullptr);
       } else {
         d_->packer.unpack(fmt, d_->picture, out.bgra, alpha ? alpha->data() : nullptr);
       }
@@ -1380,6 +1402,7 @@ struct FrameDecoder::Impl {
   PixelFormat pixels;
   HxStream hx;
   Nv12 picture;
+  Nv12 stretched;  // a limited-range picture stretched to the full range an app's NV12 output promises
   bool waiting = true;  // Hx: no picture until a keyframe
   ::VMX_INSTANCE* vmx = nullptr;
   int width = 0;
@@ -1484,17 +1507,16 @@ bool FrameDecoder::decode(const CodedFrame& c, VideoFrame& out) {
     if (!alpha) return fail();
   }
   if (d_->pixels == PixelFormat::Nv12) {
-    // No copy: the decoder's own planes, valid until the next decode. Alpha, if any, is dropped.
+    // The decoder's own planes, or a stretched copy, valid until the next decode. Alpha, if any, is dropped.
     try {
       checkNv12Picture(fmt, d_->picture, alpha ? alpha->data() : nullptr);
     } catch (const std::invalid_argument&) {
       return fail();
     }
-    out.nv12Y = d_->picture.y.data();
-    out.nv12UV = d_->picture.uv.data();
+    fullRangePlanes(fmt, d_->picture, d_->stretched, out.nv12Y, out.nv12UV);
   } else {
     try {
-      unpackUyvy(fmt, d_->picture, out.uyvy, alpha ? alpha->data() : nullptr);
+      unpackUyvyFullRange(fmt, d_->picture, d_->stretched, out.uyvy, alpha ? alpha->data() : nullptr);
     } catch (const std::invalid_argument&) {
       return fail();  // the picture does not match its header: treat it like a decode error
     }

@@ -14,14 +14,40 @@ using namespace omthx;
 
 namespace {
 // Null, with a visible message, on a PC that has no hardware encoder for this codec.
-std::unique_ptr<Encoder> openEncoder(Codec codec, const VideoFormat& f) {
+std::unique_ptr<Encoder> openEncoder(Codec codec, const VideoFormat& f, bool fullRange = true) {
   try {
     return std::make_unique<Encoder>(codec, f.width, codedHeight(f), f.fpsN, f.fpsD,
-                                     targetBitrate(f, Quality::Medium, codec));
+                                     targetBitrate(f, Quality::Medium, codec), nullptr, fullRange);
   } catch (const std::runtime_error& e) {
     MESSAGE("SKIPPED, no hardware " << codecName(codec) << " encoder on this PC: " << e.what());
     return nullptr;
   }
+}
+
+// Left half luma `left`, right half `right`, neutral chroma: a phone's limited-range black and white.
+Nv12 flatPicture(int w, int h, uint8_t left, uint8_t right) {
+  Nv12 p;
+  p.width = w;
+  p.height = h;
+  p.y.assign(static_cast<size_t>(w) * h, left);
+  for (int r = 0; r < h; ++r)
+    std::fill(p.y.begin() + static_cast<ptrdiff_t>(r) * w + w / 2, p.y.begin() + static_cast<ptrdiff_t>(r + 1) * w,
+              right);
+  p.uv.assign(static_cast<size_t>(w) * h / 2, 128);
+  return p;
+}
+
+// The green channel, well inside one half and away from the boundary: neutral chroma, so B, G and R agree.
+int bgraGrey(const std::vector<uint8_t>& bgra, int w, int h, bool right) {
+  int worst = right ? 255 : 0;
+  const int x0 = right ? w / 2 + 20 : 20;
+  const int x1 = right ? w - 20 : w / 2 - 20;
+  for (int r = 20; r < h - 20; r += 7)
+    for (int x = x0; x < x1; x += 7) {
+      const int v = bgra[(static_cast<size_t>(r) * w + x) * 4 + 1];
+      worst = right ? std::min(worst, v) : std::max(worst, v);
+    }
+  return worst;
 }
 
 std::vector<Packet> encodePattern(Encoder& enc, const VideoFormat& f, int frames, int keyAt) {
@@ -196,6 +222,68 @@ TEST_CASE("a picture with alpha survives as the fill on the GPU and alpha by VMX
   MESSAGE("mean alpha error " << alphaError << ", mean colour error " << colourError << " (0 to 255)");
   CHECK(alphaError < 3.0);
   CHECK(colourError < 6.0);
+}
+
+TEST_CASE("a limited-range HX stream decodes to full-range Bgra on the CPU") {
+  Codec codec = Codec::Hevc;
+  SUBCASE("hevc") { codec = Codec::Hevc; }
+  SUBCASE("h264") { codec = Codec::H264; }
+  const VideoFormat f{640, 360, 60, 1, false};
+  auto enc = openEncoder(codec, f, false);  // the phone's stream: limited range, flagged as such
+  if (!enc) return;
+  const Nv12 pic = flatPicture(f.width, f.height, 16, 235);
+  Decoder dec(codec, true);  // software: Packer::unpack is the CPU conversion
+  Packer packer;
+  Nv12 decoded;
+  std::vector<uint8_t> bgra;
+  bool got = false;
+  for (int i = 0; i < 30 && !got; ++i) {
+    for (const Packet& p : enc->encode(pic, i == 0)) {
+      int64_t ts = 0;
+      if (dec.decode(p.data, i, decoded, ts) != Decoded::Picture) continue;
+      CHECK_FALSE(decoded.fullRange);
+      packer.unpack(f, decoded, bgra);
+      got = true;
+      break;
+    }
+  }
+  REQUIRE(got);
+  MESSAGE("black " << bgraGrey(bgra, f.width, f.height, false) << ", white "
+                   << bgraGrey(bgra, f.width, f.height, true));
+  CHECK(bgraGrey(bgra, f.width, f.height, false) <= 3);
+  CHECK(bgraGrey(bgra, f.width, f.height, true) >= 252);
+}
+
+TEST_CASE("a full-range HX stream keeps its values in Bgra") {
+  Codec codec = Codec::Hevc;
+  SUBCASE("hevc") { codec = Codec::Hevc; }
+  SUBCASE("h264") { codec = Codec::H264; }
+  const VideoFormat f{640, 360, 60, 1, false};
+  auto enc = openEncoder(codec, f);  // our own sender's stream: full range
+  if (!enc) return;
+  const Nv12 pic = flatPicture(f.width, f.height, 16, 235);
+  Decoder dec(codec, true);
+  Packer packer;
+  Nv12 decoded;
+  std::vector<uint8_t> bgra;
+  bool got = false;
+  for (int i = 0; i < 30 && !got; ++i) {
+    for (const Packet& p : enc->encode(pic, i == 0)) {
+      int64_t ts = 0;
+      if (dec.decode(p.data, i, decoded, ts) != Decoded::Picture) continue;
+      CHECK(decoded.fullRange);
+      packer.unpack(f, decoded, bgra);
+      got = true;
+      break;
+    }
+  }
+  REQUIRE(got);
+  MESSAGE("black " << bgraGrey(bgra, f.width, f.height, false) << ", white "
+                   << bgraGrey(bgra, f.width, f.height, true));
+  CHECK(bgraGrey(bgra, f.width, f.height, false) >= 13);
+  CHECK(bgraGrey(bgra, f.width, f.height, false) <= 19);
+  CHECK(bgraGrey(bgra, f.width, f.height, true) >= 232);
+  CHECK(bgraGrey(bgra, f.width, f.height, true) <= 238);
 }
 
 TEST_CASE("Decoder: garbage is an error, not a crash, and a keyframe decodes afterwards") {

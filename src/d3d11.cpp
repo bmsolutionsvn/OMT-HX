@@ -525,7 +525,7 @@ struct Readback::Impl {
     s.order = ++next;
     s.width = w;
     s.height = h;
-    s.picture = Picture{format, timestamp, bgra, started};
+    s.picture = Picture{format, timestamp, bgra, isFullRange(frame), started};
     s.queued = std::chrono::steady_clock::now();
   }
 

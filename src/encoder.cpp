@@ -65,8 +65,9 @@ const std::vector<std::string>& Encoder::order(Codec codec) {
   return codec == Codec::H264 ? h264 : hevc;
 }
 
-Encoder::Encoder(Codec codec, int w, int h, int fpsN, int fpsD, int64_t bitrate, AVBufferRef* gpuFrames)
-    : codec_(codec) {
+Encoder::Encoder(Codec codec, int w, int h, int fpsN, int fpsD, int64_t bitrate, AVBufferRef* gpuFrames,
+                 bool fullRange)
+    : codec_(codec), fullRange_(fullRange) {
   std::string tried;
   for (const std::string& name : order(codec)) {
     const AVCodec* av = avcodec_find_encoder_by_name(name.c_str());
@@ -94,7 +95,7 @@ Encoder::Encoder(Codec codec, int w, int h, int fpsN, int fpsD, int64_t bitrate,
     c->bit_rate = bitrate;
     c->rc_max_rate = bitrate;
     c->rc_buffer_size = static_cast<int>(bitrate * 2 * fpsD / fpsN);  // about two frames
-    c->color_range = AVCOL_RANGE_JPEG;
+    c->color_range = fullRange ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
     c->colorspace = AVCOL_SPC_BT709;
     c->color_primaries = AVCOL_PRI_BT709;
     c->color_trc = AVCOL_TRC_BT709;
@@ -179,7 +180,7 @@ std::vector<Packet> Encoder::encodeGpu(const AVFrame* pic, bool forceKeyframe) {
 
 std::vector<Packet> Encoder::send(bool forceKeyframe) {
   const auto started = std::chrono::steady_clock::now();
-  frame_->color_range = AVCOL_RANGE_JPEG;
+  frame_->color_range = fullRange_ ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
   frame_->colorspace = AVCOL_SPC_BT709;
   frame_->pts = index_++;
   frame_->pict_type = forceKeyframe ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;

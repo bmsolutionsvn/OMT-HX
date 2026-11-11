@@ -145,6 +145,8 @@ Decoded Decoder::decode(std::span<const uint8_t> au, int64_t timestamp, Nv12& ou
   return ok ? Decoded::Picture : Decoded::Error;
 }
 
+bool isFullRange(const AVFrame* frame) { return frame && frame->color_range == AVCOL_RANGE_JPEG; }
+
 bool downloadNv12(const AVFrame* frame, Nv12& out) {
   AVFrame* sw = nullptr;
   const AVFrame* f = frame;
@@ -178,6 +180,7 @@ bool downloadNv12(const AVFrame* frame, Nv12& out) {
           copyPlane(out.uv.data(), sw->data[1], sw->linesize[1], w, h / 2);
         }
       }
+      out.fullRange = isFullRange(sw);  // the stream's own VUI, which the transfer copied over
       av_frame_free(&sw);
       return ok;
     }
@@ -212,6 +215,7 @@ bool downloadNv12(const AVFrame* frame, Nv12& out) {
       }
     }
   }
+  out.fullRange = isFullRange(f);
   av_frame_free(&sw);
   return ok;
 }
