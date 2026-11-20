@@ -125,7 +125,9 @@ Decoded Decoder::decodeFrame(std::span<const uint8_t> au, int64_t timestamp, AVF
   rc = avcodec_receive_frame(ctx_, out);
   if (rc == AVERROR(EAGAIN)) return Decoded::NeedMore;
   if (rc < 0) {
-    avcodec_flush_buffers(ctx_);
+    // Frame threads report a packet's error a few calls later, when the packets after it are already in flight:
+    // a flush then throws away a good keyframe sent since. Only the single-threaded decoder flushes here.
+    if (ctx_->active_thread_type != FF_THREAD_FRAME) avcodec_flush_buffers(ctx_);
     return Decoded::Error;
   }
   if (out->format != AV_PIX_FMT_D3D11 && hw_ && !refused_) {  // FFmpeg fell back to software in the GPU's context
