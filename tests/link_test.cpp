@@ -1641,6 +1641,7 @@ TEST_CASE("FrameDecoder decodes an HX source's coded frames like a Uyvy receiver
   CodedFrame c;
   VideoFrame out;
   std::map<int64_t, uint8_t> centre;  // the Uyvy receiver's Y at the centre, by timestamp
+  std::map<int64_t, uint8_t> decoded;  // FrameDecoder's Y at the centre, by timestamp
   int pictures = 0, compared = 0;
   const auto deadline = Clock::now() + std::chrono::seconds(10);
   while (pictures < 30 && Clock::now() < deadline) {
@@ -1651,12 +1652,18 @@ TEST_CASE("FrameDecoder decodes an HX source's coded frames like a Uyvy receiver
     ++pictures;
     CHECK(out.format == f);
     CHECK(out.uyvy.size() == 640u * 360 * 3);
-    const auto it = centre.find(out.timestamp);
-    if (it != centre.end()) {
-      CHECK(std::abs(static_cast<int>(out.uyvy[(180u * 640 + 320) * 2 + 1]) - it->second) <= 4);
+    decoded[out.timestamp] = out.uyvy[(180u * 640 + 320) * 2 + 1];
+  }
+  // The receiver decodes on its own and can trail the coded path: compare once both have their pictures.
+  for (const auto until = Clock::now() + std::chrono::seconds(1); Clock::now() < until;) {
+    VideoFrame r;
+    while (uyvy.receiveVideo(r, 10)) centre[r.timestamp] = r.uyvy[(180u * 640 + 320) * 2 + 1];
+  }
+  for (const auto& [ts, y] : decoded)
+    if (const auto it = centre.find(ts); it != centre.end()) {
+      CHECK(std::abs(static_cast<int>(y) - it->second) <= 4);
       ++compared;
     }
-  }
   CHECK(pictures >= 25);
   CHECK(compared > 0);
   CHECK_FALSE(decoder.name().empty());
@@ -1674,6 +1681,7 @@ TEST_CASE("FrameDecoder(Nv12) hands back the decoder's planes") {
   CodedFrame c;
   VideoFrame out;
   std::map<int64_t, uint8_t> centre;  // the Nv12 receiver's Y at the centre, by timestamp
+  std::map<int64_t, uint8_t> decoded;  // FrameDecoder's Y at the centre, by timestamp
   int pictures = 0, compared = 0;
   const auto deadline = Clock::now() + std::chrono::seconds(10);
   while (pictures < 30 && Clock::now() < deadline) {
@@ -1685,12 +1693,18 @@ TEST_CASE("FrameDecoder(Nv12) hands back the decoder's planes") {
     REQUIRE(out.nv12Y != nullptr);
     REQUIRE(out.nv12UV != nullptr);
     CHECK(out.format == f);
-    const auto it = centre.find(out.timestamp);
-    if (it != centre.end()) {
-      CHECK(std::abs(static_cast<int>(out.nv12Y[180u * 640 + 320]) - it->second) <= 4);
+    decoded[out.timestamp] = out.nv12Y[180u * 640 + 320];
+  }
+  // The receiver decodes on its own and can trail the coded path: compare once both have their pictures.
+  for (const auto until = Clock::now() + std::chrono::seconds(1); Clock::now() < until;) {
+    VideoFrame r;
+    while (nv12.receiveVideo(r, 10)) centre[r.timestamp] = r.nv12Y[180u * 640 + 320];
+  }
+  for (const auto& [ts, y] : decoded)
+    if (const auto it = centre.find(ts); it != centre.end()) {
+      CHECK(std::abs(static_cast<int>(y) - it->second) <= 4);
       ++compared;
     }
-  }
   CHECK(pictures >= 25);
   CHECK(compared > 0);
 }
@@ -1771,7 +1785,7 @@ TEST_CASE("FrameDecoder starts at a keyframe after reset") {
   picture = false;
   int afterKey = -1;  // frames fed since the keyframe
   for (const auto until = Clock::now() + std::chrono::seconds(5); !picture && Clock::now() < until;) {
-    if (afterKey >= 2) break;
+    if (afterKey >= 5) break;  // 2 frames, plus the software decoder's 3 frames of delay
     if (!coded.receiveCoded(c, 50)) continue;
     picture = decoder.decode(c, out);
     if (c.keyframe) afterKey = 0;

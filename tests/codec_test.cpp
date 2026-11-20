@@ -293,7 +293,8 @@ TEST_CASE("Decoder: garbage is an error, not a crash, and a keyframe decodes aft
   const VideoFormat f{1280, 720, 60, 1, false};
   auto enc = openEncoder(codec, f);
   if (!enc) return;
-  const std::vector<Packet> all = encodePattern(*enc, f, 12, -1);
+  // 24, not 12: a software encoder's lookahead and the software decoder's three frames of delay both hold pictures.
+  const std::vector<Packet> all = encodePattern(*enc, f, 24, -1);
   Decoder dec(codec);
   Nv12 out;
   int64_t ts = 0;
