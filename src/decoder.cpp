@@ -114,20 +114,30 @@ Decoded Decoder::decodeFrame(std::span<const uint8_t> au, int64_t timestamp, AVF
   packet_->data = const_cast<uint8_t*>(au.data());
   packet_->size = static_cast<int>(au.size());
   packet_->pts = timestamp;
+  av_frame_unref(out);
   int rc = avcodec_send_packet(ctx_, packet_);
+  int got = AVERROR(EAGAIN);
+  if (rc == AVERROR(EAGAIN)) {  // a frame or an error the last call left holds this packet back: take it, then resend
+    got = avcodec_receive_frame(ctx_, out);
+    rc = avcodec_send_packet(ctx_, packet_);
+  }
   packet_->data = nullptr;
   packet_->size = 0;
-  if (rc < 0) {
+  // Frame threads report a packet's error a few calls later, from send or from receive, once the packets after it
+  // are in flight (send has then already taken its packet): a flush would throw away a good keyframe sent since.
+  // Only the single-threaded decoder flushes.
+  const bool frameThreads = ctx_->active_thread_type == FF_THREAD_FRAME;
+  if (rc < 0 && rc != AVERROR(EAGAIN) && !frameThreads) {
     avcodec_flush_buffers(ctx_);
     return Decoded::Error;
   }
-  av_frame_unref(out);
-  rc = avcodec_receive_frame(ctx_, out);
-  if (rc == AVERROR(EAGAIN)) return Decoded::NeedMore;
-  if (rc < 0) {
-    // Frame threads report a packet's error a few calls later, when the packets after it are already in flight:
-    // a flush then throws away a good keyframe sent since. Only the single-threaded decoder flushes here.
-    if (ctx_->active_thread_type != FF_THREAD_FRAME) avcodec_flush_buffers(ctx_);
+  if (got != 0) {
+    av_frame_unref(out);
+    got = avcodec_receive_frame(ctx_, out);
+  }
+  if (got == AVERROR(EAGAIN)) return rc < 0 ? Decoded::Error : Decoded::NeedMore;
+  if (got < 0) {
+    if (!frameThreads) avcodec_flush_buffers(ctx_);
     return Decoded::Error;
   }
   if (out->format != AV_PIX_FMT_D3D11 && hw_ && !refused_) {  // FFmpeg fell back to software in the GPU's context
